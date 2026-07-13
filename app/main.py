@@ -66,29 +66,31 @@ def get_db():
 # --------------------------------------------------------------------------
 _CSS = """
 :root{
-  --bg:#eef7f1;--surface:#ffffff;--surface-2:#f1f9f4;
-  --ink:#0e1a14;--muted:#4f6157;--faint:#8aa094;
-  --line:#e3efe8;--line-strong:#d1e6d9;
-  --accent:#16a34a;--accent-strong:#15803d;--accent-soft:#dcfce7;--accent-border:#b9ecc9;
-  --ok:#16a34a;--ok-soft:#e9fbef;--ok-border:#bbf0cc;
-  --glass:rgba(255,255,255,.62);--glass-brd:rgba(255,255,255,.75);
-  --shadow-sm:0 1px 2px rgba(13,40,26,.06);
-  --shadow:0 12px 34px -12px rgba(13,60,35,.16);
-  --shadow-lg:0 22px 50px -16px rgba(13,60,35,.26);
-  --glow:0 10px 26px -8px rgba(22,163,74,.5);
-  --r:16px;--r-sm:11px;
+  --bg:#f2efe7;--surface:#ffffff;--surface-2:#f8f5ec;
+  --ink:#18241d;--muted:#5b675e;--faint:#9aa298;
+  --line:#eae4d6;--line-strong:#ddd6c4;
+  --accent:#2f7d4f;--accent-strong:#236340;--accent-soft:#e4f0e8;--accent-border:#c6e1d0;
+  --cta:#e8862e;--cta-strong:#d1741f;--cta-soft:#fbe9d5;
+  --ok:#2f7d4f;--ok-soft:#e6f2ea;--ok-border:#c6e1d0;
+  --glass:rgba(248,245,236,.72);--glass-brd:rgba(255,255,255,.6);
+  --shadow-sm:0 1px 2px rgba(40,35,20,.06);
+  --shadow:0 14px 36px -14px rgba(40,50,30,.18);
+  --shadow-lg:0 24px 54px -18px rgba(40,50,30,.26);
+  --glow:0 10px 26px -8px rgba(47,125,79,.45);
+  --r:22px;--r-sm:13px;
 }
 @media (prefers-color-scheme:dark){:root{
-  --bg:#07120c;--surface:#0f1a14;--surface-2:#15241b;
-  --ink:#e9f3ec;--muted:#93a89c;--faint:#647a6d;
-  --line:#1d2c23;--line-strong:#294034;
-  --accent:#34d399;--accent-strong:#6ee7b7;--accent-soft:#0f2519;--accent-border:#1f4d34;
-  --ok:#34d399;--ok-soft:#0f2519;--ok-border:#1f4d34;
-  --glass:rgba(15,26,20,.55);--glass-brd:rgba(255,255,255,.08);
+  --bg:#14180f;--surface:#1c2118;--surface-2:#232a1e;
+  --ink:#eef1e6;--muted:#9aa593;--faint:#6b7563;
+  --line:#2c3325;--line-strong:#3a4431;
+  --accent:#5cbd82;--accent-strong:#8fd6a9;--accent-soft:#1c2a1e;--accent-border:#2e4a35;
+  --cta:#ef9440;--cta-strong:#f2a85f;--cta-soft:#2a1e0f;
+  --ok:#5cbd82;--ok-soft:#1c2a1e;--ok-border:#2e4a35;
+  --glass:rgba(28,33,24,.6);--glass-brd:rgba(255,255,255,.07);
   --shadow-sm:0 1px 2px rgba(0,0,0,.5);
-  --shadow:0 12px 34px -12px rgba(0,0,0,.6);
-  --shadow-lg:0 22px 50px -16px rgba(0,0,0,.7);
-  --glow:0 10px 26px -8px rgba(52,211,153,.4);
+  --shadow:0 14px 36px -14px rgba(0,0,0,.6);
+  --shadow-lg:0 24px 54px -18px rgba(0,0,0,.7);
+  --glow:0 10px 26px -8px rgba(92,189,130,.35);
 }}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
@@ -96,21 +98,20 @@ body{margin:0;color:var(--ink);min-height:100vh;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   font-size:14.5px;line-height:1.55;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
   background:
-    radial-gradient(60rem 30rem at 8% -8%, var(--accent-soft), transparent 60%),
-    radial-gradient(48rem 26rem at 100% 0%, #d6f5e2, transparent 55%),
-    radial-gradient(42rem 42rem at 100% 100%, #e4f7ec, transparent 60%),
+    radial-gradient(55rem 28rem at 10% -8%, #e9f1e4, transparent 60%),
+    radial-gradient(46rem 24rem at 100% 0%, #f7efdb, transparent 55%),
     var(--bg);
   background-attachment:fixed}
 ::selection{background:var(--accent-soft);color:var(--accent-strong)}
 a{color:inherit}
 
-/* Floating soft blobs */
-body::before,body::after{content:"";position:fixed;z-index:-1;border-radius:50%;filter:blur(64px);opacity:.5;pointer-events:none}
-body::before{width:26rem;height:26rem;left:-6rem;top:5rem;background:radial-gradient(circle,#8ff0b6,transparent 70%);animation:float1 20s ease-in-out infinite}
-body::after{width:22rem;height:22rem;right:-5rem;bottom:2rem;background:radial-gradient(circle,#a7f3d0,transparent 70%);animation:float2 26s ease-in-out infinite}
+/* Floating soft blobs (cream + green + warm yellow, Neato vibe) */
+body::before,body::after{content:"";position:fixed;z-index:-1;border-radius:50%;filter:blur(66px);opacity:.4;pointer-events:none}
+body::before{width:26rem;height:26rem;left:-6rem;top:5rem;background:radial-gradient(circle,#bfe3c6,transparent 70%);animation:float1 22s ease-in-out infinite}
+body::after{width:22rem;height:22rem;right:-5rem;bottom:2rem;background:radial-gradient(circle,#f3e2b0,transparent 70%);animation:float2 28s ease-in-out infinite}
 @keyframes float1{0%,100%{transform:translate(0,0)}50%{transform:translate(3rem,2rem)}}
 @keyframes float2{0%,100%{transform:translate(0,0)}50%{transform:translate(-3rem,-2rem)}}
-@media (prefers-color-scheme:dark){body::before,body::after{opacity:.14}}
+@media (prefers-color-scheme:dark){body::before,body::after{opacity:.12}}
 
 /* Glass nav */
 .glassnav{position:sticky;top:0;z-index:40;background:var(--glass);
@@ -119,7 +120,7 @@ body::after{width:22rem;height:22rem;right:-5rem;bottom:2rem;background:radial-g
 .navinner{max-width:1180px;margin:0 auto;display:flex;align-items:center;gap:1rem;padding:.7rem 1.4rem}
 .brand{display:inline-flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--ink)}
 .brand .logo{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:11px;
-  background:linear-gradient(135deg,#22c55e,#15803d);color:#fff;font-size:1rem;box-shadow:var(--glow)}
+  background:linear-gradient(135deg,#3a9160,#236340);color:#fff;font-size:1rem;box-shadow:var(--glow)}
 .brand b{font-size:1.04rem;font-weight:800;letter-spacing:-.01em;line-height:1.1;display:block}
 .brand small{color:var(--muted);font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:.11em}
 .links{display:flex;align-items:center;gap:.15rem;margin:0 auto}
@@ -152,17 +153,20 @@ body::after{width:22rem;height:22rem;right:-5rem;bottom:2rem;background:radial-g
 .tiles .tile:nth-child(2){animation-delay:.05s}.tiles .tile:nth-child(3){animation-delay:.1s}
 .tiles .tile:nth-child(4){animation-delay:.15s}.tiles .tile:nth-child(5){animation-delay:.2s}
 
-/* Buttons */
-button,.btn{background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;border:1px solid transparent;border-radius:var(--r-sm);
-  padding:.5rem .95rem;font-size:.88rem;font-weight:700;cursor:pointer;font-family:inherit;text-decoration:none;white-space:nowrap;
+/* Buttons — pill shaped (Neato) */
+button,.btn{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;border:1px solid transparent;border-radius:999px;
+  padding:.55rem 1.05rem;font-size:.88rem;font-weight:700;cursor:pointer;font-family:inherit;text-decoration:none;white-space:nowrap;
   display:inline-flex;align-items:center;gap:.4rem;transition:transform .12s,box-shadow .2s,filter .2s;box-shadow:var(--shadow-sm)}
-button:hover,.btn:hover{transform:translateY(-1px);box-shadow:var(--glow);filter:brightness(1.04)}
+button:hover,.btn:hover{transform:translateY(-1px);box-shadow:var(--glow);filter:brightness(1.05)}
 button:active{transform:translateY(0)}
 button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft),0 0 0 4px var(--accent)}
 button.ghost,.btn.ghost{background:var(--surface);color:var(--ink);border-color:var(--line-strong);box-shadow:none}
 button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accent-strong);background:var(--accent-soft);transform:translateY(-1px)}
+/* Orange CTA (Neato "Download app" style) for the primary scan actions */
+button.cta,.btn.cta{background:linear-gradient(135deg,#f0983f,#e0791f);color:#fff;box-shadow:0 10px 24px -10px rgba(224,121,31,.6)}
+button.cta:hover,.btn.cta:hover{filter:brightness(1.05);box-shadow:0 12px 28px -8px rgba(224,121,31,.6)}
 button:disabled{opacity:.6;cursor:default;transform:none;box-shadow:none;filter:none}
-.btn-lg{font-size:.95rem;padding:.68rem 1.3rem}
+.btn-lg{font-size:.95rem;padding:.72rem 1.4rem}
 .btn-lg .spin{border-color:#fff;border-top-color:transparent}
 
 /* Inputs */
@@ -185,14 +189,14 @@ tbody tr:hover{background:var(--surface-2)}
 .chip{display:inline-block;padding:.38rem .8rem;border-radius:999px;border:1px solid var(--line-strong);
   background:var(--surface);color:var(--muted);text-decoration:none;font-size:.83rem;font-weight:600;margin:0 .35rem .45rem 0;transition:all .15s}
 .chip:hover{border-color:var(--accent);color:var(--accent-strong);transform:translateY(-1px)}
-.chip.on{background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;border-color:transparent;box-shadow:var(--shadow-sm)}
+.chip.on{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;border-color:transparent;box-shadow:var(--shadow-sm)}
 
 /* Dashboard: stat tiles */
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1rem;margin-bottom:1.25rem}
 .tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.05rem 1.15rem;box-shadow:var(--shadow-sm);
   position:relative;overflow:hidden;transition:transform .18s,box-shadow .18s,border-color .18s}
 .tile:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent-border)}
-.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#22c55e,#15803d);opacity:.85}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#3a9160,#236340);opacity:.85}
 .tile .label{color:var(--faint);font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
 .tile .val{font-size:1.95rem;font-weight:800;letter-spacing:-.02em;margin:.25rem 0 .1rem;line-height:1}
 .tile .foot{color:var(--muted);font-size:.8rem;font-weight:500}
@@ -206,12 +210,12 @@ tbody tr:hover{background:var(--surface-2)}
 .panel .cap{color:var(--faint);font-size:.8rem;margin-bottom:1rem}
 .bars{display:flex;align-items:flex-end;gap:.55rem;height:130px;padding-top:.5rem}
 .bars .b{flex:1;display:flex;flex-direction:column;align-items:center;gap:.4rem;height:100%;justify-content:flex-end;color:var(--faint);font-size:.7rem}
-.bars .b i{width:100%;max-width:34px;background:linear-gradient(180deg,#34d399,#16a34a);border-radius:6px 6px 3px 3px;min-height:3px;font-style:normal;transition:height .4s cubic-bezier(.2,.7,.2,1)}
+.bars .b i{width:100%;max-width:34px;background:linear-gradient(180deg,#4aa972,#236340);border-radius:6px 6px 3px 3px;min-height:3px;font-style:normal;transition:height .4s cubic-bezier(.2,.7,.2,1)}
 .bars .b .n{color:var(--muted);font-weight:700;font-size:.72rem}
 .hbar{display:flex;align-items:center;gap:.7rem;margin:.55rem 0}
 .hbar .hl{width:96px;flex:0 0 96px;font-size:.82rem;color:var(--muted);font-weight:600;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hbar .track{flex:1;height:9px;border-radius:99px;background:var(--surface-2);overflow:hidden}
-.hbar .track i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#34d399,#16a34a)}
+.hbar .track i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#4aa972,#236340)}
 .hbar .hn{width:34px;flex:0 0 34px;text-align:right;font-weight:700;font-size:.8rem}
 .legend{display:flex;flex-wrap:wrap;gap:.4rem 1rem;margin-top:.8rem;font-size:.82rem;color:var(--muted)}
 .legend b{color:var(--ink)}
@@ -246,7 +250,7 @@ tbody tr:hover{background:var(--surface-2)}
 .muted-count{color:var(--faint)}
 
 /* Status bars */
-.scanbar{background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;text-align:center;padding:.55rem 1rem;font-weight:600;font-size:.86rem;
+.scanbar{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;text-align:center;padding:.55rem 1rem;font-weight:600;font-size:.86rem;
   display:flex;align-items:center;justify-content:center;gap:.5rem}
 .scanbar .spin{border-color:rgba(255,255,255,.5);border-top-color:#fff}
 .donebar{background:var(--ok-soft);color:var(--ok);border-bottom:1px solid var(--ok-border);text-align:center;padding:.5rem 1rem;font-weight:600;font-size:.86rem}
@@ -255,7 +259,7 @@ tbody tr:hover{background:var(--surface-2)}
 
 /* Section heading */
 .sechead{display:flex;align-items:center;gap:.55rem;font-size:1.02rem;font-weight:800;letter-spacing:-.01em;margin:1.6rem 0 .9rem}
-.sechead::before{content:"";width:4px;height:1rem;border-radius:99px;background:linear-gradient(180deg,#22c55e,#15803d)}
+.sechead::before{content:"";width:4px;height:1rem;border-radius:99px;background:linear-gradient(180deg,#3a9160,#236340)}
 .sechead span{color:var(--faint);font-size:.84rem;font-weight:600}
 
 /* Misc */
@@ -291,10 +295,10 @@ def _shell(title: str, active: str, body: str) -> str:
     scanning = bool(news["running"] or yt["running"])
 
     scan_btn = (
-        '<button disabled><span class="spin"></span>Scanning…</button>'
+        '<button class="cta" disabled><span class="spin"></span>Scanning…</button>'
         if scanning
         else '<form method="post" action="/ui/scan" style="margin:0">'
-        "<button>▶ Scan all</button></form>"
+        '<button class="cta">▶ Scan all</button></form>'
     )
     nav_html = "".join(
         f'<a class="{"active" if key == active else ""}" href="{href}">'
@@ -362,7 +366,7 @@ async function pollScan(){
       var what = n.running ? 'newspapers for ' : 'YouTube ';
       bar.innerHTML = '<div class="scanbar"><span class="spin"></span>Scanning '+what+who+
         '… you can switch tabs — results load automatically when done.</div>';
-      nav.innerHTML = '<button disabled><span class="spin"></span>Scanning…</button>';
+      nav.innerHTML = '<button class="cta" disabled><span class="spin"></span>Scanning…</button>';
       var f = document.getElementById('sidefoot');
       if(f) f.innerHTML = '<span class="dot busy"></span>Scanning…';
     } else if(wasScanning){
@@ -387,7 +391,11 @@ def _detection_card(m: Mention) -> str:
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in (m.matched_keywords or []))
     when = m.detected_at.astimezone().strftime("%d %b %Y, %H:%M") if m.detected_at else ""
     icon = "▶ YouTube" if m.module == "youtube" else "📰"
-    meta = " · ".join(x for x in [icon, m.source, m.sentiment] if x)
+    stamp = None
+    if m.module == "youtube" and m.deeplink_seconds is not None:
+        s = int(m.deeplink_seconds)
+        stamp = f"⏱ jump to {s // 60}:{s % 60:02d}"
+    meta = " · ".join(x for x in [icon, m.source, m.sentiment, stamp] if x)
     return (
         f'<div class="det">{img}<div class="body">'
         f'<a class="ttl" href="{html.escape(m.url)}" target="_blank">{html.escape(m.title)}</a>'
@@ -399,8 +407,8 @@ def _detection_card(m: Mention) -> str:
 # Overview dashboard
 # --------------------------------------------------------------------------
 _PKT = timezone(timedelta(hours=5))
-_SENT_COLORS = {"Positive": "var(--ok)", "Critical": "var(--accent)",
-                "Neutral": "#8a93a3", "Unscored": "var(--line-strong)"}
+_SENT_COLORS = {"Positive": "var(--accent)", "Critical": "#e05d3a",
+                "Neutral": "#9b9384", "Unscored": "var(--line-strong)"}
 
 
 def _utc(dt):
@@ -645,7 +653,7 @@ def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
     table = _keyword_table(keywords, "/newspapers", "newspaper", counts, scanning, edit)
     scan_all = (
         '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
-        if scanning else '<button class="btn-lg" type="submit">▶ Scan all newspaper keywords</button>'
+        if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all newspaper keywords</button>'
     )
     n_sites = len(SITE_CONFIGS) + 1
     body = f"""
@@ -785,7 +793,7 @@ def youtube_page(error: str | None = None, edit: int | None = None, db: Session 
     ktable = _keyword_table(keywords, "/youtube", "youtube", counts, scanning, edit)
     scan_all = (
         '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
-        if scanning else '<button class="btn-lg" type="submit">▶ Scan all YouTube keywords</button>'
+        if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all YouTube keywords</button>'
     )
     banner = f'<div class="banner">⚠ {html.escape(error)}</div>' if error else ""
     trans = settings.youtube_transcriber
