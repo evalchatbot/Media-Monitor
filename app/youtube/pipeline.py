@@ -123,7 +123,7 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
         _alert(notifier, session, mention, new_kw, summary)
         return
 
-    # Deep-link timestamp: earliest transcript segment mentioning a keyword.
+    # Deep-link timestamp: exact second the keyword is first spoken.
     sec = None
     for kw in matched_kw:
         sec = transcribe.find_keyword_second(segments, kw)
@@ -135,6 +135,10 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
     if scored.get("relevance") == "Not Relevant":
         logger.info("YouTube: skipping '%s' — LLM Not Relevant", v.title[:50])
         return
+
+    # If we know the exact second, grab the video frame at that moment so the
+    # detection shows what was on screen when the keyword was said.
+    shot = _capture_video_frame(v, ch, sec, deeplink)
 
     snippet = _snippet(haystack, matched_kw)
     mention = Mention(
@@ -149,6 +153,7 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
         summary=scored.get("summary") or snippet,
         relevance=scored.get("relevance"),
         sentiment=scored.get("sentiment"),
+        screenshot_path=shot,
         deeplink_seconds=sec,
         published_at=v.published,
     )
@@ -279,6 +284,26 @@ def _alert(notifier, session, mention: Mention, keywords, summary) -> None:
         mention.notified = True
         session.commit()
         summary["alerts"] += 1
+
+
+def _capture_video_frame(v, ch, sec, deeplink) -> str | None:
+    """Grab the video frame at `sec` and stamp a footer. Returns a path or None.
+
+    Best-effort: needs ffmpeg + a resolvable stream. Never blocks a scan.
+    """
+    if sec is None:
+        return None
+    from pathlib import Path
+
+    from app.scrapers.footer import add_footer
+    from app.youtube import frame
+
+    out = settings.storage_dir / "youtube" / f"{v.video_id}_{int(sec)}s.jpg"
+    if not frame.capture_frame(v.url, sec, out):
+        return None
+    ts = f"▶ @ {int(sec) // 60}:{int(sec) % 60:02d}"
+    add_footer(Path(out), getattr(v, "channel_name", "") or getattr(ch, "name", ""), ts, deeplink)
+    return str(out)
 
 
 def _save_transcript(session, v, ch, text, segments, is_live=False) -> None:
