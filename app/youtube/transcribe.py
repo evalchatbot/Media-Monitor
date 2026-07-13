@@ -19,12 +19,20 @@ scan never crashes.
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 from pathlib import Path
 
+from rapidfuzz.distance import Levenshtein
+
+from app.core.keywords import normalize
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Word tokenizer (unicode-aware) — matches app.core.keywords._tokenize so the
+# deep-link locator sees the same tokens the keyword matcher did.
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def transcribe(video_url: str) -> tuple[str, list[dict]]:
@@ -52,37 +60,59 @@ def transcribe_file(audio) -> tuple[str, list[dict]]:
     return "", []
 
 
-def find_keyword_second(segments: list[dict], keyword: str) -> int | None:
+def find_keyword_second(
+    segments: list[dict], keyword: str, language: str = "en", max_distance: int = 2
+) -> int | None:
     """Return the start second of the earliest mention of `keyword`.
 
-    `segments` may be word-level ([{start, text=<word>}, ...]) or segment-level;
-    this scans the token stream so a multi-word keyword matches across adjacent
-    words, returning the start time of the FIRST word — giving word-level deep-
-    link precision when word timestamps are available, segment-level otherwise.
+    Matching mirrors ``app.core.keywords.find_matches`` so any keyword the
+    matcher accepted can also be *located* here:
+
+    * both keyword and transcript are normalized per language (Urdu code-point
+      unification + harakat strip; English lowercase),
+    * compared by whole-word EQUALITY first — so "war" no longer latches onto
+      "award" (which would give a wrong second, wrong frame, wrong deep-link),
+    * then a Levenshtein<=2 fuzzy pass so a mistranscribed "Bhuto" still locates
+      the keyword "Bhutto" (the metadata matcher's fuzzy hits get a timestamp).
+
+    `segments` may be word-level ([{start, text=<word>}, ...]) for word-level
+    precision, or segment-level. Punctuation-only tokens are dropped so they
+    can't break multi-word adjacency. Returns the FIRST word's start second.
     """
     if not segments:
         return None
-    kw_tokens = keyword.lower().split()
+    norm_kw = normalize(keyword, language)
+    kw_tokens = norm_kw.split()
     if not kw_tokens:
         return None
-
-    def clean(t: str) -> str:
-        return t.lower().strip(".,!?;:\"'()[]—–…")
-
-    stream: list[tuple[str, float]] = []  # (token, start_second)
-    for seg in segments:
-        start = seg.get("start", 0) or 0
-        for tok in (seg.get("text") or "").split():
-            stream.append((clean(tok), start))
-
     n = len(kw_tokens)
-    for i in range(len(stream) - n + 1):
-        if all(kw_tokens[j] in stream[i + j][0] for j in range(n)):
-            return int(stream[i][1])
-    # Fallback: whole keyword appears within a single segment's text.
+
+    # Normalized (token, start) stream — same normalization the matcher used.
+    stream: list[tuple[str, float]] = []
     for seg in segments:
-        if keyword.lower() in (seg.get("text") or "").lower():
-            return int(seg.get("start", 0) or 0)
+        start = float(seg.get("start", 0) or 0)
+        for w in _WORD_RE.findall(normalize(seg.get("text") or "", language)):
+            stream.append((w, start))
+
+    # 1) Exact whole-word match (word boundaries, not substring).
+    for i in range(len(stream) - n + 1):
+        if all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
+            return int(stream[i][1])
+
+    # 2) Fuzzy fallback mirroring find_matches (guarded so a 2-edit budget can't
+    #    over-match very short keywords onto the first unrelated word).
+    if len(norm_kw) >= 4:
+        for i in range(len(stream) - n + 1):
+            window = " ".join(stream[i + j][0] for j in range(n))
+            if abs(len(window) - len(norm_kw)) > max_distance:
+                continue
+            if Levenshtein.distance(window, norm_kw, score_cutoff=max_distance) <= max_distance:
+                return int(stream[i][1])
+
+    # 3) Last resort: the whole (normalized) keyword within one segment's text.
+    for seg in segments:
+        if norm_kw in normalize(seg.get("text") or "", language):
+            return int(float(seg.get("start", 0) or 0))
     return None
 
 
@@ -181,14 +211,30 @@ def _get_local_model():
 
 def _transcribe_local(audio: Path) -> tuple[str, list[dict]]:
     model = _get_local_model()
-    seg_iter, info = model.transcribe(
-        str(audio),
-        language=(settings.whisper_language or None),  # "" -> auto-detect; "ur"/"en" to force
-        word_timestamps=True,
-        vad_filter=True,  # skip silence — big speedup, fewer hallucinations
-    )
+    forced = settings.whisper_language or None  # "" -> auto-detect; "ur"/"en" to force
+
+    def _run(lang):
+        return model.transcribe(
+            str(audio),
+            language=lang,
+            word_timestamps=True,
+            vad_filter=True,  # skip silence — big speedup, fewer hallucinations
+        )
+
+    # faster-whisper runs language detection up front and exposes it on `info`
+    # BEFORE the (lazy) segment generator is consumed, so we can cheaply re-decode.
+    seg_iter, info = _run(forced)
+    detected = getattr(info, "language", None)
+    # Urdu and Hindi are the same spoken language; large-v3 auto-detect often
+    # tags Urdu speech as 'hi' and decodes it into Devanagari, which then never
+    # matches Perso-Arabic Urdu keywords. This tool only monitors Urdu+English,
+    # so treat a 'hi' detection as Urdu and re-decode in the correct script.
+    if forced is None and detected == "hi":
+        logger.info("faster-whisper: detected 'hi' — re-decoding as Urdu (ur/en scope)")
+        seg_iter, info = _run("ur")
+        detected = getattr(info, "language", None)
     logger.info("faster-whisper: language=%s (p=%.2f)",
-                getattr(info, "language", "?"), getattr(info, "language_probability", 0.0))
+                detected, getattr(info, "language_probability", 0.0))
     segments, texts = [], []
     for s in seg_iter:
         texts.append(s.text)

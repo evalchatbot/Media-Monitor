@@ -107,6 +107,7 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
         return
 
     matched_kw = sorted({m.keyword for m in matches})
+    kw_lang = {m.keyword: m.language for m in matches}  # locate each in its own script
 
     mention = session.execute(
         select(Mention).where(
@@ -123,13 +124,21 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
         _alert(notifier, session, mention, new_kw, summary)
         return
 
+    # `segments` is only populated the first time a video is transcribed. When a
+    # keyword is added AFTER the video was cached, reload the word-level segments
+    # persisted on the Transcript row so the timestamp + frame still get produced.
+    if not segments:
+        segments = session.execute(
+            select(Transcript.segments).where(Transcript.video_id == v.video_id)
+        ).scalar_one_or_none() or []
+
     # Deep-link timestamp: exact second the keyword is first spoken.
     sec = None
     for kw in matched_kw:
-        sec = transcribe.find_keyword_second(segments, kw)
+        sec = transcribe.find_keyword_second(segments, kw, kw_lang.get(kw, "en"))
         if sec is not None:
             break
-    deeplink = v.url + (f"&t={sec}s" if sec else "")
+    deeplink = v.url + (f"&t={sec}s" if sec is not None else "")
 
     scored = scoring.score(v.title, cache.body, matched_kw) or {}
     if scored.get("relevance") == "Not Relevant":
