@@ -22,6 +22,7 @@ SITE_CONFIGS: list[SiteConfig] = [
         base_url="https://www.thenews.com.pk",
         sections={
             "latest": "https://www.thenews.com.pk/latest",
+            "world": "https://www.thenews.com.pk/latest/category/world",
             "opinion": "https://www.thenews.com.pk/latest/category/opinion",
         },
         language="en",
@@ -34,6 +35,7 @@ SITE_CONFIGS: list[SiteConfig] = [
         base_url="https://tribune.com.pk",
         sections={
             "latest": "https://tribune.com.pk/latest",
+            "world": "https://tribune.com.pk/world",
             "opinion": "https://tribune.com.pk/opinion",
         },
         language="en",
@@ -46,6 +48,7 @@ SITE_CONFIGS: list[SiteConfig] = [
         base_url="https://jang.com.pk",
         sections={
             "latest": "https://jang.com.pk/category/latest-news",
+            "world": "https://jang.com.pk/category/world",
             "columns": "https://jang.com.pk/columns",
         },
         language="ur",
@@ -58,6 +61,7 @@ SITE_CONFIGS: list[SiteConfig] = [
         base_url="https://www.nawaiwaqt.com.pk",
         sections={
             "national": "https://www.nawaiwaqt.com.pk/national",
+            "international": "https://www.nawaiwaqt.com.pk/international",
             "columns": "https://www.nawaiwaqt.com.pk/columns",
         },
         language="ur",
@@ -97,6 +101,7 @@ SITE_CONFIGS: list[SiteConfig] = [
         sections={
             "front": "https://www.express.pk/",
             "latest": "https://www.express.pk/latest-news/",
+            "world": "https://www.express.pk/world/",
             "columns": "https://www.express.pk/columns",
         },
         language="ur",
