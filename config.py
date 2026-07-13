@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     youtube_scan_interval_minutes: int = 10
     openai_api_key: str = ""
     whisper_model: str = "large-v3"     # for local faster-whisper
+    # Local faster-whisper tuning:
+    whisper_device: str = "auto"        # auto | cuda | cpu
+    whisper_compute_type: str = "auto"  # auto | int8_float16 (GPU) | int8 (CPU) | float16
+    whisper_cpu_threads: int = 8
+    whisper_language: str = ""          # "" = auto-detect, or "ur" / "en"
     youtube_max_videos_per_scan: int = 15
     # Live-stream monitoring (needs ffmpeg + a non-stub transcriber to do real work)
     youtube_live_enabled: bool = False

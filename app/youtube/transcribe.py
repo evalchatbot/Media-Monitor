@@ -158,17 +158,43 @@ def _attr(obj, name, default=None):
     return getattr(obj, name, default)
 
 
-def _transcribe_local(audio: Path) -> tuple[str, list[dict]]:
-    from faster_whisper import WhisperModel
+_LOCAL_MODEL = None
 
-    # device/compute_type left to the user's GPU setup; defaults are CPU-safe.
-    model = WhisperModel(settings.whisper_model, device="auto", compute_type="auto")
-    seg_iter, _info = model.transcribe(str(audio), word_timestamps=True)
+
+def _get_local_model():
+    """Load faster-whisper large-v3 once and reuse it (loading is expensive)."""
+    global _LOCAL_MODEL
+    if _LOCAL_MODEL is None:
+        from faster_whisper import WhisperModel
+
+        # device='auto' picks CUDA if available else CPU; compute_type='auto'
+        # picks an efficient type (int8_float16 on GPU, int8 on CPU) per your setup.
+        # Override via WHISPER_DEVICE / WHISPER_COMPUTE_TYPE.
+        _LOCAL_MODEL = WhisperModel(
+            settings.whisper_model,
+            device=settings.whisper_device,
+            compute_type=settings.whisper_compute_type,
+            cpu_threads=settings.whisper_cpu_threads,
+        )
+    return _LOCAL_MODEL
+
+
+def _transcribe_local(audio: Path) -> tuple[str, list[dict]]:
+    model = _get_local_model()
+    seg_iter, info = model.transcribe(
+        str(audio),
+        language=(settings.whisper_language or None),  # "" -> auto-detect; "ur"/"en" to force
+        word_timestamps=True,
+        vad_filter=True,  # skip silence — big speedup, fewer hallucinations
+    )
+    logger.info("faster-whisper: language=%s (p=%.2f)",
+                getattr(info, "language", "?"), getattr(info, "language_probability", 0.0))
     segments, texts = [], []
     for s in seg_iter:
         texts.append(s.text)
         if getattr(s, "words", None):
             for w in s.words:
+                # w.start is the deep-link timestamp for that word.
                 segments.append({"start": w.start, "text": w.word})
         else:
             segments.append({"start": s.start, "text": s.text})
