@@ -1,0 +1,38 @@
+# --- Web / API ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-multipart==0.0.20
+
+# --- Config ---
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- Database / ORM ---
+sqlalchemy==2.0.36
+alembic==1.14.0
+# psycopg[binary]==3.2.3   # uncomment when moving to Postgres
+
+# --- Scheduling ---
+apscheduler==3.11.0
+
+# --- Scraping ---
+playwright==1.49.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+httpx==0.28.1
+
+# --- Matching ---
+rapidfuzz==3.11.0
+
+# --- LLM scoring (Newspaper relevance/sentiment) ---
+anthropic==0.42.0
+
+# --- Screenshot footer overlay ---
+pillow==11.1.0
+
+# --- YouTube module ---
+yt-dlp==2025.1.15          # audio download for transcription (needs ffmpeg on PATH)
+# openai==1.59.0           # uncomment for Whisper API transcription path
+# faster-whisper==1.1.0    # uncomment for local GPU transcription path
