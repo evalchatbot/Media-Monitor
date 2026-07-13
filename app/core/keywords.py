@@ -70,6 +70,34 @@ def _fuzzy_contains(haystack_tokens: list[str], needle: str, max_distance: int) 
     return False
 
 
+# Inflectional suffixes allowed on an exact match so "protest" also catches
+# "protests/protested/protesting" — without the substring noise that made
+# "rape" hit "grape"/"scrape". Only applied to keywords >= 4 chars: on shorter
+# ones a bounded suffix still over-matches (e.g. "war" -> "ward"), so those match
+# as whole words only.
+_INFLECT = "(?:s|es|ed|d|ing)?"
+
+
+def exact_pattern(norm_kw: str) -> str:
+    """Word-boundary regex for `norm_kw` (whole word + light inflection)."""
+    suffix = _INFLECT if len(norm_kw.replace(" ", "")) >= 4 else ""
+    return rf"(?<!\w){re.escape(norm_kw)}{suffix}(?!\w)"
+
+
+def fuzzy_budget(norm_kw: str, cap: int = 2) -> int:
+    """Edit-distance budget scaled to keyword length.
+
+    Short keywords get 0 so a 2-edit budget can't match dozens of unrelated
+    common words (rape ~ rate/rare/race/rope/ripe). 5-7 chars get 1, 8+ get 2.
+    """
+    n = len(norm_kw.replace(" ", ""))
+    if n <= 4:
+        return 0
+    if n <= 7:
+        return 1
+    return min(2, cap)
+
+
 def find_matches(
     text: str,
     keywords: list[tuple[str, str]],
@@ -99,9 +127,15 @@ def find_matches(
         if not norm_kw:
             continue
 
-        if norm_kw in norm_text:
+        # Whole-word match (not substring) so "rape" no longer matches inside
+        # "grape"/"scrape"; light inflection keeps "raped"/"rapes".
+        if re.search(exact_pattern(norm_kw), norm_text):
             matches.append(KeywordMatch(kw_text, lang, exact=True))
-        elif _fuzzy_contains(tokens, norm_kw, max_distance):
+            continue
+        # Fuzzy fallback, but only with a length-scaled edit budget (0 for short
+        # keywords) so it can't turn "rape" into rate/rare/race/rope/ripe.
+        budget = fuzzy_budget(norm_kw, max_distance)
+        if budget and _fuzzy_contains(tokens, norm_kw, budget):
             matches.append(KeywordMatch(kw_text, lang, exact=False))
 
     return matches

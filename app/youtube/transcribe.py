@@ -25,7 +25,7 @@ from pathlib import Path
 
 from rapidfuzz.distance import Levenshtein
 
-from app.core.keywords import normalize
+from app.core.keywords import fuzzy_budget, normalize
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -99,14 +99,15 @@ def find_keyword_second(
         if all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
             return int(stream[i][1])
 
-    # 2) Fuzzy fallback mirroring find_matches (guarded so a 2-edit budget can't
-    #    over-match very short keywords onto the first unrelated word).
-    if len(norm_kw) >= 4:
+    # 2) Fuzzy fallback mirroring find_matches, with the SAME length-scaled edit
+    #    budget so short keywords don't latch onto the first unrelated word.
+    budget = fuzzy_budget(norm_kw, max_distance)
+    if budget:
         for i in range(len(stream) - n + 1):
             window = " ".join(stream[i + j][0] for j in range(n))
-            if abs(len(window) - len(norm_kw)) > max_distance:
+            if abs(len(window) - len(norm_kw)) > budget:
                 continue
-            if Levenshtein.distance(window, norm_kw, score_cutoff=max_distance) <= max_distance:
+            if Levenshtein.distance(window, norm_kw, score_cutoff=budget) <= budget:
                 return int(stream[i][1])
 
     # 3) Last resort: the whole (normalized) keyword within one segment's text.
