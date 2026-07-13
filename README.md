@@ -25,14 +25,20 @@ default mode; going fully live is just adding credentials and flipping a flag
 ## Modules
 
 - **Newspaper** — Dawn, The News, Express Tribune, Jang, Nawa-i-Waqt, ARY News,
-  Dunya News (7 sites). Scrape → cache → keyword match → screenshot (with
-  metadata footer) → store → alert. *(Geo is JS/API-rendered — not yet scraped.)*
-- **YouTube** — RSS-based new-upload detection (no API key), keyword match on
-  title/description (+ transcript if enabled), timestamp deep-links, same alert +
-  digest pipeline.
+  Dunya News, Express Urdu (8 sites). Scrape → cache → keyword match → screenshot
+  (with metadata footer) → store → alert. *(Geo is API-rendered — see
+  [docs/RUNBOOK.md](docs/RUNBOOK.md) §6.)*
+- **YouTube** — RSS-based new-upload detection (no API key) + live-stream tapping
+  (flag-gated), keyword match on title/description/transcript, word-level timestamp
+  deep-links, same alert + digest pipeline.
 - **Digest** — daily 07:00 PKT summary grouped by source with sentiment counts +
   thumbnails.
 - **Retention** — daily cleanup (screenshots 90d, transcripts 12m, logs 24m).
+
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system diagram, components, stack decisions, **env var reference**, API summary
+- [docs/RUNBOOK.md](docs/RUNBOOK.md) — setup, enabling credentials, adding a publication/channel, fixing a broken scraper, recovery, troubleshooting
 
 ## Setup
 
