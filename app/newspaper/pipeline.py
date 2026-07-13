@@ -65,13 +65,15 @@ def run_newspaper_scan(keyword_ids: list[int] | None = None, uncapped: bool = Fa
             logger.info("No active keywords to match; nothing to do.")
             return summary
 
-        # Shared new-fetch budget across ALL sites this run. None = unlimited
-        # (manual/uncapped scan). Capped scans bound TOTAL fetches so 7 sites
-        # don't balloon to 7×cap; caches warm over successive scheduled runs.
-        budget = {"remaining": None if uncapped else settings.newspaper_max_articles_per_scan}
+        # PER-SITE new-fetch cap (None = unlimited on manual/uncapped scans).
+        # This MUST be per-site: a single shared pool was drained entirely by the
+        # first scraper (Dawn, 200+ articles), so every later site — including all
+        # three Urdu papers — cached nothing and Urdu keywords could never match.
+        per_site_cap = None if uncapped else settings.newspaper_max_articles_per_scan
 
         for scraper in _registered_scrapers():
             summary["scrapers"] += 1
+            budget = {"remaining": per_site_cap}  # fresh budget for THIS site
             run = ScrapeRun(source=scraper.name, started_at=datetime.now(timezone.utc))
             session.add(run)
             session.commit()
