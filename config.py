@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "sqlite:///./data/media_monitoring.db"
 
+    # --- Supabase (optional) ---
+    # The app talks to Postgres directly via DATABASE_URL. These are only used if
+    # a Supabase REST/JS client is added later (a Next.js frontend, etc.) — they
+    # do NOT authenticate the database connection.
+    supabase_url: str = ""
+    supabase_publishable_key: str = ""
+
     # --- Storage ---
     storage_dir: Path = BASE_DIR / "data" / "storage"
 
