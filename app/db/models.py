@@ -38,10 +38,15 @@ class Keyword(Base):
     text: Mapped[str] = mapped_column(String(255), nullable=False)
     # 'en' or 'ur'
     language: Mapped[str] = mapped_column(String(8), default="en", nullable=False)
+    # 'newspaper' | 'youtube' — which module this keyword is searched in.
+    module: Mapped[str] = mapped_column(String(16), default="newspaper", nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
-    __table_args__ = (UniqueConstraint("text", "language", name="uq_keyword_text_lang"),)
+    # Same word can exist independently for newspapers and YouTube.
+    __table_args__ = (
+        UniqueConstraint("text", "language", "module", name="uq_keyword_text_lang_module"),
+    )
 
 
 class Mention(Base):
@@ -121,6 +126,34 @@ class YouTubeChannel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (UniqueConstraint("channel_id", name="uq_youtube_channel_id"),)
+
+
+class Transcript(Base):
+    """Full YouTube transcript for a video — text + word/segment-level timestamps.
+
+    Written whenever a real (non-stub) transcription runs. `segments` is a JSON
+    list of {"start": <sec>, "text": <word|phrase>} used for keyword deep-links.
+    Persisted separately from ArticleCache so transcripts are first-class,
+    queryable, and retained on their own schedule.
+    """
+
+    __tablename__ = "transcripts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    video_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(255), default="")  # channel name
+    title: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    segments: Mapped[list] = mapped_column(JSON, default=list)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    transcriber: Mapped[str] = mapped_column(String(16), default="stub")  # stub|openai|local
+    is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("video_id", name="uq_transcript_video_id"),)
 
 
 class ScrapeRun(Base):

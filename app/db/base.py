@@ -47,8 +47,29 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 
 def init_db() -> None:
-    """Create all tables. Safe to call repeatedly (idempotent)."""
+    """Create all tables + run lightweight migrations. Safe to call repeatedly."""
     # Import models so they register on Base.metadata before create_all.
     from app.db import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _migrate_sqlite(models)
+
+
+def _migrate_sqlite(models) -> None:
+    """Idempotent SQLite migrations (Postgres/Supabase gets the schema fresh).
+
+    Adds Keyword.module by rebuilding the table (also drops the old
+    text+language unique constraint so a word can exist for both modules).
+    """
+    if not engine.url.get_backend_name().startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(keywords)").fetchall()]
+        if cols and "module" not in cols:
+            conn.exec_driver_sql("ALTER TABLE keywords RENAME TO keywords_old")
+            models.Keyword.__table__.create(bind=conn)
+            conn.exec_driver_sql(
+                "INSERT INTO keywords (id, text, language, module, active, created_at) "
+                "SELECT id, text, language, 'newspaper', active, created_at FROM keywords_old"
+            )
+            conn.exec_driver_sql("DROP TABLE keywords_old")

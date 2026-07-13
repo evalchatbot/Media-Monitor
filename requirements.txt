@@ -12,7 +12,7 @@ python-dotenv==1.0.1
 # --- Database / ORM ---
 sqlalchemy==2.0.36
 alembic==1.14.0
-# psycopg[binary]==3.2.3   # uncomment when moving to Postgres
+psycopg[binary]==3.2.3   # PostgreSQL driver (Supabase) — set DATABASE_URL=postgresql+psycopg://…
 
 # --- Scheduling ---
 apscheduler==3.11.0

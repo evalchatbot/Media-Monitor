@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core import scoring
 from app.core.keywords import find_matches
 from app.db.base import SessionLocal
-from app.db.models import ArticleCache, Keyword, Mention, YouTubeChannel
+from app.db.models import ArticleCache, Keyword, Mention, Transcript, YouTubeChannel
 from app.youtube import rss, transcribe
 from app.notifiers import get_notifier
 from app.notifiers.base import Alert
@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 def _active_keywords(session, keyword_ids):
-    stmt = select(Keyword).where(Keyword.active.is_(True))
+    # YouTube scans only use keywords scoped to the youtube module.
+    stmt = select(Keyword).where(Keyword.active.is_(True), Keyword.module == "youtube")
     if keyword_ids:
         stmt = stmt.where(Keyword.id.in_(keyword_ids))
     return [(k.text, k.language) for k in session.execute(stmt).scalars()]
@@ -96,6 +97,9 @@ def _process_video(session, ch, v: "rss.Video", keywords, notifier, summary) -> 
                     ArticleCache.module == "youtube", ArticleCache.external_id == v.video_id
                 )
             ).scalar_one()
+        # Persist a real transcript (with timestamps) as a first-class row.
+        if transcript:
+            _save_transcript(session, v, ch, transcript, segments)
 
     haystack = f"{v.title}\n{cache.body}"
     matches = find_matches(haystack, keywords)
@@ -198,9 +202,11 @@ def run_youtube_live_scan(keyword_ids=None, channel_ids=None) -> dict:
                 continue  # not tappable (ffmpeg missing) — already logged
             summary["tapped"] += 1
             try:
-                transcript, _segments = transcribe.transcribe_file(audio)
+                transcript, segments = transcribe.transcribe_file(audio)
             finally:
                 shutil.rmtree(audio.parent, ignore_errors=True)
+            if transcript:
+                _save_transcript(session, live, ch, transcript, segments, is_live=True)
 
             haystack = f"{live.title}\n{transcript}"
             matches = find_matches(haystack, keywords)
@@ -273,6 +279,32 @@ def _alert(notifier, session, mention: Mention, keywords, summary) -> None:
         mention.notified = True
         session.commit()
         summary["alerts"] += 1
+
+
+def _save_transcript(session, v, ch, text, segments, is_live=False) -> None:
+    """Upsert a Transcript row for a video (best-effort; never blocks a scan)."""
+    exists = session.execute(
+        select(Transcript.id).where(Transcript.video_id == v.video_id)
+    ).first()
+    if exists:
+        return
+    session.add(
+        Transcript(
+            video_id=v.video_id,
+            channel_id=getattr(ch, "channel_id", None),
+            source=getattr(v, "channel_name", "") or getattr(ch, "name", ""),
+            title=v.title,
+            url=v.url,
+            text=text,
+            segments=segments or [],
+            transcriber=settings.youtube_transcriber,
+            is_live=is_live,
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
 
 
 def _snippet(text: str, keywords, width: int = 160) -> str:

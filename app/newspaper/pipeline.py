@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 def _active_keywords(session, keyword_ids: list[int] | None) -> list[tuple[str, str]]:
-    stmt = select(Keyword).where(Keyword.active.is_(True))
+    # Newspaper scans only use keywords scoped to the newspaper module.
+    stmt = select(Keyword).where(Keyword.active.is_(True), Keyword.module == "newspaper")
     if keyword_ids:
         stmt = stmt.where(Keyword.id.in_(keyword_ids))
     rows = session.execute(stmt).scalars().all()

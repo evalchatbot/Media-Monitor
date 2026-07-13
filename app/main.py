@@ -247,13 +247,13 @@ tbody tr:hover{background:var(--surface-2)}
 
 _NAV = [
     ("/", "Overview", "overview", "◧"),
+    ("/newspapers", "Newspapers", "newspapers", "📰"),
+    ("/youtube", "YouTube", "youtube", "▶"),
     ("/mentions", "Detections", "mentions", "◎"),
-    ("/keywords", "Keywords", "keywords", "#"),
-    ("/channels", "Channels", "channels", "▶"),
     ("/docs", "API", "api", "⚙"),
 ]
-_TITLES = {"overview": "Overview", "mentions": "Detections",
-           "keywords": "Keywords", "channels": "Channels"}
+_TITLES = {"overview": "Overview", "newspapers": "Newspapers",
+           "youtube": "YouTube", "mentions": "Detections"}
 
 
 def _shell(title: str, active: str, body: str) -> str:
@@ -457,6 +457,10 @@ def dashboard(db: Session = Depends(get_db)):
     active_kw = db.scalar(
         select(func.count()).select_from(Keyword).where(Keyword.active.is_(True))
     ) or 0
+    np_kw = db.scalar(select(func.count()).select_from(Keyword).where(
+        Keyword.active.is_(True), Keyword.module == "newspaper")) or 0
+    yt_kw = db.scalar(select(func.count()).select_from(Keyword).where(
+        Keyword.active.is_(True), Keyword.module == "youtube")) or 0
     n_channels = db.scalar(select(func.count()).select_from(YouTubeChannel)) or 0
     n_papers = len(SITE_CONFIGS) + 1  # Dawn + configurable sites
 
@@ -526,7 +530,7 @@ def dashboard(db: Session = Depends(get_db)):
     <div class="tiles">
       {tile("Total detections", total, "all time", "◎")}
       {tile("Today", today, "since 00:00 PKT", "↑")}
-      {tile("Active keywords", active_kw, '<a class="count-link" href="/keywords">manage →</a>', "#")}
+      {tile("Active keywords", active_kw, f'{np_kw} <a class="count-link" href="/newspapers">news</a> · {yt_kw} <a class="count-link" href="/youtube">YT</a>', "#")}
       {tile("Sources", n_papers + n_channels, f'{n_papers} papers · {n_channels} channel{"" if n_channels == 1 else "s"}', "◧")}
       {tile("Last scan", last_txt, '<a class="count-link" href="/mentions">view →</a>', "▶")}
     </div>
@@ -553,108 +557,110 @@ def dashboard(db: Session = Depends(get_db)):
 
 
 # --------------------------------------------------------------------------
-# Keywords page
+# Module pages (Newspapers / YouTube) — each has its OWN keyword search
 # --------------------------------------------------------------------------
-@app.get("/keywords", response_class=HTMLResponse)
-def keywords_page(edit: int | None = None, db: Session = Depends(get_db)):
-    keywords = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
-    # Count detections per keyword (cheap: one pass over recent mentions).
-    mentions = db.execute(select(Mention.matched_keywords).limit(1000)).scalars().all()
-    counts: dict[str, int] = {}
-    for mk in mentions:
+def _kw_counts(db, module: str) -> dict:
+    rows = db.execute(
+        select(Mention.matched_keywords).where(Mention.module == module).limit(3000)
+    ).scalars().all()
+    c: dict[str, int] = {}
+    for mk in rows:
         for k in (mk or []):
-            counts[k] = counts.get(k, 0) + 1
+            c[k] = c.get(k, 0) + 1
+    return c
 
-    scanning = scan_manager.is_running()
 
-    if keywords:
-        rows = ""
-        for k in keywords:
-            if edit == k.id:
-                # Inline edit form spanning the row.
-                en = "selected" if k.language == "en" else ""
-                ur = "selected" if k.language == "ur" else ""
-                rows += (
-                    f'<tr><td colspan="5">'
-                    f'<form method="post" action="/ui/keywords/{k.id}/edit" class="row">'
-                    f'<input name="text" value="{html.escape(k.text)}" required style="flex:1;min-width:200px">'
-                    f'<select name="language"><option value="en" {en}>English</option>'
-                    f'<option value="ur" {ur}>Urdu</option></select>'
-                    f"<button type=\"submit\">Save</button>"
-                    f'<a href="/keywords" style="align-self:center;color:var(--muted);font-weight:600;text-decoration:none">Cancel</a>'
-                    f"</form></td></tr>"
-                )
-                continue
-
-            n = counts.get(k.text, 0)
-            results = (
-                f'<a class="count-link" href="/mentions?keyword={k.text}">{n} result(s) →</a>'
-                if n else '<span class="muted-count">0 results</span>'
-            )
-            status = (
-                f'<button class="ghost" title="Click to pause — paused keywords are skipped by scans">🟢 Active</button>'
-                if k.active
-                else '<button title="Click to activate">⏸ Paused</button>'
-            )
-            dim = "" if k.active else ' style="opacity:.55"'
-            scan_disabled = "disabled" if (scanning or not k.active) else ""
+def _keyword_table(keywords, page_path: str, src: str, counts: dict, scanning: bool, edit) -> str:
+    if not keywords:
+        return '<div class="empty">No keywords yet — add your first one above.</div>'
+    rows = ""
+    for k in keywords:
+        if edit == k.id:
+            en = "selected" if k.language == "en" else ""
+            ur = "selected" if k.language == "ur" else ""
             rows += (
-                f"<tr{dim}>"
-                f'<td><a class="kwname" href="/mentions?keyword={k.text}">{html.escape(k.text)}</a></td>'
-                f'<td><span class="tag">{k.language.upper()}</span></td>'
-                f'<td><form method="post" action="/ui/keywords/{k.id}/toggle" style="margin:0">{status}</form></td>'
-                f"<td>{results}</td>"
-                f'<td class="row" style="justify-content:flex-end">'
-                f'<a class="btn ghost" href="/keywords?edit={k.id}">Edit</a>'
-                f'<form method="post" action="/ui/keywords/{k.id}/scan" style="margin:0">'
-                f'<button {scan_disabled} title="Scan all sources for this keyword">▶ Scan</button></form>'
-                f'<form method="post" action="/ui/keywords/{k.id}/delete" style="margin:0">'
-                f'<button class="ghost">Delete</button></form></td></tr>'
+                f'<tr><td colspan="5">'
+                f'<form method="post" action="/ui/keywords/{k.id}/edit" class="row">'
+                f'<input name="text" value="{html.escape(k.text)}" required style="flex:1;min-width:200px">'
+                f'<select name="language"><option value="en" {en}>English</option>'
+                f'<option value="ur" {ur}>Urdu</option></select>'
+                f'<button type="submit">Save</button>'
+                f'<a href="{page_path}" style="align-self:center;color:var(--muted);font-weight:600;text-decoration:none">Cancel</a>'
+                f"</form></td></tr>"
             )
-        listing = (
-            '<table class="klist"><tr><th>Keyword</th><th>Lang</th><th>Status</th>'
-            "<th>Detections</th><th></th></tr>" + rows + "</table>"
+            continue
+        n = counts.get(k.text, 0)
+        kwlink = f"/mentions?keyword={k.text}&src={src}"
+        results = (f'<a class="count-link" href="{kwlink}">{n} result(s) →</a>'
+                   if n else '<span class="muted-count">0 results</span>')
+        status = ('<button class="ghost" title="Click to pause — paused keywords are skipped by scans">🟢 Active</button>'
+                  if k.active else '<button title="Click to activate">⏸ Paused</button>')
+        dim = "" if k.active else ' style="opacity:.55"'
+        scan_disabled = "disabled" if (scanning or not k.active) else ""
+        rows += (
+            f"<tr{dim}>"
+            f'<td><a class="kwname" href="{kwlink}">{html.escape(k.text)}</a></td>'
+            f'<td><span class="tag">{k.language.upper()}</span></td>'
+            f'<td><form method="post" action="/ui/keywords/{k.id}/toggle" style="margin:0">{status}</form></td>'
+            f"<td>{results}</td>"
+            f'<td class="row" style="justify-content:flex-end">'
+            f'<a class="btn ghost" href="{page_path}?edit={k.id}">Edit</a>'
+            f'<form method="post" action="/ui/keywords/{k.id}/scan" style="margin:0">'
+            f'<button {scan_disabled} title="Scan this keyword now">▶ Scan</button></form>'
+            f'<form method="post" action="/ui/keywords/{k.id}/delete" style="margin:0">'
+            f'<button class="ghost">Delete</button></form></td></tr>'
         )
-    else:
-        listing = '<div class="empty">No keywords yet — add your first one above.</div>'
+    return ('<table class="klist"><tr><th>Keyword</th><th>Lang</th><th>Status</th>'
+            "<th>Detections</th><th></th></tr>" + rows + "</table>")
 
+
+@app.get("/newspapers", response_class=HTMLResponse)
+def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
+    keywords = db.execute(
+        select(Keyword).where(Keyword.module == "newspaper").order_by(Keyword.created_at.desc())
+    ).scalars().all()
+    counts = _kw_counts(db, "newspaper")
+    scanning = scan_manager.is_running()
+    table = _keyword_table(keywords, "/newspapers", "newspaper", counts, scanning, edit)
     scan_all = (
         '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
-        if scanning
-        else '<button class="btn-lg" type="submit">▶ Scan all keywords</button>'
+        if scanning else '<button class="btn-lg" type="submit">▶ Scan all newspaper keywords</button>'
     )
-
+    n_sites = len(SITE_CONFIGS) + 1
     body = f"""
-    <p class="sub">Add the words you want to watch for, then scan. Detected articles
-    &amp; videos appear on the <a href="/mentions">Detections</a> tab — click any
-    keyword's result count to jump straight to its matches.</p>
+    <p class="sub">Keywords watched across <b>{n_sites} newspapers</b> (Dawn, The News,
+    Tribune, Jang, Nawa-i-Waqt, ARY, Dunya, Express Urdu). These keywords are searched
+    <b>only in newspapers</b>. <a href="/mentions?src=newspaper">View newspaper detections →</a></p>
 
     <div class="card">
       <form method="post" action="/ui/keywords" class="row" style="margin-bottom:.9rem">
-        <input name="text" placeholder="Add a keyword to watch, e.g. Imran Khan" required
-               style="flex:1;min-width:200px">
+        <input type="hidden" name="module" value="newspaper">
+        <input name="text" placeholder="Add a newspaper keyword, e.g. Imran Khan" required
+               style="flex:1;min-width:220px">
         <select name="language"><option value="en">English</option><option value="ur">Urdu</option></select>
         <button type="submit">+ Add keyword</button>
       </form>
-      <form method="post" action="/ui/scan" style="margin:0">{scan_all}</form>
+      <form method="post" action="/ui/scan/newspaper" style="margin:0">{scan_all}</form>
     </div>
-
-    <div class="card">{listing}</div>
+    <div class="card">{table}</div>
     """
-    return _shell("Media Monitor — Keywords", "keywords", body)
+    return _shell("Media Monitor — Newspapers", "newspapers", body)
 
 
 @app.post("/ui/keywords")
-def ui_add_keyword(text: str = Form(...), language: str = Form("en"), db: Session = Depends(get_db)):
+def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
+                   module: str = Form("newspaper"), db: Session = Depends(get_db)):
     text = text.strip()
+    module = module if module in ("newspaper", "youtube") else "newspaper"
     if text:
         exists = db.execute(
-            select(Keyword).where(Keyword.text == text, Keyword.language == language)
+            select(Keyword).where(Keyword.text == text, Keyword.language == language,
+                                  Keyword.module == module)
         ).first()
         if not exists:
-            db.add(Keyword(text=text, language=language, active=True))
+            db.add(Keyword(text=text, language=language, module=module, active=True))
             db.commit()
-    return RedirectResponse("/keywords", status_code=303)
+    return RedirectResponse(f"/{'youtube' if module == 'youtube' else 'newspapers'}", status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/edit")
@@ -665,25 +671,27 @@ def ui_edit_keyword(kid: int, text: str = Form(...), language: str = Form("en"),
         kw.text = text.strip()
         kw.language = language if language in ("en", "ur") else kw.language
         db.commit()
-    return RedirectResponse("/keywords", status_code=303)
+    return RedirectResponse(_kw_page(kw), status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/toggle")
 def ui_toggle_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
+    dest = _kw_page(kw)
     if kw:
         kw.active = not kw.active
         db.commit()
-    return RedirectResponse("/keywords", status_code=303)
+    return RedirectResponse(dest, status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/delete")
 def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
+    dest = _kw_page(kw)
     if kw:
         db.delete(kw)
         db.commit()
-    return RedirectResponse("/keywords", status_code=303)
+    return RedirectResponse(dest, status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/scan")
@@ -691,61 +699,106 @@ def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
-    scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
-    return RedirectResponse(f"/mentions?keyword={kw.text}", status_code=303)
+    # Route to the matching module's scanner so a YouTube keyword only scans
+    # YouTube, and a newspaper keyword only scans newspapers.
+    if kw.module == "youtube":
+        scan_runner.start_scan(keyword_ids=[kid], label=kw.text)
+    else:
+        scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
+    return RedirectResponse(f"/mentions?keyword={kw.text}&src={kw.module}", status_code=303)
+
+
+def _kw_page(kw) -> str:
+    return "/youtube" if (kw and kw.module == "youtube") else "/newspapers"
 
 
 @app.post("/ui/scan")
 def ui_scan_all():
+    # Topbar "Scan all" — refresh both modules (separate subprocesses).
     scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
+    scan_runner.start_scan()
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/ui/scan/newspaper")
+def ui_scan_newspapers():
+    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/scan/youtube")
+def ui_scan_youtube_kw():
+    scan_runner.start_scan()
+    return RedirectResponse("/youtube", status_code=303)
+
+
 # --------------------------------------------------------------------------
-# YouTube channels page
+# YouTube page — channels + YouTube-scoped keyword search
 # --------------------------------------------------------------------------
-@app.get("/channels", response_class=HTMLResponse)
-def channels_page(error: str | None = None, db: Session = Depends(get_db)):
-    channels = db.execute(select(YouTubeChannel).order_by(YouTubeChannel.created_at.desc())).scalars().all()
+@app.get("/youtube", response_class=HTMLResponse)
+def youtube_page(error: str | None = None, edit: int | None = None, db: Session = Depends(get_db)):
+    channels = db.execute(
+        select(YouTubeChannel).order_by(YouTubeChannel.created_at.desc())
+    ).scalars().all()
     if channels:
-        rows = "".join(
+        crows = "".join(
             f"<tr><td><b>{html.escape(c.name or c.channel_id)}</b><br>"
-            f'<span style="color:#888;font-size:.8rem">{c.channel_id}</span></td>'
+            f'<span style="color:var(--faint);font-size:.78rem">{c.channel_id}</span></td>'
             f"<td>{'🟢 active' if c.active else '⚪ off'}</td>"
-            f'<td class="row">'
+            f'<td class="row" style="justify-content:flex-end">'
             f'<form method="post" action="/ui/channels/{c.id}/scan" style="margin:0">'
-            f'<button title="Scan this channel now">▶ Run scan</button></form>'
+            f'<button title="Scan this channel now">▶ Scan</button></form>'
             f'<form method="post" action="/ui/channels/{c.id}/delete" style="margin:0">'
             f'<button class="ghost">Delete</button></form></td></tr>'
             for c in channels
         )
-        table = f"<table><tr><th>Channel</th><th>Status</th><th>Actions</th></tr>{rows}</table>"
+        ctable = f"<table><tr><th>Channel</th><th>Status</th><th></th></tr>{crows}</table>"
     else:
-        table = '<div class="empty">No channels yet. Add one above to start monitoring YouTube.</div>'
+        ctable = '<div class="empty">No channels yet. Add one above to start monitoring YouTube.</div>'
 
-    # The global status bar (in _shell) shows "scanning YouTube"; only errors here.
-    banner = f'<div class="banner">⚠ {html.escape(error)}</div>' if error else ""
-
-    trans = settings.youtube_transcriber
-    note = (
-        f'Transcription mode: <b>{trans}</b>. '
-        + ("In <b>stub</b> mode, matching runs on video title + description only "
-           "(no GPU/API key needed). Set YOUTUBE_TRANSCRIBER=openai or local to transcribe audio."
-           if trans == "stub" else "Audio is transcribed for in-video keyword detection.")
+    keywords = db.execute(
+        select(Keyword).where(Keyword.module == "youtube").order_by(Keyword.created_at.desc())
+    ).scalars().all()
+    counts = _kw_counts(db, "youtube")
+    scanning = scan_runner.is_running()
+    ktable = _keyword_table(keywords, "/youtube", "youtube", counts, scanning, edit)
+    scan_all = (
+        '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
+        if scanning else '<button class="btn-lg" type="submit">▶ Scan all YouTube keywords</button>'
     )
+    banner = f'<div class="banner">⚠ {html.escape(error)}</div>' if error else ""
+    trans = settings.youtube_transcriber
+    note = ("Matching runs on video <b>title + description</b> (stub mode). Set "
+            "YOUTUBE_TRANSCRIBER=openai or local to also search inside audio."
+            if trans == "stub" else "Audio is transcribed for in-video keyword detection.")
 
     body = f"""
     {banner}
-    <p class="sub">Add a channel by URL, @handle, or channel ID (UC…). {note}</p>
+    <p class="sub">Monitor YouTube channels for keywords searched <b>only in YouTube</b>.
+    {note} <a href="/mentions?src=youtube">View YouTube detections →</a></p>
+
+    <div class="sechead">▶ Channels</div>
     <div class="card">
-      <form method="post" action="/ui/channels" class="row">
-        <input name="channel" placeholder="https://youtube.com/@GeoNews  or  UC…" required style="flex:1;min-width:220px">
+      <form method="post" action="/ui/channels" class="row" style="margin-bottom:.9rem">
+        <input name="channel" placeholder="https://youtube.com/@GeoNews  or  UC…" required style="flex:1;min-width:240px">
         <button type="submit">+ Add channel</button>
       </form>
+      {ctable}
     </div>
-    <div class="card">{table}</div>
+
+    <div class="sechead"># YouTube keywords</div>
+    <div class="card">
+      <form method="post" action="/ui/keywords" class="row" style="margin-bottom:.9rem">
+        <input type="hidden" name="module" value="youtube">
+        <input name="text" placeholder="Add a YouTube keyword, e.g. Imran Khan" required style="flex:1;min-width:220px">
+        <select name="language"><option value="en">English</option><option value="ur">Urdu</option></select>
+        <button type="submit">+ Add keyword</button>
+      </form>
+      <form method="post" action="/ui/scan/youtube" style="margin:0">{scan_all}</form>
+    </div>
+    <div class="card">{ktable}</div>
     """
-    return _shell("Media Monitor — Channels", "channels", body)
+    return _shell("Media Monitor — YouTube", "youtube", body)
 
 
 @app.post("/ui/channels")
@@ -753,13 +806,13 @@ def ui_add_channel(channel: str = Form(...), db: Session = Depends(get_db)):
     channel_id, name = rss.resolve_channel_id(channel)
     if not channel_id:
         return RedirectResponse(
-            "/channels?error=Could not resolve that channel. Paste the full channel URL or its UC… id.",
+            "/youtube?error=Could not resolve that channel. Paste the full channel URL or its UC… id.",
             status_code=303,
         )
     if not db.execute(select(YouTubeChannel).where(YouTubeChannel.channel_id == channel_id)).first():
         db.add(YouTubeChannel(channel_id=channel_id, name=name, url=channel, active=True))
         db.commit()
-    return RedirectResponse("/channels", status_code=303)
+    return RedirectResponse("/youtube", status_code=303)
 
 
 @app.post("/ui/channels/{cid}/delete")
@@ -768,7 +821,7 @@ def ui_delete_channel(cid: int, db: Session = Depends(get_db)):
     if ch:
         db.delete(ch)
         db.commit()
-    return RedirectResponse("/channels", status_code=303)
+    return RedirectResponse("/youtube", status_code=303)
 
 
 @app.post("/ui/channels/{cid}/scan")
@@ -777,7 +830,7 @@ def ui_scan_channel(cid: int, db: Session = Depends(get_db)):
     if not ch:
         raise HTTPException(404, "channel not found")
     scan_runner.start_scan(channel_ids=[cid], label=ch.name or ch.channel_id)
-    return RedirectResponse("/mentions", status_code=303)
+    return RedirectResponse("/mentions?src=youtube", status_code=303)
 
 
 @app.post("/ui/youtube/scan")
@@ -888,7 +941,8 @@ def _media_url(abs_path: str | None) -> str | None:
 @app.get("/api/keywords")
 def list_keywords(db: Session = Depends(get_db)):
     rows = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
-    return [{"id": k.id, "text": k.text, "language": k.language, "active": k.active} for k in rows]
+    return [{"id": k.id, "text": k.text, "language": k.language, "module": k.module,
+             "active": k.active} for k in rows]
 
 
 @app.get("/api/mentions")
