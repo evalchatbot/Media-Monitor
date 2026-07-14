@@ -197,11 +197,15 @@ class BaseScraper:
         article: Article,
         out_dir: Path,
         crop_selector: str | None = None,
+        wait_until: str = "load",
     ) -> tuple[Path | None, Path | None]:
         """Capture (full_page_png, cropped_article_png).
 
         Reuses the shared browser context. Returns (None, None) on failure so
-        the pipeline degrades gracefully rather than crashing.
+        the pipeline degrades gracefully rather than crashing. `wait_until=
+        "domcontentloaded"` is markedly more reliable on ad-heavy pages (their
+        load event can outlast any sane timeout) at the cost of the odd
+        late-rendering element — the right trade for backfill passes.
         """
         try:
             self._ensure_browser()
@@ -218,9 +222,9 @@ class BaseScraper:
 
         page = self._context.new_page()
         try:
-            # `load` (not `networkidle`): ad/tracker sockets on these sites keep
-            # the network perpetually busy, so networkidle reliably times out.
-            page.goto(article.url, wait_until="load", timeout=45000)
+            # Never `networkidle`: ad/tracker sockets keep the network busy
+            # forever on these sites, so it reliably times out.
+            page.goto(article.url, wait_until=wait_until, timeout=45000)
             page.wait_for_timeout(1500)  # let layout/images settle
 
             from config import settings
