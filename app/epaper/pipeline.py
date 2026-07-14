@@ -175,6 +175,13 @@ def match_stored_pages(session, keywords, notifier, summary,
         )).scalar_one_or_none()
 
         if mention is not None:
+            # Self-heal: if the stamped shot's file is gone (host move, pruned
+            # volume), rebuild it from the page scan.
+            if not (mention.screenshot_path and Path(mention.screenshot_path).exists()):
+                shot = _detection_shot(row)
+                if shot:
+                    mention.screenshot_path = shot
+                    session.commit()
             new_kw = [k for k in matched_kw if k not in (mention.matched_keywords or [])]
             if not new_kw:
                 continue
