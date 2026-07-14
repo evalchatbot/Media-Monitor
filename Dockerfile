@@ -9,7 +9,11 @@
 # - The host must provide env vars (DATABASE_URL, GROQ_API_KEY, …) and a
 #   persistent volume for STORAGE_DIR (e.g. mount /data, STORAGE_DIR=/data/storage).
 
-FROM python:3.12-slim
+# -bookworm pin matters: plain -slim now tracks Debian 13 (trixie), where the
+# font packages Playwright 1.49's --with-deps requests (ttf-unifont et al) were
+# renamed — the browser install dies with "no installation candidate".
+# Playwright 1.49 officially supports Debian 12.
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
