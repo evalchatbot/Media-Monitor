@@ -88,21 +88,19 @@ class Settings(BaseSettings):
     def smtp_configured(self) -> bool:
         return bool(self.smtp_host and self.digest_sender and self.digest_recipient_list)
 
-    # --- YouTube module ---
-    youtube_transcriber: str = "stub"   # stub | openai | local
-    youtube_scan_interval_minutes: int = 10
-    openai_api_key: str = ""
-    whisper_model: str = "large-v3"     # for local faster-whisper
-    # Local faster-whisper tuning:
-    whisper_device: str = "auto"        # auto | cuda | cpu
-    whisper_compute_type: str = "auto"  # auto | int8_float16 (GPU) | int8 (CPU) | float16
-    whisper_cpu_threads: int = 8
-    whisper_language: str = ""          # "" = auto-detect, or "ur" / "en"
-    youtube_max_videos_per_scan: int = 15
-    # Live-stream monitoring (needs ffmpeg + a non-stub transcriber to do real work)
-    youtube_live_enabled: bool = False
-    youtube_live_chunk_seconds: int = 30
-    youtube_live_check_interval_minutes: int = 2
+    # --- E-paper module (print editions) ---
+    epaper_enabled: bool = True
+    # Preferred city edition where a paper prints several (lahore|karachi|islamabad…)
+    epaper_city: str = "lahore"
+    # Comma-separated paper slugs to fetch (empty = all supported)
+    epaper_papers: str = ""
+    # Editions publish by early morning; fetch daily at this hour (PKT).
+    epaper_fetch_hour_pkt: int = 8
+    # Safety cap per edition (a daily paper is typically 8-20 pages)
+    epaper_max_pages: int = 24
+    # Reading a scanned page (image -> text) uses Claude vision; needs
+    # ANTHROPIC_API_KEY. Model defaults to LLM_MODEL when empty.
+    epaper_ocr_model: str = ""
 
     # --- Data retention (days) ---
     retention_screenshots_days: int = 90

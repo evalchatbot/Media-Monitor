@@ -1,10 +1,10 @@
 """ORM models for the media monitoring system.
 
 Design notes:
-- `Mention` is the shared table both modules (newspaper + youtube) write into,
-  so the alert pipeline and daily digest are source-agnostic.
+- `Mention` is the shared table both modules (newspaper websites + e-paper
+  print editions) write into, so alerts and the daily digest are source-agnostic.
 - `external_id` + `module` are uniquely constrained to deduplicate: the same
-  article or video seen on repeated scrapes must not re-alert.
+  article or e-paper page seen on repeated scans must not re-alert.
 - Keyword matches and other list-ish data are stored as JSON for MVP simplicity;
   they can graduate to association tables later without touching the pipeline.
 """
@@ -38,12 +38,12 @@ class Keyword(Base):
     text: Mapped[str] = mapped_column(String(255), nullable=False)
     # 'en' or 'ur'
     language: Mapped[str] = mapped_column(String(8), default="en", nullable=False)
-    # 'newspaper' | 'youtube' — which module this keyword is searched in.
+    # Kept for schema compat (always 'newspaper' now). Every keyword is matched
+    # against BOTH newspaper websites and e-paper print editions.
     module: Mapped[str] = mapped_column(String(16), default="newspaper", nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
-    # Same word can exist independently for newspapers and YouTube.
     __table_args__ = (
         UniqueConstraint("text", "language", "module", name="uq_keyword_text_lang_module"),
     )
@@ -54,9 +54,10 @@ class Mention(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    # 'newspaper' | 'youtube'
+    # 'newspaper' (website article) | 'epaper' (print-edition page)
     module: Mapped[str] = mapped_column(String(16), nullable=False)
-    # Stable identifier for dedup within a module (e.g. article URL, video id).
+    # Stable identifier for dedup within a module (e.g. article URL, or
+    # "paper:city:date:pN" for an e-paper page).
     external_id: Mapped[str] = mapped_column(String(512), nullable=False)
 
     source: Mapped[str] = mapped_column(String(128), nullable=False)  # e.g. "Dawn"
@@ -75,7 +76,7 @@ class Mention(Base):
     # Artifacts
     screenshot_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     full_screenshot_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # YouTube deep-link timestamp (seconds); null for newspaper
+    # Legacy column (kept for schema compat with existing DBs); unused.
     deeplink_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -113,47 +114,35 @@ class ArticleCache(Base):
     )
 
 
-class YouTubeChannel(Base):
-    """A monitored YouTube channel (admin-managed, like keywords)."""
+class EPaperPage(Base):
+    """One page of a paper's daily PRINT edition (the e-paper).
 
-    __tablename__ = "youtube_channels"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    channel_id: Mapped[str] = mapped_column(String(64), nullable=False)  # UC...
-    name: Mapped[str] = mapped_column(String(255), default="")
-    url: Mapped[str] = mapped_column(Text, default="")
-    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-    __table_args__ = (UniqueConstraint("channel_id", name="uq_youtube_channel_id"),)
-
-
-class Transcript(Base):
-    """Full YouTube transcript for a video — text + word/segment-level timestamps.
-
-    Written whenever a real (non-stub) transcription runs. `segments` is a JSON
-    list of {"start": <sec>, "text": <word|phrase>} used for keyword deep-links.
-    Persisted separately from ArticleCache so transcripts are first-class,
-    queryable, and retained on their own schedule.
+    E-paper pages are scanned images, so keyword matching needs the page read
+    into text first: `ocr_text` holds that extraction (Claude vision), and
+    `ocr_status` tracks where each page is in the pipeline. Matching then runs
+    on `ocr_text` with the same matcher the website articles use.
     """
 
-    __tablename__ = "transcripts"
+    __tablename__ = "epaper_pages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    video_id: Mapped[str] = mapped_column(String(32), nullable=False)
-    channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    source: Mapped[str] = mapped_column(String(255), default="")  # channel name
-    title: Mapped[str] = mapped_column(Text, default="")
-    url: Mapped[str] = mapped_column(Text, default="")
-    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    text: Mapped[str] = mapped_column(Text, default="")
-    segments: Mapped[list] = mapped_column(JSON, default=list)
-    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    transcriber: Mapped[str] = mapped_column(String(16), default="stub")  # stub|openai|local
-    is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    paper: Mapped[str] = mapped_column(String(32), nullable=False)   # slug, e.g. "jang"
+    source: Mapped[str] = mapped_column(String(128), nullable=False)  # display, e.g. "Jang"
+    city: Mapped[str] = mapped_column(String(32), default="lahore", nullable=False)
+    date: Mapped[str] = mapped_column(String(10), nullable=False)     # "YYYY-MM-DD"
+    page_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_url: Mapped[str] = mapped_column(Text, nullable=False)      # remote full-size image
+    image_path: Mapped[str | None] = mapped_column(Text, nullable=True)  # local copy
+    viewer_url: Mapped[str] = mapped_column(Text, default="")         # human-facing page link
+    ocr_text: Mapped[str] = mapped_column(Text, default="")
+    # 'pending' (not read yet) | 'done' | 'failed' | 'no_key' (needs ANTHROPIC_API_KEY)
+    ocr_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
-    __table_args__ = (UniqueConstraint("video_id", name="uq_transcript_video_id"),)
+    __table_args__ = (
+        UniqueConstraint("paper", "city", "date", "page_no", name="uq_epaper_page"),
+        Index("ix_epaper_date", "date"),
+    )
 
 
 class ScrapeRun(Base):

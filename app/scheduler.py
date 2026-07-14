@@ -40,20 +40,12 @@ def _job_daily_digest():
     logger.info("Daily digest job: %s", result)
 
 
-def _job_youtube_scan():
-    """Scan YouTube channels for new uploads matching keywords."""
-    from app.youtube import scan_runner
+def _job_epaper_scan():
+    """Fetch today's print editions (e-papers), read them, match keywords."""
+    from app.epaper import scan_runner
 
     started = scan_runner.start_scan()
-    logger.info("YouTube scan trigger: %s", "started" if started else "skipped (already running)")
-
-
-def _job_youtube_live():
-    """Check active channels for live broadcasts and tap them (flag-gated)."""
-    from app.youtube import scan_runner
-
-    started = scan_runner.start_scan(live=True)
-    logger.info("YouTube live-check trigger: %s", "started" if started else "skipped (already running)")
+    logger.info("E-paper scan trigger: %s", "started" if started else "skipped (already running)")
 
 
 def _job_retention_cleanup():
@@ -82,16 +74,19 @@ def start_scheduler() -> BackgroundScheduler:
         misfire_grace_time=300,
     )
 
-    scheduler.add_job(
-        _job_youtube_scan,
-        trigger="interval",
-        minutes=settings.youtube_scan_interval_minutes,
-        id="youtube_scan",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=300,
-    )
+    # Daily e-paper fetch + scan (print editions are online by early morning PKT).
+    if settings.epaper_enabled:
+        scheduler.add_job(
+            _job_epaper_scan,
+            trigger="cron",
+            hour=settings.epaper_fetch_hour_pkt,
+            minute=15,
+            id="epaper_scan",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
 
     # Daily digest at DIGEST_HOUR_PKT:00 Pakistan time.
     scheduler.add_job(
@@ -117,25 +112,18 @@ def start_scheduler() -> BackgroundScheduler:
         misfire_grace_time=3600,
     )
 
-    # Live-stream checks — only when explicitly enabled (needs ffmpeg + transcriber).
-    if settings.youtube_live_enabled:
-        scheduler.add_job(
-            _job_youtube_live,
-            trigger="interval",
-            minutes=settings.youtube_live_check_interval_minutes,
-            id="youtube_live",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=120,
-        )
-
     scheduler.start()
+    # Drop jobs from removed modules that may persist in the job store.
+    for stale in ("youtube_scan", "youtube_live"):
+        try:
+            scheduler.remove_job(stale)
+        except Exception:
+            pass
     _scheduler = scheduler
     logger.info(
-        "Scheduler started: newspaper/%smin, youtube/%smin, digest @%02d:00 PKT, retention @04:00 PKT",
+        "Scheduler started: newspaper/%smin, e-paper @%02d:15 PKT, digest @%02d:00 PKT, retention @04:00 PKT",
         settings.newspaper_scrape_interval_minutes,
-        settings.youtube_scan_interval_minutes,
+        settings.epaper_fetch_hour_pkt,
         settings.digest_hour_pkt,
     )
     return scheduler

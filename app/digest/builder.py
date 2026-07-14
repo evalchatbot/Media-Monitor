@@ -112,7 +112,7 @@ def _mention_row(m: Mention) -> str:
     )
     kws = ", ".join(m.matched_keywords or [])
     when = m.detected_at.astimezone(PKT).strftime("%d %b %H:%M PKT") if m.detected_at else ""
-    tag = "▶ video" if m.module == "youtube" else "📰 article"
+    tag = "🗞 e-paper" if m.module == "epaper" else "📰 article"
     return f"""
     <table style="margin:10px 0;border-collapse:collapse"><tr>
       <td style="vertical-align:top;padding-right:12px">{img}</td>

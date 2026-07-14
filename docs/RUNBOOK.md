@@ -15,36 +15,40 @@ python -m scripts.init_db
 python -m scripts.seed_keywords   # optional sample keywords
 ```
 
-`ffmpeg` on PATH is required only for YouTube transcription / live streams.
-
 ## 2. Running
 
 ```powershell
 uvicorn app.main:app --reload
-#   Admin UI:  http://127.0.0.1:8000/
+#   Console:   http://127.0.0.1:8000/     (Overview · Newspapers · E-Paper · Detections)
 #   API docs:  http://127.0.0.1:8000/docs
 ```
 
-The scheduler starts with the app (newspapers 30 min, YouTube 10 min, digest
-07:00 PKT, retention 04:00 PKT). To run the UI **without** background scans:
-`set SCHEDULER_ENABLED=false` before starting.
+The scheduler starts with the app (websites every 30 min, e-paper daily 08:15
+PKT, digest 07:00 PKT, retention 04:00 PKT). To run the UI **without**
+background scans: `set SCHEDULER_ENABLED=false` before starting.
 
 Manual / testing without the server:
 ```powershell
-python -m scripts.run_newspaper_once     # one newspaper scan
-python -m scripts.run_youtube            # one YouTube upload scan
-python -m scripts.run_youtube --live     # one live-stream check
+python -m scripts.run_newspaper_once     # one website scan
+python -m scripts.run_epaper             # fetch + read + match today's e-papers
+python -m scripts.run_epaper --no-fetch  # re-read/re-match stored pages only
 python -m scripts.send_digest            # build + send/preview the digest
+python -m tests.test_keywords            # matching precision suite
 ```
 
 ## 3. Turning on the live integrations (credentials)
 
 Each is a paste into `.env`, then restart the app. Nothing else to change.
 
-**Claude scoring (relevance + sentiment)**
+**Claude API key — unlocks e-paper page reading (and scoring, if enabled)**
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+Without it, e-paper pages are still fetched daily and browsable in the console;
+they sit at `ocr_status='no_key'` and are read automatically on the first scan
+after the key appears. To also score every mention:
 ```
 ENABLE_LLM_SCORING=true
-ANTHROPIC_API_KEY=sk-ant-...
 LLM_MODEL=claude-haiku-4-5      # cheapest; or claude-sonnet-5 for higher quality
 ```
 
@@ -72,28 +76,23 @@ Note: business-initiated alerts outside the 24-hour window require an **approved
 message template** registered in the Meta dashboard. Without credentials the
 WhatsApp path dry-runs (logs the exact payload); console/`alerts.log` always records.
 
-**YouTube transcription** (in-video keyword detection + timestamps):
-```
-YOUTUBE_TRANSCRIBER=openai        # needs OPENAI_API_KEY + ffmpeg (~$0.006/min)
-OPENAI_API_KEY=sk-...
-# or, with a GPU:
-# YOUTUBE_TRANSCRIBER=local       # pip install faster-whisper + CUDA + ffmpeg
-```
-
-**Live streams:** additionally set `YOUTUBE_LIVE_ENABLED=true` (needs ffmpeg + a
-non-stub transcriber). The live-check job is only registered when this is true.
-
 ## 4. Add a keyword
-Admin UI → **Keywords** → type the word, pick language, **+ Add keyword**.
-Edit / pause (⏸) / delete inline. Paused keywords are skipped by scans. Changes
-take effect on the next scan (≤ the scan interval). No restart, no deploy.
+Console → **Newspapers** → type the word (English or اردو), pick language,
+**+ Add keyword**. Edit / pause / delete inline. One keyword list covers both
+website scans and e-paper pages. Changes take effect on the next scan — and for
+e-papers, new keywords are re-matched against the last 3 days of already-read
+pages immediately, no re-fetch needed.
 
-## 5. Add a YouTube channel
-Admin UI → **Channels** → paste a channel URL, `@handle`, or `UC…` id → **Add**.
-If it can't resolve, paste the full channel URL or the `UC…` id from the
-channel's page source.
+## 5. E-paper operations
+- **Fetch on demand:** E-Paper page → *⟳ Fetch today's editions* (or per-paper ⟳).
+- **Cadence:** editions upload progressively through the morning; the daily
+  08:15 PKT job catches most pages, and any later re-fetch picks up stragglers
+  (already-stored pages are never re-downloaded or re-read).
+- **Costs:** each page is sent to Claude vision exactly once, ever. A typical
+  day across all six papers is ~70–90 pages.
+- **City editions:** set `EPAPER_CITY` (lahore default). Dawn is national.
 
-## 6. Add a newspaper publication
+## 6. Add a newspaper website
 Most sites are one config entry. Edit `app/scrapers/sites.py` and append a
 `SiteConfig` to `SITE_CONFIGS`:
 
@@ -129,10 +128,19 @@ added in `sites.py:build_scrapers()`.
 
 > **Geo (urdu.geo.tv)** is intentionally not scraped — it serves headless
 > browsers an empty shell and loads articles from an internal API with no clean
-> public endpoint. Monitor Geo via its YouTube channel instead, or build a
-> dedicated API scraper if the endpoint can be authenticated.
+> public endpoint.
 
-## 7. Fix a broken scraper
+## 7. Add an e-paper
+Add an adapter function in `app/epaper/sources.py` returning `list[EPage]` for
+a date+city, and register it in `SOURCES`. The existing six adapters cover the
+common patterns: direct image listing (tribune), per-city index (express),
+viewer-embedded thumbnails (nawaiwaqt), and constructable-URL probing
+(jang / thenews / dawn). Verify with:
+```powershell
+python -c "from app.epaper import sources; ps=sources.list_pages('slug'); print(len(ps), ps[0].image_url if ps else '')"
+```
+
+## 8. Fix a broken scraper
 Symptom: a site's scans return 0 articles, or bodies are empty.
 
 1. Check `ScrapeRun` rows (status `error`/`blocked`) or the app log.
@@ -145,27 +153,31 @@ Symptom: a site's scans return 0 articles, or bodies are empty.
 5. If bodies are short (generic extractor under-pulls), add a `body_selector` to
    the `SiteConfig`.
 
-## 8. Data retention & backup
-- Retention runs daily 04:00 PKT: screenshots > `RETENTION_SCREENSHOTS_DAYS`,
-  cache/transcripts > `RETENTION_TRANSCRIPTS_DAYS`, scrape logs > `RETENTION_LOGS_DAYS`.
-  Run on demand: `python -c "from app.maintenance.retention import run_retention; print(run_retention())"`
-- **Backup** = copy `data/media_monitoring.db` (+ `data/storage/` for images).
-  SQLite is a single file; stop the app or copy the `-wal`/`-shm` files too.
+For e-papers: run the §7 verify one-liner; if 0 pages, the paper likely moved
+its scan URLs — re-derive the pattern (see the probing notes in `sources.py`).
 
-## 9. Restart / recovery
-No special steps. On restart the SQLite data persists and APScheduler reloads its
+## 9. Data retention & backup
+- Retention runs daily 04:00 PKT: screenshots > `RETENTION_SCREENSHOTS_DAYS`,
+  cached text > `RETENTION_TRANSCRIPTS_DAYS`, scrape logs > `RETENTION_LOGS_DAYS`.
+  Run on demand: `python -c "from app.maintenance.retention import run_retention; print(run_retention())"`
+- **Backup**: on Supabase, use its scheduled backups; on SQLite copy
+  `data/media_monitoring.db` (+ `data/storage/` for images).
+
+## 10. Restart / recovery
+No special steps. On restart the data persists and APScheduler reloads its
 persisted jobs from the DB, so all monitoring resumes automatically (a past-due
 scan may fire immediately). Verify: after `uvicorn` starts, the log prints
-"Scheduler started: newspaper/…, youtube/…, digest …, retention …".
+"Scheduler started: newspaper/…, e-paper …, digest …, retention …".
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Clicked "Run scan", nothing appears | First scan of a cold site fetches bounded new bodies; coverage grows over successive scans. Watch the status bar; results auto-load when done. |
-| A keyword's article isn't detected | It may be beyond the per-scan fetch cap on a cold cache — scan again or wait for the scheduled scans to warm the cache. |
+| Clicked "Scan all", nothing appears | First scan of a cold site fetches bounded new bodies per site; coverage grows over successive scans. Watch the status bar; results auto-load when done. |
+| A keyword's article isn't detected | It may be beyond the per-site fetch cap on a cold cache — scan again or wait for scheduled scans to warm the cache. |
+| E-paper cards say "awaiting API key" | Add `ANTHROPIC_API_KEY` to `.env` (§3) and run a scan — stored pages are read automatically. |
+| An e-paper shows few pages early morning | Pages upload progressively; the next fetch picks up the rest (nothing is re-downloaded). |
 | WhatsApp not delivering | Without Meta creds it dry-runs (see `data/alerts.log`). With creds, confirm an **approved template** and the recipient. |
 | Digest went to a file, not email | `SMTP_HOST`/creds not set — see §3. |
-| YouTube shows videos but no in-video hits | `YOUTUBE_TRANSCRIBER=stub` (default) matches title/description only; set `openai`/`local` + ffmpeg. |
 | Server unreachable right after a scan starts | Ensure scans run via the subprocess runners (they do by default) — never call the pipeline inline in the web process. |
 | Port already in use | An old `uvicorn` is still running; stop it before restarting. |

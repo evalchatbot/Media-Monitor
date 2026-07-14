@@ -1,41 +1,45 @@
-"""FastAPI application: keyword admin + detections dashboard + scheduler.
+"""FastAPI application: the monitoring console.
 
 Run:  uvicorn app.main:app --reload
-  - Admin UI:  http://127.0.0.1:8000/
+  - Console:   http://127.0.0.1:8000/
   - API docs:  http://127.0.0.1:8000/docs
 
-Manual scans (per-keyword or global) run uncapped in a background thread so one
-click covers Dawn's whole front page without the browser hanging. The scheduler
-keeps running bounded scans every N minutes. Keyword changes take effect on the
-next scan with no redeploy — the pipeline reads active keywords from the DB each
-run.
+Two pipelines feed one Mention table:
+  newspapers — website articles, scraped every N minutes (Playwright subprocess)
+  e-paper    — each paper's daily PRINT edition: page scans fetched every
+               morning, read with Claude vision, matched with the same keywords
+
+Manual scans run as subprocesses so the UI never blocks and Playwright stays
+stable; a tiny poller keeps every tab's status live and reloads once on finish.
 """
 from __future__ import annotations
 
 import html
 import logging
+from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from config import settings
 from app.db.base import SessionLocal, init_db
-from app.db.models import Keyword, Mention, YouTubeChannel
+from app.db.models import EPaperPage, Keyword, Mention, ScrapeRun
+from app.epaper import reader, scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan
-from app.youtube import scan_runner
-from app.youtube import rss
 from app.scrapers.sites import SITE_CONFIGS
 from app.scheduler import shutdown_scheduler, start_scheduler
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+_PKT = timezone(timedelta(hours=5))
 
 
 @asynccontextmanager
@@ -47,7 +51,7 @@ async def lifespan(app: FastAPI):
     shutdown_scheduler()
 
 
-app = FastAPI(title="Media Monitoring", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Media Monitoring", version="0.3.0", lifespan=lifespan)
 
 settings.storage_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(settings.storage_dir)), name="media")
@@ -61,354 +65,472 @@ def get_db():
         db.close()
 
 
-# --------------------------------------------------------------------------
-# Shared UI shell (red + white theme)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Design system — warm cream + deep green + orange CTA ("Neato" language)
+# ==========================================================================
 _CSS = """
 :root{
-  --bg:#f2efe7;--surface:#ffffff;--surface-2:#f8f5ec;
-  --ink:#18241d;--muted:#5b675e;--faint:#9aa298;
-  --line:#eae4d6;--line-strong:#ddd6c4;
-  --accent:#2f7d4f;--accent-strong:#236340;--accent-soft:#e4f0e8;--accent-border:#c6e1d0;
-  --cta:#e8862e;--cta-strong:#d1741f;--cta-soft:#fbe9d5;
-  --ok:#2f7d4f;--ok-soft:#e6f2ea;--ok-border:#c6e1d0;
-  --glass:rgba(248,245,236,.72);--glass-brd:rgba(255,255,255,.6);
-  --shadow-sm:0 1px 2px rgba(40,35,20,.06);
-  --shadow:0 14px 36px -14px rgba(40,50,30,.18);
-  --shadow-lg:0 24px 54px -18px rgba(40,50,30,.26);
-  --glow:0 10px 26px -8px rgba(47,125,79,.45);
-  --r:22px;--r-sm:13px;
+  --bg:#f3f0e7;--surface:#ffffff;--surface-2:#f8f5ec;--surface-3:#efeadd;
+  --ink:#17231c;--muted:#5b675e;--faint:#98a096;
+  --line:#e8e2d2;--line-strong:#d9d2bf;
+  --accent:#2f7d4f;--accent-2:#3a9160;--accent-strong:#215e3c;
+  --accent-soft:#e3f0e7;--accent-border:#c4e0cf;
+  --cta:#e8862e;--cta-2:#f0983f;--cta-strong:#d1741f;--cta-soft:#fbe9d5;
+  --warn:#b97324;--warn-soft:#faf0dd;--warn-border:#ecd9b7;
+  --crit:#c94f31;--ok:#2f7d4f;
+  --glass:rgba(250,248,241,.78);--glass-brd:rgba(255,255,255,.65);
+  --shadow-xs:0 1px 2px rgba(43,38,22,.05);
+  --shadow-sm:0 2px 10px -4px rgba(43,48,30,.10);
+  --shadow:0 16px 40px -16px rgba(40,50,30,.20);
+  --shadow-lg:0 28px 60px -20px rgba(40,50,30,.28);
+  --glow:0 10px 28px -8px rgba(47,125,79,.45);
+  --glow-cta:0 12px 30px -10px rgba(224,121,31,.55);
+  --r-lg:26px;--r:20px;--r-sm:13px;
 }
 @media (prefers-color-scheme:dark){:root{
-  --bg:#14180f;--surface:#1c2118;--surface-2:#232a1e;
-  --ink:#eef1e6;--muted:#9aa593;--faint:#6b7563;
-  --line:#2c3325;--line-strong:#3a4431;
-  --accent:#5cbd82;--accent-strong:#8fd6a9;--accent-soft:#1c2a1e;--accent-border:#2e4a35;
-  --cta:#ef9440;--cta-strong:#f2a85f;--cta-soft:#2a1e0f;
-  --ok:#5cbd82;--ok-soft:#1c2a1e;--ok-border:#2e4a35;
-  --glass:rgba(28,33,24,.6);--glass-brd:rgba(255,255,255,.07);
-  --shadow-sm:0 1px 2px rgba(0,0,0,.5);
-  --shadow:0 14px 36px -14px rgba(0,0,0,.6);
-  --shadow-lg:0 24px 54px -18px rgba(0,0,0,.7);
-  --glow:0 10px 26px -8px rgba(92,189,130,.35);
+  --bg:#131710;--surface:#1b2017;--surface-2:#222819;--surface-3:#2a3120;
+  --ink:#edf1e4;--muted:#9aa593;--faint:#6c7663;
+  --line:#2b3223;--line-strong:#3a4430;
+  --accent:#5cbd82;--accent-2:#6ecb92;--accent-strong:#93d8ae;
+  --accent-soft:#1d2b1f;--accent-border:#2e4a36;
+  --cta:#ef9440;--cta-2:#f4a75c;--cta-strong:#f2a85f;--cta-soft:#2b1f0f;
+  --warn:#e0a95a;--warn-soft:#292113;--warn-border:#4a3b1f;
+  --crit:#e0714f;--ok:#5cbd82;
+  --glass:rgba(24,29,20,.7);--glass-brd:rgba(255,255,255,.08);
+  --shadow-xs:0 1px 2px rgba(0,0,0,.4);
+  --shadow-sm:0 2px 10px -4px rgba(0,0,0,.5);
+  --shadow:0 16px 40px -16px rgba(0,0,0,.65);
+  --shadow-lg:0 28px 60px -20px rgba(0,0,0,.75);
+  --glow:0 10px 28px -8px rgba(92,189,130,.3);
+  --glow-cta:0 12px 30px -10px rgba(239,148,64,.4);
 }}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;color:var(--ink);min-height:100vh;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
   font-size:14.5px;line-height:1.55;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
   background:
-    radial-gradient(55rem 28rem at 10% -8%, #e9f1e4, transparent 60%),
-    radial-gradient(46rem 24rem at 100% 0%, #f7efdb, transparent 55%),
+    radial-gradient(60rem 30rem at 8% -10%, #e9f1e4, transparent 58%),
+    radial-gradient(48rem 26rem at 102% -2%, #f8efd9, transparent 55%),
     var(--bg);
   background-attachment:fixed}
+@media (prefers-color-scheme:dark){body{background:
+  radial-gradient(60rem 30rem at 8% -10%, #1a2415, transparent 58%),
+  radial-gradient(48rem 26rem at 102% -2%, #241d10, transparent 55%),
+  var(--bg)}}
 ::selection{background:var(--accent-soft);color:var(--accent-strong)}
 a{color:inherit}
+h1,h2,h3,.display{font-family:"Sora","Inter",sans-serif}
 
-/* Floating soft blobs (cream + green + warm yellow, Neato vibe) */
-body::before,body::after{content:"";position:fixed;z-index:-1;border-radius:50%;filter:blur(66px);opacity:.4;pointer-events:none}
-body::before{width:26rem;height:26rem;left:-6rem;top:5rem;background:radial-gradient(circle,#bfe3c6,transparent 70%);animation:float1 22s ease-in-out infinite}
-body::after{width:22rem;height:22rem;right:-5rem;bottom:2rem;background:radial-gradient(circle,#f3e2b0,transparent 70%);animation:float2 28s ease-in-out infinite}
-@keyframes float1{0%,100%{transform:translate(0,0)}50%{transform:translate(3rem,2rem)}}
-@keyframes float2{0%,100%{transform:translate(0,0)}50%{transform:translate(-3rem,-2rem)}}
-@media (prefers-color-scheme:dark){body::before,body::after{opacity:.12}}
+/* Ambient drifting blobs */
+body::before,body::after{content:"";position:fixed;z-index:-1;border-radius:50%;filter:blur(70px);opacity:.38;pointer-events:none}
+body::before{width:28rem;height:28rem;left:-7rem;top:6rem;background:radial-gradient(circle,#bfe3c6,transparent 70%);animation:drift1 26s ease-in-out infinite}
+body::after{width:24rem;height:24rem;right:-6rem;bottom:3rem;background:radial-gradient(circle,#f3e2b0,transparent 70%);animation:drift2 32s ease-in-out infinite}
+@keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(3.5rem,2rem) scale(1.06)}}
+@keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-3rem,-2.5rem) scale(.95)}}
+@media (prefers-color-scheme:dark){body::before,body::after{opacity:.10}}
 
-/* Glass nav */
-.glassnav{position:sticky;top:0;z-index:40;background:var(--glass);
-  backdrop-filter:blur(16px) saturate(1.7);-webkit-backdrop-filter:blur(16px) saturate(1.7);
-  border-bottom:1px solid var(--glass-brd);box-shadow:0 6px 24px -14px rgba(13,60,35,.3)}
-.navinner{max-width:1180px;margin:0 auto;display:flex;align-items:center;gap:1rem;padding:.7rem 1.4rem}
-.brand{display:inline-flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--ink)}
-.brand .logo{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:11px;
-  background:linear-gradient(135deg,#3a9160,#236340);color:#fff;font-size:1rem;box-shadow:var(--glow)}
-.brand b{font-size:1.04rem;font-weight:800;letter-spacing:-.01em;line-height:1.1;display:block}
-.brand small{color:var(--muted);font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:.11em}
-.links{display:flex;align-items:center;gap:.15rem;margin:0 auto}
-.links a{position:relative;display:inline-flex;align-items:center;gap:.4rem;padding:.5rem .85rem;border-radius:999px;
-  color:var(--muted);text-decoration:none;font-weight:600;font-size:.9rem;transition:color .18s,background .18s}
-.links a .ic{font-size:.84rem;opacity:.85}
-.links a:hover{color:var(--ink);background:rgba(22,163,74,.08)}
-.links a.active{color:var(--accent-strong);background:var(--accent-soft)}
-.links a::after{content:"";position:absolute;left:50%;bottom:.22rem;width:0;height:2px;border-radius:2px;
-  background:var(--accent);transform:translateX(-50%);transition:width .22s ease}
-.links a:hover::after,.links a.active::after{width:42%}
-#navscan{display:flex;align-items:center;gap:.7rem}
+/* ===== Floating rounded nav ===== */
+.navwrap{position:sticky;top:.85rem;z-index:50;padding:0 1rem;margin-bottom:.4rem}
+.nav{max-width:1200px;margin:0 auto;display:flex;align-items:center;gap:1rem;
+  background:var(--glass);border:1px solid var(--glass-brd);border-radius:999px;
+  padding:.55rem .8rem .55rem .65rem;box-shadow:var(--shadow-sm);
+  backdrop-filter:blur(18px) saturate(1.8);-webkit-backdrop-filter:blur(18px) saturate(1.8);
+  transition:box-shadow .3s}
+.nav.scrolled{box-shadow:var(--shadow)}
+.brand{display:inline-flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--ink);padding-left:.25rem}
+.brand .logo{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:14px;
+  background:linear-gradient(135deg,var(--accent-2),var(--accent-strong));color:#fff;font-size:1.05rem;
+  box-shadow:var(--glow);transition:transform .3s cubic-bezier(.34,1.56,.64,1)}
+.brand:hover .logo{transform:rotate(-8deg) scale(1.06)}
+.brand b{font-family:"Sora",sans-serif;font-size:1.02rem;font-weight:700;letter-spacing:-.02em;line-height:1.05;display:block}
+.brand small{color:var(--muted);font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.14em}
+.links{position:relative;display:flex;align-items:center;gap:.1rem;margin:0 auto}
+.links a{position:relative;z-index:1;display:inline-flex;align-items:center;gap:.42rem;padding:.52rem .95rem;border-radius:999px;
+  color:var(--muted);text-decoration:none;font-weight:600;font-size:.9rem;transition:color .2s}
+.links a .ic{font-size:.85rem;opacity:.9;transition:transform .25s}
+.links a:hover{color:var(--ink)}
+.links a:hover .ic{transform:translateY(-1px) scale(1.12)}
+.links a.active{color:var(--accent-strong)}
+#navind{position:absolute;top:2px;bottom:2px;left:0;width:0;border-radius:999px;
+  background:var(--accent-soft);border:1px solid var(--accent-border);opacity:0;z-index:0;
+  transition:transform .35s cubic-bezier(.3,1.1,.3,1),width .35s cubic-bezier(.3,1.1,.3,1),opacity .2s}
+.navside{display:flex;align-items:center;gap:.7rem}
 .navdot{font-size:.8rem;color:var(--muted);font-weight:600;white-space:nowrap}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.4rem;vertical-align:middle}
-.dot.live{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.18)}
-.dot.busy{background:var(--accent);box-shadow:0 0 0 3px rgba(22,163,74,.22)}
+.dot.live{background:var(--ok);box-shadow:0 0 0 3px rgba(47,125,79,.16);animation:pulse 2.6s ease-in-out infinite}
+.dot.busy{background:var(--cta);box-shadow:0 0 0 3px rgba(232,134,46,.2);animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 
-/* Layout */
-.page{padding:1.7rem 1.4rem 3rem}
-.container{max-width:1180px;margin:0 auto;animation:fadeIn .4s ease both}
-.ptitle{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;margin:.2rem 0 1.1rem}
-.sub{color:var(--muted);margin:.1rem 0 1.4rem;max-width:72ch}
-.sub a{color:var(--accent);text-decoration:none;font-weight:700}.sub a:hover{text-decoration:underline}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.25rem;box-shadow:var(--shadow-sm);margin-bottom:1.25rem}
+/* ===== Layout ===== */
+.page{padding:1.6rem 1.4rem 3.5rem}
+.container{max-width:1200px;margin:0 auto}
+.hero{margin:.6rem 0 1.5rem;animation:fadeUp .55s cubic-bezier(.2,.7,.2,1) both}
+.ptitle{font-size:clamp(1.55rem,3vw,2.05rem);font-weight:800;letter-spacing:-.03em;margin:0 0 .2rem;line-height:1.15}
+.ptitle .swash{position:relative;white-space:nowrap}
+.ptitle .swash::after{content:"";position:absolute;left:0;right:0;bottom:.06em;height:.32em;z-index:-1;border-radius:99px;
+  background:linear-gradient(90deg,var(--accent-soft),var(--cta-soft));animation:swash .9s cubic-bezier(.2,.7,.2,1) .2s both;transform-origin:left}
+@keyframes swash{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+.sub{color:var(--muted);margin:.15rem 0 0;max-width:78ch}
+.sub a,.plink{color:var(--accent);text-decoration:none;font-weight:700}
+.sub a:hover,.plink:hover{text-decoration:underline}
 
-/* Animations */
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-.tile,.panel,.card,.det{animation:fadeUp .5s cubic-bezier(.2,.7,.2,1) both}
-.tiles .tile:nth-child(2){animation-delay:.05s}.tiles .tile:nth-child(3){animation-delay:.1s}
-.tiles .tile:nth-child(4){animation-delay:.15s}.tiles .tile:nth-child(5){animation-delay:.2s}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.25rem;box-shadow:var(--shadow-xs);margin-bottom:1.2rem}
+@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+.tile,.panel,.card,.det,.paper,.edcard{animation:fadeUp .55s cubic-bezier(.2,.7,.2,1) both}
+.stagger>*:nth-child(2){animation-delay:.06s}.stagger>*:nth-child(3){animation-delay:.12s}
+.stagger>*:nth-child(4){animation-delay:.18s}.stagger>*:nth-child(5){animation-delay:.24s}
+.stagger>*:nth-child(6){animation-delay:.3s}.stagger>*:nth-child(7){animation-delay:.36s}
+.stagger>*:nth-child(8){animation-delay:.42s}
 
-/* Buttons — pill shaped (Neato) */
-button,.btn{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;border:1px solid transparent;border-radius:999px;
-  padding:.55rem 1.05rem;font-size:.88rem;font-weight:700;cursor:pointer;font-family:inherit;text-decoration:none;white-space:nowrap;
-  display:inline-flex;align-items:center;gap:.4rem;transition:transform .12s,box-shadow .2s,filter .2s;box-shadow:var(--shadow-sm)}
-button:hover,.btn:hover{transform:translateY(-1px);box-shadow:var(--glow);filter:brightness(1.05)}
-button:active{transform:translateY(0)}
-button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft),0 0 0 4px var(--accent)}
+/* ===== Buttons ===== */
+button,.btn{position:relative;overflow:hidden;background:linear-gradient(135deg,var(--accent-2),var(--accent-strong));color:#fff;
+  border:1px solid transparent;border-radius:999px;padding:.55rem 1.1rem;font-size:.88rem;font-weight:700;cursor:pointer;
+  font-family:inherit;text-decoration:none;white-space:nowrap;display:inline-flex;align-items:center;gap:.45rem;
+  transition:transform .15s cubic-bezier(.34,1.56,.64,1),box-shadow .2s,filter .2s;box-shadow:var(--shadow-xs)}
+button:hover,.btn:hover{transform:translateY(-2px);box-shadow:var(--glow);filter:brightness(1.06)}
+button:active,.btn:active{transform:translateY(0) scale(.98)}
+button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft),0 0 0 5px var(--accent)}
+button::after,.btn::after{content:"";position:absolute;top:0;left:-80%;width:50%;height:100%;
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.35),transparent);transform:skewX(-20deg);transition:left .5s}
+button:hover::after,.btn:hover::after{left:130%}
 button.ghost,.btn.ghost{background:var(--surface);color:var(--ink);border-color:var(--line-strong);box-shadow:none}
-button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accent-strong);background:var(--accent-soft);transform:translateY(-1px)}
-/* Orange CTA (Neato "Download app" style) for the primary scan actions */
-button.cta,.btn.cta{background:linear-gradient(135deg,#f0983f,#e0791f);color:#fff;box-shadow:0 10px 24px -10px rgba(224,121,31,.6)}
-button.cta:hover,.btn.cta:hover{filter:brightness(1.05);box-shadow:0 12px 28px -8px rgba(224,121,31,.6)}
-button:disabled{opacity:.6;cursor:default;transform:none;box-shadow:none;filter:none}
-.btn-lg{font-size:.95rem;padding:.72rem 1.4rem}
-.btn-lg .spin{border-color:#fff;border-top-color:transparent}
+button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accent-strong);background:var(--accent-soft)}
+button.cta,.btn.cta{background:linear-gradient(135deg,var(--cta-2),var(--cta-strong));box-shadow:var(--glow-cta)}
+button.cta:hover,.btn.cta:hover{filter:brightness(1.06);box-shadow:0 16px 34px -10px rgba(224,121,31,.6)}
+button.sm,.btn.sm{padding:.38rem .8rem;font-size:.8rem}
+button:disabled{opacity:.55;cursor:default;transform:none;box-shadow:none;filter:none}
+.btn-lg{font-size:.95rem;padding:.75rem 1.5rem}
 
-/* Inputs */
-input,select{padding:.58rem .75rem;border:1px solid var(--line-strong);border-radius:var(--r-sm);
+/* ===== Inputs ===== */
+input,select{padding:.6rem .8rem;border:1px solid var(--line-strong);border-radius:999px;
   font-size:.92rem;font-family:inherit;background:var(--surface);color:var(--ink);transition:border-color .15s,box-shadow .15s}
 input::placeholder{color:var(--faint)}
 input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 
-/* Tables */
+/* ===== Table ===== */
 table{border-collapse:collapse;width:100%}
-th{text-align:left;color:var(--faint);font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:.5rem .6rem;border-bottom:1px solid var(--line)}
-td{padding:.7rem .6rem;border-bottom:1px solid var(--line);vertical-align:middle}
+th{text-align:left;color:var(--faint);font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:.5rem .65rem;border-bottom:1px solid var(--line)}
+td{padding:.72rem .65rem;border-bottom:1px solid var(--line);vertical-align:middle}
 tbody tr:last-child td{border-bottom:none}
 tbody tr{transition:background .12s}
 tbody tr:hover{background:var(--surface-2)}
 
-/* Pills */
+/* ===== Pills & chips ===== */
 .tag{display:inline-flex;align-items:center;background:var(--accent-soft);color:var(--accent-strong);
-  border-radius:999px;padding:.15rem .58rem;font-size:.74rem;font-weight:700;margin:2px 3px 2px 0;text-decoration:none;line-height:1.4}
-.chip{display:inline-block;padding:.38rem .8rem;border-radius:999px;border:1px solid var(--line-strong);
-  background:var(--surface);color:var(--muted);text-decoration:none;font-size:.83rem;font-weight:600;margin:0 .35rem .45rem 0;transition:all .15s}
-.chip:hover{border-color:var(--accent);color:var(--accent-strong);transform:translateY(-1px)}
-.chip.on{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;border-color:transparent;box-shadow:var(--shadow-sm)}
+  border-radius:999px;padding:.16rem .6rem;font-size:.74rem;font-weight:700;margin:2px 3px 2px 0;text-decoration:none;line-height:1.4}
+.tag.warn{background:var(--warn-soft);color:var(--warn)}
+.chip{display:inline-block;padding:.4rem .85rem;border-radius:999px;border:1px solid var(--line-strong);
+  background:var(--surface);color:var(--muted);text-decoration:none;font-size:.83rem;font-weight:600;margin:0 .35rem .45rem 0;
+  transition:all .18s cubic-bezier(.34,1.56,.64,1)}
+.chip:hover{border-color:var(--accent);color:var(--accent-strong);transform:translateY(-2px)}
+.chip.on{background:linear-gradient(135deg,var(--accent-2),var(--accent-strong));color:#fff;border-color:transparent;box-shadow:var(--shadow-xs)}
+.badge{display:inline-flex;align-items:center;gap:.3rem;font-size:.72rem;font-weight:700;padding:.14rem .55rem;border-radius:999px}
+.badge.ok{background:var(--accent-soft);color:var(--accent-strong)}
+.badge.off{background:var(--surface-3);color:var(--muted)}
+.badge.warn{background:var(--warn-soft);color:var(--warn)}
 
-/* Dashboard: stat tiles */
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1rem;margin-bottom:1.25rem}
-.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.05rem 1.15rem;box-shadow:var(--shadow-sm);
-  position:relative;overflow:hidden;transition:transform .18s,box-shadow .18s,border-color .18s}
-.tile:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent-border)}
-.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#3a9160,#236340);opacity:.85}
-.tile .label{color:var(--faint);font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
-.tile .val{font-size:1.95rem;font-weight:800;letter-spacing:-.02em;margin:.25rem 0 .1rem;line-height:1}
+/* ===== KPI tiles ===== */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:1rem;margin-bottom:1.2rem}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.1rem 1.15rem;box-shadow:var(--shadow-xs);
+  position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s,border-color .2s}
+.tile:hover{transform:translateY(-4px);box-shadow:var(--shadow);border-color:var(--accent-border)}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,var(--accent-2),var(--accent-strong));opacity:.9}
+.tile .label{color:var(--faint);font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em}
+.tile .val{font-family:"Sora",sans-serif;font-size:2rem;font-weight:800;letter-spacing:-.03em;margin:.28rem 0 .12rem;line-height:1;font-variant-numeric:tabular-nums}
 .tile .foot{color:var(--muted);font-size:.8rem;font-weight:500}
-.tile .ic{position:absolute;top:1rem;right:1rem;width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--accent-soft);color:var(--accent);font-size:1rem}
+.tile .ic{position:absolute;top:.95rem;right:.95rem;width:36px;height:36px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  background:var(--accent-soft);color:var(--accent);font-size:1rem;transition:transform .3s cubic-bezier(.34,1.56,.64,1)}
+.tile:hover .ic{transform:rotate(-8deg) scale(1.12)}
 
-/* Dashboard: panels + charts */
-.cols{display:grid;grid-template-columns:1.6fr 1fr;gap:1.25rem;align-items:start}
-@media (max-width:900px){.cols{grid-template-columns:1fr}}
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.2rem;box-shadow:var(--shadow-sm);margin-bottom:1.25rem}
-.panel h3{margin:0 0 .1rem;font-size:.98rem;font-weight:800;letter-spacing:-.01em}
+/* ===== Panels & charts ===== */
+.cols{display:grid;grid-template-columns:1.6fr 1fr;gap:1.2rem;align-items:start}
+@media (max-width:920px){.cols{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.2rem;box-shadow:var(--shadow-xs);margin-bottom:1.2rem}
+.panel h3{margin:0 0 .12rem;font-size:1rem;font-weight:700;letter-spacing:-.015em}
 .panel .cap{color:var(--faint);font-size:.8rem;margin-bottom:1rem}
-.bars{display:flex;align-items:flex-end;gap:.55rem;height:130px;padding-top:.5rem}
+.bars{display:flex;align-items:flex-end;gap:.55rem;height:138px;padding-top:.4rem}
 .bars .b{flex:1;display:flex;flex-direction:column;align-items:center;gap:.4rem;height:100%;justify-content:flex-end;color:var(--faint);font-size:.7rem}
-.bars .b i{width:100%;max-width:34px;background:linear-gradient(180deg,#4aa972,#236340);border-radius:6px 6px 3px 3px;min-height:3px;font-style:normal;transition:height .4s cubic-bezier(.2,.7,.2,1)}
-.bars .b .n{color:var(--muted);font-weight:700;font-size:.72rem}
+.bars .b i{width:100%;max-width:36px;background:linear-gradient(180deg,var(--accent-2),var(--accent-strong));border-radius:7px 7px 3px 3px;
+  height:3px;font-style:normal;transition:height .9s cubic-bezier(.2,.7,.2,1)}
+.bars .b .n{color:var(--muted);font-weight:700;font-size:.72rem;font-variant-numeric:tabular-nums}
 .hbar{display:flex;align-items:center;gap:.7rem;margin:.55rem 0}
-.hbar .hl{width:96px;flex:0 0 96px;font-size:.82rem;color:var(--muted);font-weight:600;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hbar .hl{width:104px;flex:0 0 104px;font-size:.82rem;color:var(--muted);font-weight:600;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hbar .track{flex:1;height:9px;border-radius:99px;background:var(--surface-2);overflow:hidden}
-.hbar .track i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#4aa972,#236340)}
-.hbar .hn{width:34px;flex:0 0 34px;text-align:right;font-weight:700;font-size:.8rem}
+.hbar .track i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent-2),var(--accent-strong));
+  width:0;transition:width .9s cubic-bezier(.2,.7,.2,1)}
+.hbar .hn{width:34px;flex:0 0 34px;text-align:right;font-weight:700;font-size:.8rem;font-variant-numeric:tabular-nums}
 .legend{display:flex;flex-wrap:wrap;gap:.4rem 1rem;margin-top:.8rem;font-size:.82rem;color:var(--muted)}
 .legend b{color:var(--ink)}
 .sdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:.4rem;vertical-align:middle}
 
-/* Recent activity list */
+/* ===== Activity list ===== */
 .rlist{display:flex;flex-direction:column}
-.ritem{display:flex;align-items:center;gap:.8rem;padding:.7rem .2rem;border-bottom:1px solid var(--line);text-decoration:none;color:inherit;transition:padding .15s}
+.ritem{display:flex;align-items:center;gap:.8rem;padding:.72rem .3rem;border-bottom:1px solid var(--line);text-decoration:none;color:inherit;
+  border-radius:10px;transition:background .15s,padding .18s}
 .ritem:last-child{border-bottom:none}
-.ritem:hover{padding-left:.5rem}
+.ritem:hover{background:var(--surface-2);padding-left:.65rem}
 .ritem:hover .rt{color:var(--accent-strong)}
-.rsrc{flex:0 0 auto;font-size:.7rem;font-weight:700;color:var(--muted);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:.2rem .45rem;white-space:nowrap}
-.rt{flex:1;min-width:0;font-weight:600;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rsrc{flex:0 0 auto;font-size:.7rem;font-weight:700;color:var(--muted);background:var(--surface-2);border:1px solid var(--line);border-radius:7px;padding:.22rem .5rem;white-space:nowrap}
+.rt{flex:1;min-width:0;font-weight:600;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:color .15s}
 .rtime{flex:0 0 auto;color:var(--faint);font-size:.78rem}
 
-/* Detection grid */
+/* ===== Detections grid ===== */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1.1rem}
-.det{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;
-  display:flex;flex-direction:column;box-shadow:var(--shadow-sm);transition:transform .18s,box-shadow .18s,border-color .18s}
-.det:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:var(--accent-border)}
-.det img{width:100%;height:200px;object-fit:cover;object-position:top center;background:var(--surface-2);border-bottom:1px solid var(--line);cursor:zoom-in;display:block}
+.det{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;
+  box-shadow:var(--shadow-xs);transition:transform .22s cubic-bezier(.2,.7,.2,1),box-shadow .22s,border-color .22s}
+.det:hover{transform:translateY(-5px);box-shadow:var(--shadow-lg);border-color:var(--accent-border)}
+.det .shot{position:relative;overflow:hidden;background:var(--surface-2);border-bottom:1px solid var(--line)}
+.det img{width:100%;height:205px;object-fit:cover;object-position:top center;cursor:zoom-in;display:block;transition:transform .5s cubic-bezier(.2,.7,.2,1)}
+.det:hover img{transform:scale(1.04)}
+.det .pagebadge{position:absolute;top:.6rem;left:.6rem;background:rgba(20,28,22,.82);color:#fff;font-size:.7rem;font-weight:700;
+  border-radius:999px;padding:.2rem .6rem;backdrop-filter:blur(6px)}
 .det .body{padding:.95rem 1.05rem;display:flex;flex-direction:column;gap:.5rem}
 .det .ttl{font-weight:700;line-height:1.35;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
 .det .ttl:hover{color:var(--accent-strong)}
 .det .meta{color:var(--faint);font-size:.78rem;font-weight:500}
 
-/* Keyword list */
-.klist .kwname{font-weight:700;font-size:.98rem;color:var(--ink);text-decoration:none}
-.klist .kwname:hover{color:var(--accent-strong)}
+/* ===== Newspapers page ===== */
+.papers{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:1rem;margin-bottom:1.4rem}
+.paper{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.05rem 1.1rem;box-shadow:var(--shadow-xs);
+  transition:transform .2s,box-shadow .2s,border-color .2s;position:relative;overflow:hidden}
+.paper:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent-border)}
+.paper h4{margin:0;font-size:1rem;font-weight:700;letter-spacing:-.015em;display:flex;align-items:center;gap:.5rem}
+.paper .mono{font-size:.74rem;color:var(--faint);margin:.15rem 0 .55rem}
+.paper .secs{color:var(--muted);font-size:.8rem;line-height:1.5}
+.paper .stat{margin-top:.6rem;display:flex;align-items:center;justify-content:space-between;font-size:.78rem;color:var(--faint)}
+
+/* ===== E-paper page ===== */
+.edcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:1.15rem 1.2rem;box-shadow:var(--shadow-xs);margin-bottom:1.1rem}
+.edhead{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;margin-bottom:.7rem}
+.edhead h4{margin:0;font-size:1.05rem;font-weight:700;letter-spacing:-.015em}
+.edhead .grow{flex:1}
+.pgstrip{display:flex;gap:.6rem;overflow-x:auto;padding:.2rem .1rem .5rem}
+.pgstrip a{flex:0 0 auto;position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);
+  transition:transform .2s,box-shadow .2s,border-color .2s}
+.pgstrip a:hover{transform:translateY(-3px) scale(1.02);box-shadow:var(--shadow);border-color:var(--accent-border)}
+.pgstrip img{height:130px;display:block;background:var(--surface-2)}
+.pgstrip .pn{position:absolute;bottom:.35rem;left:.35rem;background:rgba(20,28,22,.82);color:#fff;
+  font-size:.66rem;font-weight:700;border-radius:99px;padding:.1rem .45rem}
+
+/* ===== Bars & banners ===== */
+.scanbar{background:linear-gradient(135deg,var(--accent-2),var(--accent-strong));color:#fff;text-align:center;padding:.55rem 1rem;font-weight:600;font-size:.86rem;
+  display:flex;align-items:center;justify-content:center;gap:.5rem}
+.scanbar .spin{border-color:rgba(255,255,255,.5);border-top-color:#fff}
+.donebar{background:var(--accent-soft);color:var(--accent-strong);border-bottom:1px solid var(--accent-border);text-align:center;padding:.5rem 1rem;font-weight:600;font-size:.86rem;animation:fadeUp .4s both}
+.banner{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn);border-radius:var(--r-sm);padding:.8rem 1rem;margin-bottom:1.2rem;font-weight:600;font-size:.88rem}
+.hint{background:var(--surface-2);border:1px solid var(--line-strong);color:var(--muted);border-radius:var(--r-sm);padding:.75rem 1rem;font-size:.86rem;margin:.6rem 0 0}
+
+/* ===== Section heading ===== */
+.sechead{display:flex;align-items:center;gap:.55rem;font-size:1.05rem;font-weight:700;letter-spacing:-.015em;margin:1.7rem 0 .9rem;font-family:"Sora",sans-serif}
+.sechead::before{content:"";width:4px;height:1.05rem;border-radius:99px;background:linear-gradient(180deg,var(--accent-2),var(--accent-strong))}
+.sechead span{color:var(--faint);font-size:.84rem;font-weight:600}
+
+/* ===== Lightbox ===== */
+#lb{position:fixed;inset:0;z-index:100;background:rgba(15,20,14,.85);display:none;align-items:center;justify-content:center;
+  padding:2rem;backdrop-filter:blur(8px);cursor:zoom-out;opacity:0;transition:opacity .25s}
+#lb.open{display:flex;opacity:1}
+#lb img{max-width:min(96vw,1100px);max-height:92vh;border-radius:14px;box-shadow:0 40px 90px -20px rgba(0,0,0,.7);
+  animation:lbin .3s cubic-bezier(.2,.9,.3,1.2) both}
+@keyframes lbin{from{transform:scale(.92);opacity:.4}to{transform:scale(1);opacity:1}}
+
+/* ===== Misc ===== */
+.row{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}
+.empty{color:var(--muted);text-align:center;padding:2.6rem 1.5rem;border:1.5px dashed var(--line-strong);border-radius:var(--r);background:var(--surface)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+.kwname{font-weight:700;font-size:.96rem;color:var(--ink);text-decoration:none}
+.kwname:hover{color:var(--accent-strong)}
 .count-link{color:var(--accent-strong);font-weight:700;text-decoration:none}
 .count-link:hover{text-decoration:underline}
 .muted-count{color:var(--faint)}
-
-/* Status bars */
-.scanbar{background:linear-gradient(135deg,#3a9160,#236340);color:#fff;text-align:center;padding:.55rem 1rem;font-weight:600;font-size:.86rem;
-  display:flex;align-items:center;justify-content:center;gap:.5rem}
-.scanbar .spin{border-color:rgba(255,255,255,.5);border-top-color:#fff}
-.donebar{background:var(--ok-soft);color:var(--ok);border-bottom:1px solid var(--ok-border);text-align:center;padding:.5rem 1rem;font-weight:600;font-size:.86rem}
-.banner{background:var(--accent-soft);border:1px solid var(--accent-border);color:var(--accent-strong);border-radius:var(--r-sm);padding:.8rem 1rem;margin-bottom:1.2rem;font-weight:600}
-.hint{background:var(--surface-2);border:1px solid var(--line-strong);color:var(--muted);border-radius:var(--r-sm);padding:.75rem 1rem;font-size:.88rem;margin-bottom:1rem}
-
-/* Section heading */
-.sechead{display:flex;align-items:center;gap:.55rem;font-size:1.02rem;font-weight:800;letter-spacing:-.01em;margin:1.6rem 0 .9rem}
-.sechead::before{content:"";width:4px;height:1rem;border-radius:99px;background:linear-gradient(180deg,#3a9160,#236340)}
-.sechead span{color:var(--faint);font-size:.84rem;font-weight:600}
-
-/* Misc */
-.row{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}
-.empty{color:var(--muted);text-align:center;padding:2.6rem 1.5rem;border:1px dashed var(--line-strong);border-radius:var(--r);background:var(--surface)}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;margin-right:.4rem}
-@keyframes s{to{transform:rotate(360deg)}}
-@media (max-width:820px){
-  .navinner{flex-wrap:wrap;gap:.5rem}
-  .links{order:3;width:100%;overflow-x:auto;justify-content:flex-start;margin:0;padding-bottom:.15rem}
+@media (max-width:860px){
+  .nav{flex-wrap:wrap;border-radius:24px}
+  .links{order:3;width:100%;overflow-x:auto;justify-content:flex-start;padding:.2rem 0 .1rem}
   .navdot{display:none}
-  .cols{grid-template-columns:1fr}
+  #navind{display:none}
 }
 """
 
+_FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+          '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+          '<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800'
+          '&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">')
 
 _NAV = [
     ("/", "Overview", "overview", "◧"),
     ("/newspapers", "Newspapers", "newspapers", "📰"),
-    ("/youtube", "YouTube", "youtube", "▶"),
+    ("/epaper", "E-Paper", "epaper", "🗞"),
     ("/mentions", "Detections", "mentions", "◎"),
     ("/docs", "API", "api", "⚙"),
 ]
 _TITLES = {"overview": "Overview", "newspapers": "Newspapers",
-           "youtube": "YouTube", "mentions": "Detections"}
+           "epaper": "E-Paper editions", "mentions": "Detections"}
+_HERO_SUBS = {
+    "overview": "Everything your keywords caught across Pakistan's press — live.",
+    "newspapers": "The publications being watched and the keywords that watch them.",
+    "epaper": "Daily print editions, fetched every morning and read page by page.",
+    "mentions": "Every keyword hit — website articles and print pages side by side.",
+}
+
+
+# JS: nav indicator, scroll shadow, KPI count-up, chart grow-in, lightbox, scan poller
+_JS = """
+(function(){
+  /* nav active indicator */
+  function placeInd(){
+    var a=document.querySelector('.links a.active'),ind=document.getElementById('navind');
+    if(!a||!ind)return;
+    ind.style.width=a.offsetWidth+'px';
+    ind.style.transform='translateX('+a.offsetLeft+'px)';
+    ind.style.opacity='1';
+  }
+  placeInd();window.addEventListener('resize',placeInd);
+  if(document.fonts&&document.fonts.ready)document.fonts.ready.then(placeInd);
+
+  /* nav scroll shadow */
+  var nav=document.querySelector('.nav');
+  window.addEventListener('scroll',function(){nav&&nav.classList.toggle('scrolled',window.scrollY>8)},{passive:true});
+
+  /* KPI count-up */
+  document.querySelectorAll('[data-count]').forEach(function(el){
+    var end=parseInt(el.getAttribute('data-count'),10)||0,t0=null,D=700;
+    if(end<=0){el.textContent=end;return}
+    function step(t){t0=t0||t;var p=Math.min((t-t0)/D,1);p=1-Math.pow(1-p,3);
+      el.textContent=Math.round(end*p);if(p<1)requestAnimationFrame(step)}
+    requestAnimationFrame(step);
+  });
+
+  /* chart grow-in */
+  requestAnimationFrame(function(){requestAnimationFrame(function(){
+    document.querySelectorAll('.bars i[data-h]').forEach(function(el){el.style.height=el.getAttribute('data-h')+'px'});
+    document.querySelectorAll('.hbar .track i[data-w]').forEach(function(el){el.style.width=el.getAttribute('data-w')+'%'});
+  })});
+
+  /* lightbox */
+  var lb=document.createElement('div');lb.id='lb';lb.innerHTML='<img>';document.body.appendChild(lb);
+  var lbimg=lb.querySelector('img');
+  document.addEventListener('click',function(e){
+    var z=e.target.closest('.zoom');
+    if(z){e.preventDefault();lbimg.src=z.getAttribute('data-full')||z.src;lb.classList.add('open')}
+    else if(e.target===lb||e.target===lbimg){lb.classList.remove('open')}
+  });
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')lb.classList.remove('open')});
+
+  /* scan status poller */
+  var wasScanning=__SCANNING__;
+  async function poll(){
+    try{
+      var n=await fetch('/api/scan/status').then(function(r){return r.json()});
+      var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
+      var running=n.running||e.running;
+      var bar=document.getElementById('statusbar'),side=document.getElementById('navside-state');
+      if(running){
+        var msg=n.running?('Scanning newspapers'+(n.keyword?' for \\u201c'+n.keyword+'\\u201d':''))
+                         :('Fetching & reading e-paper'+(e.label?' \\u2014 '+e.label:''));
+        bar.innerHTML='<div class="scanbar"><span class="spin"></span>'+msg+'\\u2026 you can keep browsing \\u2014 results load automatically.</div>';
+        if(side)side.innerHTML='<span class="dot busy"></span>Working\\u2026';
+        var b=document.getElementById('navscanbtn');if(b){b.disabled=true;b.innerHTML='<span class="spin"></span>Scanning\\u2026'}
+      }else if(wasScanning){location.reload()}
+      wasScanning=running;
+    }catch(err){}
+  }
+  setInterval(poll,3000);
+})();
+"""
 
 
 def _shell(title: str, active: str, body: str) -> str:
-    # A scan runs in a subprocess, so its state is global. A tiny JS poller keeps
-    # the status live on EVERY tab and reloads the page ONCE when a scan finishes.
     news = scan_manager.status()
-    yt = scan_runner.status()
-    scanning = bool(news["running"] or yt["running"])
+    ep = scan_runner.status()
+    scanning = bool(news["running"] or ep["running"])
 
     scan_btn = (
-        '<button class="cta" disabled><span class="spin"></span>Scanning…</button>'
+        '<button class="cta" id="navscanbtn" disabled><span class="spin"></span>Scanning…</button>'
         if scanning
         else '<form method="post" action="/ui/scan" style="margin:0">'
-        '<button class="cta">▶ Scan all</button></form>'
+             '<button class="cta" id="navscanbtn">▶ Scan all</button></form>'
     )
     nav_html = "".join(
         f'<a class="{"active" if key == active else ""}" href="{href}">'
         f'<span class="ic">{ic}</span>{label}</a>'
         for href, label, key, ic in _NAV
     )
-    foot = (
-        '<span class="dot busy"></span>Scanning…' if scanning
-        else '<span class="dot live"></span>Live · idle'
-    )
+    state = ('<span class="dot busy"></span>Working…' if scanning
+             else '<span class="dot live"></span>Live')
+    hero_sub = _HERO_SUBS.get(active, "")
+    title_words = _TITLES.get(active, "Media Monitor").split(" ")
+    hero_title = (" ".join(title_words[:-1]) + f' <span class="swash">{title_words[-1]}</span>'
+                  if title_words else "Media Monitor")
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><style>{_CSS}</style></head><body>
-<header class="glassnav"><div class="navinner">
+<title>{title}</title>{_FONTS}<style>{_CSS}</style></head><body>
+<div class="navwrap"><header class="nav">
   <a class="brand" href="/"><span class="logo">📡</span>
-    <span><b>Media Monitor</b><small>Live intelligence</small></span></a>
-  <nav class="links">{nav_html}</nav>
-  <span id="navscan"><span class="navdot" id="sidefoot">{foot}</span>{scan_btn}</span>
-</div></header>
-<div id="statusbar">{_status_bar(news, yt)}</div>
+    <span><b>Media Monitor</b><small>Press intelligence</small></span></a>
+  <nav class="links"><span id="navind"></span>{nav_html}</nav>
+  <span class="navside"><span class="navdot" id="navside-state">{state}</span>{scan_btn}</span>
+</header></div>
+<div id="statusbar">{_status_bar(news, ep)}</div>
 <main class="page"><div class="container">
-  <h1 class="ptitle">{_TITLES.get(active, "Media Monitor")}</h1>
+  <div class="hero"><h1 class="ptitle">{hero_title}</h1>
+  <p class="sub">{hero_sub}</p></div>
   {body}
 </div></main>
-<script>{_STATUS_JS.replace('__SCANNING__', 'true' if scanning else 'false')}</script>
+<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false')}</script>
 </body></html>"""
 
 
-def _status_bar(news: dict, yt: dict) -> str:
-    """Full-width bar under the header: live scan state, shown on all tabs."""
+def _status_bar(news: dict, ep: dict) -> str:
     if news["running"]:
         who = f"“{html.escape(news['keyword'])}”" if news["keyword"] else "all keywords"
-        return (
-            f'<div class="scanbar"><span class="spin"></span>'
-            f"Scanning newspapers for {who}… you can switch tabs — results load automatically when done.</div>"
-        )
-    if yt["running"]:
-        who = f"“{html.escape(yt['label'])}”" if yt.get("label") else "your channels"
-        return f'<div class="scanbar"><span class="spin"></span>Scanning YouTube {who}…</div>'
+        return (f'<div class="scanbar"><span class="spin"></span>'
+                f"Scanning newspapers for {who}… you can keep browsing — results load automatically.</div>")
+    if ep["running"]:
+        who = f" — {html.escape(ep['label'])}" if ep.get("label") else ""
+        return (f'<div class="scanbar"><span class="spin"></span>'
+                f"Fetching &amp; reading e-paper editions{who}…</div>")
     s = news.get("last_summary")
     if s:
         who = f"“{html.escape(news['last_keyword'])}”" if news.get("last_keyword") else "all keywords"
-        return (
-            f'<div class="donebar">✓ Last scan of {who}: {s.get("mentions",0)} new detection(s), '
-            f'{s.get("cached",0)} article(s) fetched.</div>'
-        )
+        return (f'<div class="donebar">✓ Last scan of {who}: {s.get("mentions", 0)} new detection(s), '
+                f'{s.get("cached", 0)} article(s) fetched.</div>')
+    e = ep.get("last_summary")
+    if e:
+        return (f'<div class="donebar">✓ Last e-paper cycle: {e.get("downloaded", 0)} page(s) fetched, '
+                f'{e.get("read", 0)} read, {e.get("mentions", 0)} new detection(s).</div>')
     return ""
 
 
-# Polls scan status every 3s; updates the bar live and reloads once when a scan
-# finishes so fresh results appear without a jarring constant refresh.
-_STATUS_JS = """
-var wasScanning = __SCANNING__;
-async function pollScan(){
-  try{
-    var n = await fetch('/api/scan/status').then(r=>r.json());
-    var y = await fetch('/api/scan/youtube/status').then(r=>r.json());
-    var running = n.running || y.running;
-    var bar = document.getElementById('statusbar');
-    var nav = document.getElementById('navscan');
-    if(running){
-      var who = n.running ? (n.keyword ? '“'+n.keyword+'”' : 'all keywords')
-                          : (y.label ? '“'+y.label+'”' : 'your channels');
-      var what = n.running ? 'newspapers for ' : 'YouTube ';
-      bar.innerHTML = '<div class="scanbar"><span class="spin"></span>Scanning '+what+who+
-        '… you can switch tabs — results load automatically when done.</div>';
-      nav.innerHTML = '<button class="cta" disabled><span class="spin"></span>Scanning…</button>';
-      var f = document.getElementById('sidefoot');
-      if(f) f.innerHTML = '<span class="dot busy"></span>Scanning…';
-    } else if(wasScanning){
-      location.reload();      // scan just finished -> show results
-    }
-    wasScanning = running;
-  }catch(e){}
-}
-setInterval(pollScan, 3000);
-"""
+# ==========================================================================
+# Shared card renderers
+# ==========================================================================
+def _media_url(abs_path: str | None) -> str | None:
+    if not abs_path:
+        return None
+    try:
+        rel = Path(abs_path).resolve().relative_to(settings.storage_dir.resolve())
+        return "/media/" + str(rel).replace("\\", "/")
+    except Exception:
+        return None
 
 
 def _detection_card(m: Mention) -> str:
-    """One detection card (thumbnail + title + meta + keyword tags)."""
     thumb = _media_url(m.screenshot_path) or _media_url(m.full_screenshot_path)
-    img = (
-        f'<a href="{thumb}" target="_blank" title="Open full screenshot">'
-        f'<img loading="lazy" src="{thumb}"></a>'
-        if thumb
-        else ""
-    )
+    badge = ""
+    if m.module == "epaper" and m.section:
+        pg = m.section.rsplit("page", 1)[-1].strip()
+        badge = f'<span class="pagebadge">🗞 p.{html.escape(pg)}</span>'
+    img = (f'<div class="shot">{badge}<img loading="lazy" class="zoom" src="{thumb}" '
+           f'data-full="{thumb}"></div>') if thumb else ""
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in (m.matched_keywords or []))
-    when = m.detected_at.astimezone().strftime("%d %b %Y, %H:%M") if m.detected_at else ""
-    icon = "▶ YouTube" if m.module == "youtube" else "📰"
-    stamp = None
-    if m.module == "youtube" and m.deeplink_seconds is not None:
-        s = int(m.deeplink_seconds)
-        stamp = f"⏱ jump to {s // 60}:{s % 60:02d}"
-    meta = " · ".join(x for x in [icon, m.source, m.sentiment, stamp] if x)
-    return (
-        f'<div class="det">{img}<div class="body">'
-        f'<a class="ttl" href="{html.escape(m.url)}" target="_blank">{html.escape(m.title)}</a>'
-        f'<div class="meta">{meta} · {when}</div><div>{tags}</div></div></div>'
-    )
-
-
-# --------------------------------------------------------------------------
-# Overview dashboard
-# --------------------------------------------------------------------------
-_PKT = timezone(timedelta(hours=5))
-_SENT_COLORS = {"Positive": "var(--accent)", "Critical": "#e05d3a",
-                "Neutral": "#9b9384", "Unscored": "var(--line-strong)"}
+    when = m.detected_at.astimezone(_PKT).strftime("%d %b %Y, %H:%M") if m.detected_at else ""
+    icon = "🗞 E-Paper" if m.module == "epaper" else "📰"
+    meta = " · ".join(x for x in [icon, m.source, m.sentiment, when] if x)
+    return (f'<div class="det">{img}<div class="body">'
+            f'<a class="ttl" href="{html.escape(m.url)}" target="_blank">{html.escape(m.title)}</a>'
+            f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
 
 
 def _utc(dt):
@@ -429,11 +551,15 @@ def _rel(dt) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
+_SENT_COLORS = {"Positive": "var(--accent)", "Critical": "#e05d3a",
+                "Neutral": "#9b9384", "Unscored": "var(--line-strong)"}
+
+
 def _bars(days: list[tuple[str, int]]) -> str:
     mx = max((v for _, v in days), default=0) or 1
     cells = "".join(
         f'<div class="b"><span class="n">{v}</span>'
-        f'<i style="height:{int(4 + (v / mx) * 104)}px"></i>{lbl}</div>'
+        f'<i data-h="{int(4 + (v / mx) * 108)}"></i>{lbl}</div>'
         for lbl, v in days
     )
     return f'<div class="bars">{cells}</div>'
@@ -445,7 +571,7 @@ def _hbars(pairs: list[tuple[str, int]]) -> str:
     mx = max(v for _, v in pairs) or 1
     return "".join(
         f'<div class="hbar"><div class="hl" title="{html.escape(l)}">{html.escape(l)}</div>'
-        f'<div class="track"><i style="width:{int(v / mx * 100)}%"></i></div>'
+        f'<div class="track"><i data-w="{int(v / mx * 100)}"></i></div>'
         f'<div class="hn">{v}</div></div>'
         for l, v in pairs
     )
@@ -475,6 +601,9 @@ def _health_row(label: str, ok: bool, text: str) -> str:
             f"{text}</span></div>")
 
 
+# ==========================================================================
+# Overview
+# ==========================================================================
 @app.get("/", response_class=HTMLResponse)
 def dashboard(db: Session = Depends(get_db)):
     total = db.scalar(select(func.count()).select_from(Mention)) or 0
@@ -486,20 +615,18 @@ def dashboard(db: Session = Depends(get_db)):
     active_kw = db.scalar(
         select(func.count()).select_from(Keyword).where(Keyword.active.is_(True))
     ) or 0
-    np_kw = db.scalar(select(func.count()).select_from(Keyword).where(
-        Keyword.active.is_(True), Keyword.module == "newspaper")) or 0
-    yt_kw = db.scalar(select(func.count()).select_from(Keyword).where(
-        Keyword.active.is_(True), Keyword.module == "youtube")) or 0
-    n_channels = db.scalar(select(func.count()).select_from(YouTubeChannel)) or 0
-    n_papers = len(SITE_CONFIGS) + 1  # Dawn + configurable sites
+    n_papers = len(SITE_CONFIGS) + 1
+    n_epapers = len(sources.SOURCES)
+    ep_pages_today = db.scalar(
+        select(func.count()).select_from(EPaperPage)
+        .where(EPaperPage.date == today_start.date().isoformat())
+    ) or 0
 
-    # Aggregate over recent mentions for the charts.
     agg = db.execute(
         select(Mention.detected_at, Mention.source, Mention.sentiment, Mention.module)
         .order_by(Mention.detected_at.desc()).limit(3000)
     ).all()
 
-    # 7-day trend (PKT days)
     day_counts: dict[str, int] = {}
     for i in range(6, -1, -1):
         d = (today_start - timedelta(days=i))
@@ -513,7 +640,6 @@ def dashboard(db: Session = Depends(get_db)):
                 day_counts[lbl] += 1
     days = [(l, day_counts[l]) for l in order]
 
-    # Top sources + sentiment
     src_counts: dict[str, int] = {}
     sent_counts = {"Positive": 0, "Critical": 0, "Neutral": 0, "Unscored": 0}
     for _dt, source, sentiment, _mod in agg:
@@ -527,7 +653,7 @@ def dashboard(db: Session = Depends(get_db)):
     ).scalars().all()
     recent_html = "".join(
         f'<a class="ritem" href="{html.escape(m.url)}" target="_blank">'
-        f'<span class="rsrc">{"▶" if m.module == "youtube" else "📰"} '
+        f'<span class="rsrc">{"🗞" if m.module == "epaper" else "📰"} '
         f'{html.escape((m.source or "")[:16])}</span>'
         f'<span class="rt">{html.escape(m.title)}</span>'
         f'<span class="rtime">{_rel(m.detected_at)}</span></a>'
@@ -536,42 +662,44 @@ def dashboard(db: Session = Depends(get_db)):
 
     st = scan_manager.status()
     last = st.get("last_summary")
-    last_txt = (f'{last.get("mentions", 0)} found' if last else "no scans yet")
+    last_txt = (f'{last.get("mentions", 0)} found' if last else "—")
 
     health = (
-        _health_row("Newspaper + YouTube scans", settings.scheduler_enabled,
-                    "scheduled" if settings.scheduler_enabled else "manual only")
-        + _health_row("LLM scoring (Claude)", settings.enable_llm_scoring and bool(settings.anthropic_api_key),
+        _health_row("Scheduled scans", settings.scheduler_enabled,
+                    "on" if settings.scheduler_enabled else "manual only")
+        + _health_row("E-paper reading (Claude vision)", reader.has_key(),
+                      "ready" if reader.has_key() else "needs ANTHROPIC_API_KEY")
+        + _health_row("LLM scoring", settings.enable_llm_scoring and bool(settings.anthropic_api_key),
                       "on" if (settings.enable_llm_scoring and settings.anthropic_api_key) else "off")
         + _health_row("WhatsApp alerts", settings.notifier == "whatsapp" and bool(settings.whatsapp_access_token),
                       "live" if (settings.notifier == "whatsapp" and settings.whatsapp_access_token) else "dry-run")
         + _health_row("Email digest", settings.smtp_configured,
                       "SMTP" if settings.smtp_configured else "file preview")
-        + _health_row("YouTube transcription", settings.youtube_transcriber != "stub",
-                      settings.youtube_transcriber)
     )
 
-    def tile(label, val, foot, ic):
+    def tile(label, val, foot, ic, count=True):
+        v = (f'<div class="val" data-count="{val}">0</div>' if count and str(val).isdigit()
+             else f'<div class="val">{val}</div>')
         return (f'<div class="tile"><div class="ic">{ic}</div><div class="label">{label}</div>'
-                f'<div class="val">{val}</div><div class="foot">{foot}</div></div>')
+                f'{v}<div class="foot">{foot}</div></div>')
 
     body = f"""
-    <div class="tiles">
+    <div class="tiles stagger">
       {tile("Total detections", total, "all time", "◎")}
       {tile("Today", today, "since 00:00 PKT", "↑")}
-      {tile("Active keywords", active_kw, f'{np_kw} <a class="count-link" href="/newspapers">news</a> · {yt_kw} <a class="count-link" href="/youtube">YT</a>', "#")}
-      {tile("Sources", n_papers + n_channels, f'{n_papers} papers · {n_channels} channel{"" if n_channels == 1 else "s"}', "◧")}
-      {tile("Last scan", last_txt, '<a class="count-link" href="/mentions">view →</a>', "▶")}
+      {tile("Active keywords", active_kw, '<a class="count-link" href="/newspapers">manage →</a>', "#")}
+      {tile("Coverage", n_papers + n_epapers, f'{n_papers} websites · {n_epapers} e-papers', "◧")}
+      {tile("E-paper pages today", ep_pages_today, '<a class="count-link" href="/epaper">browse →</a>', "🗞")}
     </div>
 
     <div class="cols">
       <div>
         <div class="panel">
-          <h3>Detections — last 7 days</h3><div class="cap">Newspaper + YouTube hits per day (PKT)</div>
+          <h3>Detections — last 7 days</h3><div class="cap">Website + print hits per day (PKT)</div>
           {_bars(days)}
         </div>
         <div class="panel">
-          <h3>Recent activity</h3><div class="cap">Latest matches across all sources</div>
+          <h3>Recent activity</h3><div class="cap">Latest matches across all sources · last scan: {last_txt}</div>
           <div class="rlist">{recent_html}</div>
         </div>
       </div>
@@ -585,13 +713,14 @@ def dashboard(db: Session = Depends(get_db)):
     return _shell("Media Monitor — Overview", "overview", body)
 
 
-# --------------------------------------------------------------------------
-# Module pages (Newspapers / YouTube) — each has its OWN keyword search
-# --------------------------------------------------------------------------
-def _kw_counts(db, module: str) -> dict:
-    rows = db.execute(
-        select(Mention.matched_keywords).where(Mention.module == module).limit(3000)
-    ).scalars().all()
+# ==========================================================================
+# Newspapers — sources + the keyword manager
+# ==========================================================================
+_LANG_NAMES = {"en": "English", "ur": "Urdu"}
+
+
+def _kw_counts(db) -> dict:
+    rows = db.execute(select(Mention.matched_keywords).limit(4000)).scalars().all()
     c: dict[str, int] = {}
     for mk in rows:
         for k in (mk or []):
@@ -599,7 +728,43 @@ def _kw_counts(db, module: str) -> dict:
     return c
 
 
-def _keyword_table(keywords, page_path: str, src: str, counts: dict, scanning: bool, edit) -> str:
+def _last_runs(db) -> dict:
+    """Most recent ScrapeRun per source slug."""
+    runs = db.execute(
+        select(ScrapeRun).order_by(ScrapeRun.started_at.desc()).limit(80)
+    ).scalars().all()
+    out: dict[str, ScrapeRun] = {}
+    for r in runs:
+        out.setdefault(r.source, r)
+    return out
+
+
+def _paper_cards(db) -> str:
+    last = _last_runs(db)
+    metas = [("dawn", "Dawn", "en", ["front page", "world"])] + [
+        (c.name, c.source, c.language, list(c.sections)) for c in SITE_CONFIGS
+    ]
+    cards = ""
+    for slug, name, lang, secs in metas:
+        run = last.get(slug)
+        if run:
+            ok = run.status == "ok"
+            stat = (f'<span class="badge {"ok" if ok else "warn"}">'
+                    f'{"✓" if ok else "⚠"} {run.status}</span>'
+                    f'<span>{run.articles_found} links · {_rel(run.started_at)}</span>')
+        else:
+            stat = '<span class="badge off">no scans yet</span><span></span>'
+        cards += (
+            f'<div class="paper"><h4>{html.escape(name)} '
+            f'<span class="tag">{_LANG_NAMES.get(lang, lang)}</span></h4>'
+            f'<div class="mono">{slug}</div>'
+            f'<div class="secs">{ " · ".join(html.escape(s) for s in secs) }</div>'
+            f'<div class="stat">{stat}</div></div>'
+        )
+    return f'<div class="papers stagger">{cards}</div>'
+
+
+def _keyword_table(keywords, counts: dict, scanning: bool, edit) -> str:
     if not keywords:
         return '<div class="empty">No keywords yet — add your first one above.</div>'
     rows = ""
@@ -614,16 +779,16 @@ def _keyword_table(keywords, page_path: str, src: str, counts: dict, scanning: b
                 f'<select name="language"><option value="en" {en}>English</option>'
                 f'<option value="ur" {ur}>Urdu</option></select>'
                 f'<button type="submit">Save</button>'
-                f'<a href="{page_path}" style="align-self:center;color:var(--muted);font-weight:600;text-decoration:none">Cancel</a>'
+                f'<a href="/newspapers" style="align-self:center;color:var(--muted);font-weight:600;text-decoration:none">Cancel</a>'
                 f"</form></td></tr>"
             )
             continue
         n = counts.get(k.text, 0)
-        kwlink = f"/mentions?keyword={k.text}&src={src}"
+        kwlink = f"/mentions?keyword={k.text}"
         results = (f'<a class="count-link" href="{kwlink}">{n} result(s) →</a>'
                    if n else '<span class="muted-count">0 results</span>')
-        status = ('<button class="ghost" title="Click to pause — paused keywords are skipped by scans">🟢 Active</button>'
-                  if k.active else '<button title="Click to activate">⏸ Paused</button>')
+        status = ('<button class="ghost sm" title="Click to pause — paused keywords are skipped">🟢 Active</button>'
+                  if k.active else '<button class="sm" title="Click to activate">⏸ Paused</button>')
         dim = "" if k.active else ' style="opacity:.55"'
         scan_disabled = "disabled" if (scanning or not k.active) else ""
         rows += (
@@ -633,255 +798,154 @@ def _keyword_table(keywords, page_path: str, src: str, counts: dict, scanning: b
             f'<td><form method="post" action="/ui/keywords/{k.id}/toggle" style="margin:0">{status}</form></td>'
             f"<td>{results}</td>"
             f'<td class="row" style="justify-content:flex-end">'
-            f'<a class="btn ghost" href="{page_path}?edit={k.id}">Edit</a>'
+            f'<a class="btn ghost sm" href="/newspapers?edit={k.id}">Edit</a>'
             f'<form method="post" action="/ui/keywords/{k.id}/scan" style="margin:0">'
-            f'<button {scan_disabled} title="Scan this keyword now">▶ Scan</button></form>'
-            f'<form method="post" action="/ui/keywords/{k.id}/delete" style="margin:0">'
-            f'<button class="ghost">Delete</button></form></td></tr>'
+            f'<button class="sm" {scan_disabled} title="Scan this keyword now">▶ Scan</button></form>'
+            f'<form method="post" action="/ui/keywords/{k.id}/delete" style="margin:0" '
+            f"onsubmit=\"return confirm('Delete keyword “{html.escape(k.text)}”?')\">"
+            f'<button class="ghost sm">Delete</button></form></td></tr>'
         )
-    return ('<table class="klist"><tr><th>Keyword</th><th>Lang</th><th>Status</th>'
+    return ('<table><tr><th>Keyword</th><th>Lang</th><th>Status</th>'
             "<th>Detections</th><th></th></tr>" + rows + "</table>")
 
 
 @app.get("/newspapers", response_class=HTMLResponse)
 def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
-    keywords = db.execute(
-        select(Keyword).where(Keyword.module == "newspaper").order_by(Keyword.created_at.desc())
-    ).scalars().all()
-    counts = _kw_counts(db, "newspaper")
+    keywords = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
+    counts = _kw_counts(db)
     scanning = scan_manager.is_running()
-    table = _keyword_table(keywords, "/newspapers", "newspaper", counts, scanning, edit)
+    table = _keyword_table(keywords, counts, scanning, edit)
     scan_all = (
         '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
-        if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all newspaper keywords</button>'
+        if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all keywords now</button>'
     )
-    n_sites = len(SITE_CONFIGS) + 1
     body = f"""
-    <p class="sub">Keywords watched across <b>{n_sites} newspapers</b> (Dawn, The News,
-    Tribune, Jang, Nawa-i-Waqt, ARY, Dunya, Express Urdu). These keywords are searched
-    <b>only in newspapers</b>. <a href="/mentions?src=newspaper">View newspaper detections →</a></p>
+    <div class="sechead">Publications <span>({len(SITE_CONFIGS) + 1} websites · scanned every
+      {settings.newspaper_scrape_interval_minutes} min when scheduling is on)</span></div>
+    {_paper_cards(db)}
 
+    <div class="sechead">Keywords <span>(matched on websites and e-paper pages alike)</span></div>
     <div class="card">
       <form method="post" action="/ui/keywords" class="row" style="margin-bottom:.9rem">
-        <input type="hidden" name="module" value="newspaper">
-        <input name="text" placeholder="Add a newspaper keyword, e.g. Imran Khan" required
+        <input name="text" placeholder="Add a keyword — English or اردو" required
                style="flex:1;min-width:220px">
         <select name="language"><option value="en">English</option><option value="ur">Urdu</option></select>
         <button type="submit">+ Add keyword</button>
       </form>
       <form method="post" action="/ui/scan/newspaper" style="margin:0">{scan_all}</form>
+      <div class="hint">Matching is precise: whole words only (no “rape” → “grape”),
+      light inflection for English (protest → protests/protesting), Urdu script &amp;
+      diacritic variants unified, and fuzziness scaled to keyword length.</div>
     </div>
     <div class="card">{table}</div>
     """
     return _shell("Media Monitor — Newspapers", "newspapers", body)
 
 
-@app.post("/ui/keywords")
-def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
-                   module: str = Form("newspaper"), db: Session = Depends(get_db)):
-    text = text.strip()
-    module = module if module in ("newspaper", "youtube") else "newspaper"
-    if text:
-        exists = db.execute(
-            select(Keyword).where(Keyword.text == text, Keyword.language == language,
-                                  Keyword.module == module)
-        ).first()
-        if not exists:
-            db.add(Keyword(text=text, language=language, module=module, active=True))
-            db.commit()
-    return RedirectResponse(f"/{'youtube' if module == 'youtube' else 'newspapers'}", status_code=303)
+# ==========================================================================
+# E-paper — daily print editions
+# ==========================================================================
+@app.get("/epaper", response_class=HTMLResponse)
+def epaper_page(date: str | None = None, db: Session = Depends(get_db)):
+    today = datetime.now(_PKT).date()
+    try:
+        show_date = datetime.strptime(date, "%Y-%m-%d").date() if date else today
+    except ValueError:
+        show_date = today
+    ds = show_date.isoformat()
 
-
-@app.post("/ui/keywords/{kid}/edit")
-def ui_edit_keyword(kid: int, text: str = Form(...), language: str = Form("en"),
-                    db: Session = Depends(get_db)):
-    kw = db.get(Keyword, kid)
-    if kw and text.strip():
-        kw.text = text.strip()
-        kw.language = language if language in ("en", "ur") else kw.language
-        db.commit()
-    return RedirectResponse(_kw_page(kw), status_code=303)
-
-
-@app.post("/ui/keywords/{kid}/toggle")
-def ui_toggle_keyword(kid: int, db: Session = Depends(get_db)):
-    kw = db.get(Keyword, kid)
-    dest = _kw_page(kw)
-    if kw:
-        kw.active = not kw.active
-        db.commit()
-    return RedirectResponse(dest, status_code=303)
-
-
-@app.post("/ui/keywords/{kid}/delete")
-def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
-    kw = db.get(Keyword, kid)
-    dest = _kw_page(kw)
-    if kw:
-        db.delete(kw)
-        db.commit()
-    return RedirectResponse(dest, status_code=303)
-
-
-@app.post("/ui/keywords/{kid}/scan")
-def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
-    kw = db.get(Keyword, kid)
-    if not kw:
-        raise HTTPException(404, "keyword not found")
-    # Route to the matching module's scanner so a YouTube keyword only scans
-    # YouTube, and a newspaper keyword only scans newspapers.
-    if kw.module == "youtube":
-        scan_runner.start_scan(keyword_ids=[kid], label=kw.text)
-    else:
-        scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
-    return RedirectResponse(f"/mentions?keyword={kw.text}&src={kw.module}", status_code=303)
-
-
-def _kw_page(kw) -> str:
-    return "/youtube" if (kw and kw.module == "youtube") else "/newspapers"
-
-
-@app.post("/ui/scan")
-def ui_scan_all():
-    # Topbar "Scan all" — refresh both modules (separate subprocesses).
-    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
-    scan_runner.start_scan()
-    return RedirectResponse("/", status_code=303)
-
-
-@app.post("/ui/scan/newspaper")
-def ui_scan_newspapers():
-    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
-    return RedirectResponse("/newspapers", status_code=303)
-
-
-@app.post("/ui/scan/youtube")
-def ui_scan_youtube_kw():
-    scan_runner.start_scan()
-    return RedirectResponse("/youtube", status_code=303)
-
-
-# --------------------------------------------------------------------------
-# YouTube page — channels + YouTube-scoped keyword search
-# --------------------------------------------------------------------------
-@app.get("/youtube", response_class=HTMLResponse)
-def youtube_page(error: str | None = None, edit: int | None = None, db: Session = Depends(get_db)):
-    channels = db.execute(
-        select(YouTubeChannel).order_by(YouTubeChannel.created_at.desc())
+    rows = db.execute(
+        select(EPaperPage).where(EPaperPage.date == ds)
+        .order_by(EPaperPage.paper, EPaperPage.page_no)
     ).scalars().all()
-    if channels:
-        crows = "".join(
-            f"<tr><td><b>{html.escape(c.name or c.channel_id)}</b><br>"
-            f'<span style="color:var(--faint);font-size:.78rem">{c.channel_id}</span></td>'
-            f"<td>{'🟢 active' if c.active else '⚪ off'}</td>"
-            f'<td class="row" style="justify-content:flex-end">'
-            f'<form method="post" action="/ui/channels/{c.id}/scan" style="margin:0">'
-            f'<button title="Scan this channel now">▶ Scan</button></form>'
-            f'<form method="post" action="/ui/channels/{c.id}/delete" style="margin:0">'
-            f'<button class="ghost">Delete</button></form></td></tr>'
-            for c in channels
+    by_paper: dict[str, list[EPaperPage]] = defaultdict(list)
+    for r in rows:
+        by_paper[r.paper].append(r)
+
+    running = scan_runner.is_running()
+    key_ok = reader.has_key()
+
+    cards = ""
+    for slug, (name, lang, _fn) in sources.SOURCES.items():
+        pages = by_paper.get(slug, [])
+        n_done = sum(1 for p in pages if p.ocr_status == "done")
+        n_wait = sum(1 for p in pages if p.ocr_status in ("pending", "no_key"))
+        if pages:
+            state = f'<span class="badge ok">{len(pages)} pages</span>'
+            if n_done:
+                state += f'<span class="badge ok">✓ {n_done} read</span>'
+            if n_wait:
+                state += (f'<span class="badge warn">⏳ {n_wait} awaiting '
+                          f'{"read" if key_ok else "API key"}</span>')
+        else:
+            state = '<span class="badge off">not fetched yet</span>'
+        strip = ""
+        for p in pages[:14]:
+            thumb = _media_url(p.image_path)
+            if not thumb:
+                continue
+            strip += (f'<a href="{html.escape(p.viewer_url or p.image_url)}" target="_blank" '
+                      f'onclick="return false" style="cursor:zoom-in">'
+                      f'<img class="zoom" loading="lazy" src="{thumb}" data-full="{thumb}">'
+                      f'<span class="pn">p{p.page_no}</span></a>')
+        strip = (f'<div class="pgstrip">{strip}</div>' if strip else
+                 '<div class="empty" style="padding:1.2rem">No pages stored for this date.</div>')
+        fetch_btn = ('<button class="sm" disabled><span class="spin"></span></button>' if running else
+                     f'<form method="post" action="/ui/epaper/fetch/{slug}" style="margin:0">'
+                     f'<button class="ghost sm" title="Fetch this paper now">⟳ Fetch</button></form>')
+        cards += (
+            f'<div class="edcard"><div class="edhead">'
+            f'<h4>🗞 {html.escape(name)}</h4><span class="tag">{_LANG_NAMES.get(lang, lang)}</span>'
+            f'<span class="grow"></span>{state}{fetch_btn}</div>{strip}</div>'
         )
-        ctable = f"<table><tr><th>Channel</th><th>Status</th><th></th></tr>{crows}</table>"
-    else:
-        ctable = '<div class="empty">No channels yet. Add one above to start monitoring YouTube.</div>'
 
-    keywords = db.execute(
-        select(Keyword).where(Keyword.module == "youtube").order_by(Keyword.created_at.desc())
-    ).scalars().all()
-    counts = _kw_counts(db, "youtube")
-    scanning = scan_runner.is_running()
-    ktable = _keyword_table(keywords, "/youtube", "youtube", counts, scanning, edit)
-    scan_all = (
-        '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
-        if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all YouTube keywords</button>'
+    unsupported = " · ".join(html.escape(v) for v in sources.UNSUPPORTED.values())
+    key_banner = "" if key_ok else (
+        '<div class="banner">⚠ Reading pages needs <b>ANTHROPIC_API_KEY</b> in your .env — '
+        "page scans are still fetched and browsable, but keyword matching inside them "
+        "starts once the key is set (already-fetched pages are read automatically on the next scan).</div>"
     )
-    banner = f'<div class="banner">⚠ {html.escape(error)}</div>' if error else ""
-    trans = settings.youtube_transcriber
-    note = ("Matching runs on video <b>title + description</b> (stub mode). Set "
-            "YOUTUBE_TRANSCRIBER=openai or local to also search inside audio."
-            if trans == "stub" else "Audio is transcribed for in-video keyword detection.")
+    fetch_all = (
+        '<button class="btn-lg" disabled><span class="spin"></span>Working…</button>' if running
+        else '<button class="btn-lg cta" type="submit">⟳ Fetch today’s editions</button>'
+    )
+
+    day_chips = ""
+    for i in range(0, 7):
+        d = today - timedelta(days=i)
+        lbl = "Today" if i == 0 else d.strftime("%d %b")
+        on = "on" if d == show_date else ""
+        day_chips += f'<a class="chip {on}" href="/epaper?date={d.isoformat()}">{lbl}</a>'
 
     body = f"""
-    {banner}
-    <p class="sub">Monitor YouTube channels for keywords searched <b>only in YouTube</b>.
-    {note} <a href="/mentions?src=youtube">View YouTube detections →</a></p>
-
-    <div class="sechead">▶ Channels</div>
-    <div class="card">
-      <form method="post" action="/ui/channels" class="row" style="margin-bottom:.9rem">
-        <input name="channel" placeholder="https://youtube.com/@GeoNews  or  UC…" required style="flex:1;min-width:240px">
-        <button type="submit">+ Add channel</button>
-      </form>
-      {ctable}
+    {key_banner}
+    <div class="card" style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap">
+      <form method="post" action="/ui/epaper/fetch" style="margin:0">{fetch_all}</form>
+      <span style="color:var(--muted);font-size:.88rem">Editions publish by early morning;
+      the scheduler fetches daily at {settings.epaper_fetch_hour_pkt:02d}:15 PKT.
+      Every page is read once, then all keywords match against it — including ones you add later.</span>
     </div>
-
-    <div class="sechead"># YouTube keywords</div>
-    <div class="card">
-      <form method="post" action="/ui/keywords" class="row" style="margin-bottom:.9rem">
-        <input type="hidden" name="module" value="youtube">
-        <input name="text" placeholder="Add a YouTube keyword, e.g. Imran Khan" required style="flex:1;min-width:220px">
-        <select name="language"><option value="en">English</option><option value="ur">Urdu</option></select>
-        <button type="submit">+ Add keyword</button>
-      </form>
-      <form method="post" action="/ui/scan/youtube" style="margin:0">{scan_all}</form>
-    </div>
-    <div class="card">{ktable}</div>
+    <div style="margin:.2rem 0 1rem">{day_chips}</div>
+    {cards}
+    <p class="sub" style="font-size:.83rem">Not available: {unsupported}.</p>
     """
-    return _shell("Media Monitor — YouTube", "youtube", body)
+    return _shell("Media Monitor — E-Paper", "epaper", body)
 
 
-@app.post("/ui/channels")
-def ui_add_channel(channel: str = Form(...), db: Session = Depends(get_db)):
-    channel_id, name = rss.resolve_channel_id(channel)
-    if not channel_id:
-        return RedirectResponse(
-            "/youtube?error=Could not resolve that channel. Paste the full channel URL or its UC… id.",
-            status_code=303,
-        )
-    if not db.execute(select(YouTubeChannel).where(YouTubeChannel.channel_id == channel_id)).first():
-        db.add(YouTubeChannel(channel_id=channel_id, name=name, url=channel, active=True))
-        db.commit()
-    return RedirectResponse("/youtube", status_code=303)
-
-
-@app.post("/ui/channels/{cid}/delete")
-def ui_delete_channel(cid: int, db: Session = Depends(get_db)):
-    ch = db.get(YouTubeChannel, cid)
-    if ch:
-        db.delete(ch)
-        db.commit()
-    return RedirectResponse("/youtube", status_code=303)
-
-
-@app.post("/ui/channels/{cid}/scan")
-def ui_scan_channel(cid: int, db: Session = Depends(get_db)):
-    ch = db.get(YouTubeChannel, cid)
-    if not ch:
-        raise HTTPException(404, "channel not found")
-    scan_runner.start_scan(channel_ids=[cid], label=ch.name or ch.channel_id)
-    return RedirectResponse("/mentions?src=youtube", status_code=303)
-
-
-@app.post("/ui/youtube/scan")
-def ui_scan_youtube_all():
-    scan_runner.start_scan()
-    return RedirectResponse("/mentions", status_code=303)
-
-
-# --------------------------------------------------------------------------
-# Detections page (filterable by keyword)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Detections
+# ==========================================================================
 @app.get("/mentions", response_class=HTMLResponse)
-def detections_page(keyword: str | None = None, src: str | None = None, db: Session = Depends(get_db)):
+def detections_page(keyword: str | None = None, src: str | None = None,
+                    db: Session = Depends(get_db)):
     mentions = (
         db.execute(select(Mention).order_by(Mention.detected_at.desc()).limit(500))
-        .scalars()
-        .all()
+        .scalars().all()
     )
     if keyword:
         mentions = [m for m in mentions if keyword in (m.matched_keywords or [])]
-    papers = [m for m in mentions if m.module != "youtube"]
-    videos = [m for m in mentions if m.module == "youtube"]
+    papers = [m for m in mentions if m.module == "newspaper"]
+    prints = [m for m in mentions if m.module == "epaper"]
 
     active_keywords = db.execute(
         select(Keyword).where(Keyword.active.is_(True)).order_by(Keyword.text)
@@ -898,44 +962,39 @@ def detections_page(keyword: str | None = None, src: str | None = None, db: Sess
     def chip(label, active, link):
         return f'<a class="chip {"on" if active else ""}" href="{link}">{label}</a>'
 
-    # Source filter (newspaper vs youtube)
     src_chips = (
         chip("All sources", src is None, href(keyword, None))
-        + chip("📰 Newspapers", src == "newspaper", href(keyword, "newspaper"))
-        + chip("▶ YouTube", src == "youtube", href(keyword, "youtube"))
+        + chip("📰 Websites", src == "newspaper", href(keyword, "newspaper"))
+        + chip("🗞 E-Paper", src == "epaper", href(keyword, "epaper"))
     )
-    # Keyword filter (preserves the source filter)
     kw_chips = chip("All keywords", keyword is None, href(None, src)) + "".join(
         chip(html.escape(k.text), keyword == k.text, href(k.text, src)) for k in active_keywords
     )
 
     def section(title, items):
-        grid = (
-            f'<div class="grid">{"".join(_detection_card(m) for m in items)}</div>'
-            if items
-            else '<div class="empty">Nothing here yet.</div>'
-        )
+        grid = (f'<div class="grid stagger">{"".join(_detection_card(m) for m in items)}</div>'
+                if items else '<div class="empty">Nothing here yet.</div>')
         return f'<div class="sechead">{title} <span>({len(items)})</span></div>{grid}'
 
     if src == "newspaper":
-        content = section("📰 Newspapers", papers)
-    elif src == "youtube":
-        content = section("▶ YouTube", videos)
-    elif not papers and not videos:
-        content = '<div class="empty">No detections yet.<br>Run a scan from the Keywords page.</div>'
+        content = section("📰 Website articles", papers)
+    elif src == "epaper":
+        content = section("🗞 Print edition pages", prints)
+    elif not papers and not prints:
+        content = ('<div class="empty">No detections yet.<br>'
+                   'Add keywords on the <a class="plink" href="/newspapers">Newspapers</a> page '
+                   "and run a scan.</div>")
     else:
-        content = section("📰 Newspapers", papers) + section("▶ YouTube", videos)
+        content = section("📰 Website articles", papers) + section("🗞 Print edition pages", prints)
 
     clear_btn = (
         '<form method="post" action="/ui/detections/clear" style="margin:0" '
         "onsubmit=\"return confirm('Delete ALL detections? This cannot be undone.')\">"
-        '<button class="ghost">🗑 Clear all detections</button></form>'
+        '<button class="ghost">🗑 Clear all</button></form>'
     )
-
     body = f"""
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:.2rem">
-      <p class="sub" style="margin:0">{len(mentions)} detection(s){' for “'+html.escape(keyword)+'”' if keyword else ''} —
-      newspapers and YouTube shown separately below.</p>
+      <p class="sub" style="margin:0">{len(mentions)} detection(s){' for “' + html.escape(keyword) + '”' if keyword else ''}</p>
       {clear_btn}
     </div>
     <div style="margin:.8rem 0 .3rem">{src_chips}</div>
@@ -945,33 +1004,108 @@ def detections_page(keyword: str | None = None, src: str | None = None, db: Sess
     return _shell("Media Monitor — Detections", "mentions", body)
 
 
+# ==========================================================================
+# UI actions
+# ==========================================================================
+@app.post("/ui/keywords")
+def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
+                   db: Session = Depends(get_db)):
+    text = text.strip()
+    if text:
+        exists = db.execute(
+            select(Keyword).where(Keyword.text == text, Keyword.language == language)
+        ).first()
+        if not exists:
+            db.add(Keyword(text=text, language=language, module="newspaper", active=True))
+            db.commit()
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/keywords/{kid}/edit")
+def ui_edit_keyword(kid: int, text: str = Form(...), language: str = Form("en"),
+                    db: Session = Depends(get_db)):
+    kw = db.get(Keyword, kid)
+    if kw and text.strip():
+        kw.text = text.strip()
+        kw.language = language if language in ("en", "ur") else kw.language
+        db.commit()
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/keywords/{kid}/toggle")
+def ui_toggle_keyword(kid: int, db: Session = Depends(get_db)):
+    kw = db.get(Keyword, kid)
+    if kw:
+        kw.active = not kw.active
+        db.commit()
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/keywords/{kid}/delete")
+def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
+    kw = db.get(Keyword, kid)
+    if kw:
+        db.delete(kw)
+        db.commit()
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/keywords/{kid}/scan")
+def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
+    kw = db.get(Keyword, kid)
+    if not kw:
+        raise HTTPException(404, "keyword not found")
+    # Websites now; e-paper re-match runs against already-read pages (no fetch).
+    scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
+    return RedirectResponse(f"/mentions?keyword={kw.text}", status_code=303)
+
+
+@app.post("/ui/scan")
+def ui_scan_all():
+    # Nav "Scan all": websites + today's e-paper cycle (subprocesses; one each).
+    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
+    scan_runner.start_scan()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/ui/scan/newspaper")
+def ui_scan_newspapers():
+    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
+    return RedirectResponse("/newspapers", status_code=303)
+
+
+@app.post("/ui/epaper/fetch")
+def ui_epaper_fetch_all():
+    scan_runner.start_scan()
+    return RedirectResponse("/epaper", status_code=303)
+
+
+@app.post("/ui/epaper/fetch/{slug}")
+def ui_epaper_fetch_one(slug: str):
+    if slug not in sources.SOURCES:
+        raise HTTPException(404, "unknown paper")
+    name = sources.SOURCES[slug][0]
+    scan_runner.start_scan(papers=[slug], label=name)
+    return RedirectResponse("/epaper", status_code=303)
+
+
 @app.post("/ui/detections/clear")
 def ui_clear_detections(db: Session = Depends(get_db)):
-    """Delete all detections (Mention rows). Cached article text is kept so a
-    re-scan can re-detect; screenshots on disk are pruned by the retention job."""
+    """Delete all detections (Mention rows). Cached article text and e-paper
+    reads are kept, so a re-scan can re-detect instantly."""
     db.execute(delete(Mention))
     db.commit()
     return RedirectResponse("/mentions", status_code=303)
 
 
-def _media_url(abs_path: str | None) -> str | None:
-    if not abs_path:
-        return None
-    try:
-        rel = Path(abs_path).resolve().relative_to(settings.storage_dir.resolve())
-        return "/media/" + str(rel).replace("\\", "/")
-    except Exception:
-        return None
-
-
-# --------------------------------------------------------------------------
+# ==========================================================================
 # JSON API
-# --------------------------------------------------------------------------
+# ==========================================================================
 @app.get("/api/keywords")
 def list_keywords(db: Session = Depends(get_db)):
     rows = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
-    return [{"id": k.id, "text": k.text, "language": k.language, "module": k.module,
-             "active": k.active} for k in rows]
+    return [{"id": k.id, "text": k.text, "language": k.language, "active": k.active}
+            for k in rows]
 
 
 @app.get("/api/mentions")
@@ -981,20 +1115,25 @@ def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = De
         rows = [m for m in rows if keyword in (m.matched_keywords or [])]
     return [
         {
-            "id": m.id, "source": m.source, "title": m.title, "url": m.url,
-            "matched_keywords": m.matched_keywords, "sentiment": m.sentiment,
+            "id": m.id, "module": m.module, "source": m.source, "title": m.title,
+            "url": m.url, "matched_keywords": m.matched_keywords, "sentiment": m.sentiment,
             "detected_at": m.detected_at.isoformat() if m.detected_at else None,
         }
         for m in rows
     ]
 
 
-@app.get("/api/channels")
-def list_channels(db: Session = Depends(get_db)):
-    rows = db.execute(select(YouTubeChannel).order_by(YouTubeChannel.created_at.desc())).scalars().all()
+@app.get("/api/epaper/pages")
+def list_epaper_pages(date: str | None = None, db: Session = Depends(get_db)):
+    ds = date or datetime.now(_PKT).date().isoformat()
+    rows = db.execute(
+        select(EPaperPage).where(EPaperPage.date == ds)
+        .order_by(EPaperPage.paper, EPaperPage.page_no)
+    ).scalars().all()
     return [
-        {"id": c.id, "channel_id": c.channel_id, "name": c.name, "active": c.active}
-        for c in rows
+        {"paper": r.paper, "source": r.source, "city": r.city, "date": r.date,
+         "page": r.page_no, "ocr_status": r.ocr_status, "viewer_url": r.viewer_url}
+        for r in rows
     ]
 
 
@@ -1003,15 +1142,14 @@ def scan_status():
     return scan_manager.status()
 
 
-@app.get("/api/scan/youtube/status")
-def youtube_scan_status():
+@app.get("/api/scan/epaper/status")
+def epaper_scan_status():
     return scan_runner.status()
 
 
-@app.post("/api/scan/youtube")
-def trigger_youtube_scan():
-    started = scan_runner.start_scan()
-    return {"started": started}
+@app.post("/api/scan/epaper")
+def trigger_epaper_scan():
+    return {"started": scan_runner.start_scan()}
 
 
 @app.post("/api/scan/newspaper")

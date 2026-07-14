@@ -13,27 +13,28 @@
 -- want defense-in-depth, enable RLS and add a service-role-only policy.
 -- ==========================================================================
 
--- Keywords — each scoped to a module ('newspaper' | 'youtube').
+-- Keywords. `module` is kept for schema compat and is always 'newspaper' now;
+-- every keyword is matched on BOTH newspaper websites and e-paper pages.
 create table if not exists keywords (
     id          bigint generated always as identity primary key,
     text        varchar(255) not null,
     language    varchar(8)  not null default 'en',       -- 'en' | 'ur'
-    module      varchar(16) not null default 'newspaper', -- 'newspaper' | 'youtube'
+    module      varchar(16) not null default 'newspaper',
     active      boolean     not null default true,
     created_at  timestamptz not null default now(),
     constraint uq_keyword_text_lang_module unique (text, language, module)
 );
 create index if not exists ix_keywords_module_active on keywords (module, active);
 
--- Mentions — the shared detections table (newspaper + youtube).
+-- Mentions — the shared detections table (website articles + e-paper pages).
 create table if not exists mentions (
     id                   bigint generated always as identity primary key,
-    module               varchar(16)  not null,          -- 'newspaper' | 'youtube'
-    external_id          varchar(512) not null,          -- article url / video id (dedup)
-    source               varchar(128) not null,          -- 'Dawn', 'Geo News', ...
+    module               varchar(16)  not null,          -- 'newspaper' | 'epaper'
+    external_id          varchar(512) not null,          -- article url / paper:city:date:pN
+    source               varchar(128) not null,          -- 'Dawn', 'Jang', ...
     section              varchar(128),
     title                text not null,
-    url                  text not null,                  -- article url or youtube deep-link
+    url                  text not null,
     matched_keywords     jsonb not null default '[]'::jsonb,
     snippet              text,
     summary              text,
@@ -41,7 +42,7 @@ create table if not exists mentions (
     sentiment            varchar(16),                    -- Positive/Critical/Neutral
     screenshot_path      text,
     full_screenshot_path text,
-    deeplink_seconds     integer,                        -- youtube: exact second
+    deeplink_seconds     integer,                        -- legacy (unused)
     published_at         timestamptz,
     detected_at          timestamptz not null default now(),
     notified             boolean not null default false,
@@ -68,35 +69,32 @@ create table if not exists article_cache (
 );
 create index if not exists ix_cache_fetched_at on article_cache (fetched_at);
 
--- YouTube channels being monitored.
-create table if not exists youtube_channels (
+-- E-paper pages — one row per page of a paper's daily print edition. The page
+-- scan is an image; `ocr_text` holds its Claude-vision reading (done once),
+-- and keyword matching runs on that text.
+create table if not exists epaper_pages (
     id          bigint generated always as identity primary key,
-    channel_id  varchar(64) not null,                   -- UC...
-    name        varchar(255) not null default '',
-    url         text not null default '',
-    active      boolean not null default true,
-    created_at  timestamptz not null default now(),
-    constraint uq_youtube_channel_id unique (channel_id)
+    paper       varchar(32)  not null,                  -- slug: 'jang', 'dawn', ...
+    source      varchar(128) not null,                  -- display: 'Jang', 'Dawn'
+    city        varchar(32)  not null default 'lahore',
+    date        varchar(10)  not null,                  -- 'YYYY-MM-DD'
+    page_no     integer      not null,
+    image_url   text         not null,
+    image_path  text,
+    viewer_url  text         not null default '',
+    ocr_text    text         not null default '',
+    ocr_status  varchar(16)  not null default 'pending', -- pending|done|failed|no_key
+    fetched_at  timestamptz  not null default now(),
+    constraint uq_epaper_page unique (paper, city, date, page_no)
 );
+create index if not exists ix_epaper_date on epaper_pages (date);
 
--- Transcripts — full YouTube transcript with word/segment timestamps.
-create table if not exists transcripts (
-    id               bigint generated always as identity primary key,
-    video_id         varchar(32) not null,
-    channel_id       varchar(64),
-    source           varchar(255) not null default '',  -- channel name
-    title            text not null default '',
-    url              text not null default '',
-    language         varchar(8),
-    text             text not null default '',
-    segments         jsonb not null default '[]'::jsonb, -- [{start: <sec>, text: <word|phrase>}]
-    duration_seconds integer,
-    transcriber      varchar(16) not null default 'stub', -- 'stub' | 'openai' | 'local'
-    is_live          boolean not null default false,
-    created_at       timestamptz not null default now(),
-    constraint uq_transcript_video_id unique (video_id)
-);
-create index if not exists ix_transcript_channel on transcripts (channel_id);
+-- Migration from the YouTube-era schema (run once if upgrading):
+--   drop table if exists transcripts;
+--   drop table if exists youtube_channels;
+--   delete from mentions      where module = 'youtube';
+--   delete from article_cache where module = 'youtube';
+--   delete from keywords      where module = 'youtube';
 
 -- Scrape runs — audit trail (uptime + blocked-scrape alerts).
 create table if not exists scrape_runs (
@@ -116,10 +114,9 @@ create index if not exists ix_scrape_started_at on scrape_runs (started_at desc)
 -- Leave commented unless you understand the implications; the app uses the
 -- direct Postgres connection, which bypasses RLS regardless.
 -- ==========================================================================
--- alter table keywords         enable row level security;
--- alter table mentions         enable row level security;
--- alter table article_cache    enable row level security;
--- alter table youtube_channels enable row level security;
--- alter table transcripts      enable row level security;
--- alter table scrape_runs      enable row level security;
+-- alter table keywords      enable row level security;
+-- alter table mentions      enable row level security;
+-- alter table article_cache enable row level security;
+-- alter table epaper_pages  enable row level security;
+-- alter table scrape_runs   enable row level security;
 -- (No policies added => only the service_role / postgres role can read/write.)

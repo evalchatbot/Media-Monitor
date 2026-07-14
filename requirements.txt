@@ -26,16 +26,8 @@ httpx==0.28.1
 # --- Matching ---
 rapidfuzz==3.11.0
 
-# --- LLM scoring (Newspaper relevance/sentiment) ---
+# --- LLM: relevance/sentiment scoring + e-paper page reading (Claude vision) ---
 anthropic==0.42.0
 
-# --- Screenshot footer overlay ---
+# --- Screenshot footer overlay + e-paper image handling ---
 pillow==11.1.0
-
-# --- YouTube module ---
-yt-dlp==2026.7.4           # audio/frame download (needs ffmpeg on PATH). KEEP CURRENT:
-                           # YouTube changes formats often — an old yt-dlp fails with
-                           # "Requested format is not available". Refresh: pip install -U yt-dlp
-# openai==1.59.0           # uncomment for Whisper API transcription path
-faster-whisper==1.1.0      # local transcription (GPU or CPU); pulls large-v3 on first run
-requests==2.32.3           # required by faster-whisper / huggingface_hub
