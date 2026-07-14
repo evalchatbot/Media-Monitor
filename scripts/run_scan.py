@@ -40,9 +40,15 @@ def main() -> None:
     if args.backfill_only:
         summary = backfill_screenshots(limit=40)
     else:
+        shots = 0
+        if keyword_ids:
+            # A per-keyword scan follows an instant Quick Scan — capture those
+            # fresh hits' screenshots FIRST so the results the user is already
+            # looking at get their images within a couple of minutes.
+            shots += backfill_screenshots(limit=15).get("captured", 0)
         summary = run_newspaper_scan(keyword_ids=keyword_ids, uncapped=not args.capped)
-        # Give quick-scan detections their visuals while the browser is warm.
-        summary["screenshots_backfilled"] = backfill_screenshots(limit=25).get("captured", 0)
+        shots += backfill_screenshots(limit=25).get("captured", 0)
+        summary["screenshots_backfilled"] = shots
 
     _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _STATUS_FILE.write_text(

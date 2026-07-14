@@ -27,7 +27,6 @@ def backfill_screenshots(limit: int = 25) -> dict:
     Newest first, so fresh detections get their visuals before old ones."""
     summary = {"missing": 0, "captured": 0}
     session = SessionLocal()
-    by_source: dict = {}
     try:
         rows = session.execute(
             select(Mention)
@@ -39,34 +38,41 @@ def backfill_screenshots(limit: int = 25) -> dict:
             return summary
 
         # Map display source -> scraper (for crop selectors + storage dirs).
+        by_source = {}
         for sc in build_scrapers():
             display = sc.cfg.source if hasattr(sc, "cfg") else "Dawn"
             by_source[display] = sc
 
-        for m in rows[:limit]:
-            sc = by_source.get(m.source)
+        # ONE browser at a time: sync Playwright refuses a second instance in
+        # the same thread, so process mentions grouped by source and close each
+        # source's browser before opening the next.
+        todo = rows[:limit]
+        for source in {m.source for m in todo}:
+            sc = by_source.get(source)
             if sc is None:
                 continue
-            art = Article(source=m.source, title=m.title, url=m.url,
-                          section=m.section, external_id=m.external_id)
             try:
-                full, crop = sc.capture_screenshots(
-                    art, settings.storage_dir / sc.name,
-                    getattr(sc, "ARTICLE_CROP_SELECTOR", None),
-                )
-            except Exception as exc:
-                logger.warning("backfill: screenshot failed for %s: %s", m.url, exc)
-                continue
-            if crop or full:
-                m.screenshot_path = str(crop) if crop else None
-                m.full_screenshot_path = str(full) if full else None
-                session.commit()
-                summary["captured"] += 1
+                for m in (x for x in todo if x.source == source):
+                    art = Article(source=m.source, title=m.title, url=m.url,
+                                  section=m.section, external_id=m.external_id)
+                    try:
+                        full, crop = sc.capture_screenshots(
+                            art, settings.storage_dir / sc.name,
+                            getattr(sc, "ARTICLE_CROP_SELECTOR", None),
+                        )
+                    except Exception as exc:
+                        logger.warning("backfill: screenshot failed for %s: %s", m.url, exc)
+                        continue
+                    if crop or full:
+                        m.screenshot_path = str(crop) if crop else None
+                        m.full_screenshot_path = str(full) if full else None
+                        session.commit()
+                        summary["captured"] += 1
+            finally:
+                try:
+                    sc.close()
+                except Exception:
+                    pass
         return summary
     finally:
-        for sc in by_source.values():
-            try:
-                sc.close()
-            except Exception:
-                pass
         session.close()

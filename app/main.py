@@ -792,7 +792,7 @@ def _keyword_table(keywords, counts: dict, scanning: bool, edit) -> str:
             )
             continue
         n = counts.get(k.text, 0)
-        kwlink = f"/mentions?keyword={k.text}"
+        kwlink = f"/newspapers?kw={k.text}#results"
         results = (f'<a class="count-link" href="{kwlink}">{n} result(s) →</a>'
                    if n else '<span class="muted-count">0 results</span>')
         status = ('<button class="ghost sm" title="Click to pause — paused keywords are skipped">🟢 Active</button>'
@@ -818,7 +818,9 @@ def _keyword_table(keywords, counts: dict, scanning: bool, edit) -> str:
 
 
 @app.get("/newspapers", response_class=HTMLResponse)
-def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
+def newspapers_page(edit: int | None = None, kw: str | None = None,
+                    checked: int | None = None, pages: int | None = None,
+                    db: Session = Depends(get_db)):
     keywords = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
     counts = _kw_counts(db)
     scanning = scan_manager.is_running()
@@ -827,12 +829,43 @@ def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
         '<button class="btn-lg" disabled><span class="spin"></span>Scanning…</button>'
         if scanning else '<button class="btn-lg cta" type="submit">▶ Scan all keywords now</button>'
     )
+
+    # ---- Unified detections (websites + e-papers together), keyword dropdown
+    mentions = db.execute(
+        select(Mention).order_by(Mention.detected_at.desc()).limit(600)
+    ).scalars().all()
+    if kw:
+        mentions = [m for m in mentions if kw in (m.matched_keywords or [])]
+    shown = mentions[:60]
+    opts = f'<option value="">All keywords ({sum(counts.values())} hits)</option>'
+    for k in sorted(keywords, key=lambda x: -counts.get(x.text, 0)):
+        sel = " selected" if kw == k.text else ""
+        opts += (f'<option value="{html.escape(k.text)}"{sel}>'
+                 f"{html.escape(k.text)} ({counts.get(k.text, 0)})</option>")
+    grid = (f'<div class="grid stagger">{"".join(_detection_card(m) for m in shown)}</div>'
+            if shown else
+            '<div class="empty">No detections yet'
+            + (f" for “{html.escape(kw)}” — hit ⚡ Scan on it above." if kw else
+               " — add a keyword and hit ⚡ Scan.") + "</div>")
+    more = (f'<p class="sub" style="margin-top:1rem">Showing {len(shown)} of {len(mentions)} — '
+            f'<a class="plink" href="/mentions{"?keyword=" + kw if kw else ""}">see all in Detections →</a></p>'
+            if len(mentions) > len(shown) else "")
+
+    quick_banner = ""
+    if checked is not None:
+        quick_banner = (
+            f'<div class="banner ok">⚡ Instant results below — checked <b>{checked}</b> stored '
+            f'article(s) and <b>{pages or 0}</b> e-paper page(s). A fresh scan of all live sources '
+            f"is running in the background — new hits and screenshots appear automatically.</div>"
+        )
+
     body = f"""
-    <div class="sechead">Publications <span>({len(SITE_CONFIGS) + 1} websites · scanned every
-      {settings.newspaper_scrape_interval_minutes} min when scheduling is on)</span></div>
+    {quick_banner}
+    <div class="sechead">Publications <span>({len(SITE_CONFIGS) + 1} websites · {len(sources.SOURCES)} e-papers ·
+      scanned every {settings.newspaper_scrape_interval_minutes} min when scheduling is on)</span></div>
     {_paper_cards(db)}
 
-    <div class="sechead">Keywords <span>(matched on websites and e-paper pages alike)</span></div>
+    <div class="sechead">Keywords <span>(one list — matched on websites and e-paper pages alike)</span></div>
     <div class="card">
       <form method="post" action="/ui/keywords" class="row" style="margin-bottom:.9rem">
         <input name="text" placeholder="Add a keyword — English or اردو" required
@@ -841,14 +874,24 @@ def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
         <button type="submit">+ Add keyword</button>
       </form>
       <form method="post" action="/ui/scan/newspaper" style="margin:0">{scan_all}</form>
-      <div class="hint">⚡ <b>Scan</b> on a keyword is instant — it checks every stored
-      article and e-paper page and takes you straight to the results.
-      <b>Scan all keywords now</b> scrapes the sites for fresh content first (takes minutes).
-      Matching is precise: whole words only (no “rape” → “grape”), light inflection for
-      English (protest → protests/protesting), Urdu script &amp; diacritic variants unified,
-      fuzziness scaled to keyword length. Monitoring window: <b>{settings.monitor_since[:4]} onwards</b>.</div>
+      <div class="hint">⚡ <b>Scan</b> on a keyword: instant results from everything stored, then a
+      fresh scan of every website and today's e-papers for exact matches — with a screenshot of each
+      hit (article shot or the print page). Matching is precise: whole words only (no “rape” →
+      “grape”), light inflection for English, Urdu script &amp; diacritic variants unified.
+      Monitoring window: <b>{settings.monitor_since[:4]} onwards</b>.</div>
     </div>
     <div class="card">{table}</div>
+
+    <div class="sechead" id="results">Detections <span>(websites + e-papers together)</span></div>
+    <div class="card" style="margin-bottom:1rem">
+      <form method="get" action="/newspapers" class="row">
+        <label style="font-weight:700">Keyword:</label>
+        <select name="kw" onchange="this.form.submit()" style="min-width:240px">{opts}</select>
+        <noscript><button type="submit">Show</button></noscript>
+      </form>
+    </div>
+    {grid}
+    {more}
     """
     return _shell("Media Monitor — Newspapers", "newspapers", body)
 
@@ -983,21 +1026,20 @@ def detections_page(keyword: str | None = None, src: str | None = None,
         chip(html.escape(k.text), keyword == k.text, href(k.text, src)) for k in active_keywords
     )
 
-    def section(title, items):
-        grid = (f'<div class="grid stagger">{"".join(_detection_card(m) for m in items)}</div>'
-                if items else '<div class="empty">Nothing here yet.</div>')
-        return f'<div class="sechead">{title} <span>({len(items)})</span></div>{grid}'
-
+    # One unified grid — website articles and print pages together, newest
+    # first; each card carries its own 📰/🗞 badge.
     if src == "newspaper":
-        content = section("📰 Website articles", papers)
+        items = papers
     elif src == "epaper":
-        content = section("🗞 Print edition pages", prints)
-    elif not papers and not prints:
+        items = prints
+    else:
+        items = mentions
+    if items:
+        content = f'<div class="grid stagger">{"".join(_detection_card(m) for m in items)}</div>'
+    else:
         content = ('<div class="empty">No detections yet.<br>'
                    'Add keywords on the <a class="plink" href="/newspapers">Newspapers</a> page '
-                   "and run a scan.</div>")
-    else:
-        content = section("📰 Website articles", papers) + section("🗞 Print edition pages", prints)
+                   "and hit ⚡ Scan.</div>")
 
     clear_btn = (
         '<form method="post" action="/ui/detections/clear" style="margin:0" '
@@ -1073,24 +1115,22 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
 
 @app.post("/ui/keywords/{kid}/scan")
 def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
-    """⚡ Quick Scan: instantly match this keyword against everything already
-    stored (every cached article + every read e-paper page) and show results.
-    Runs inline — no browser, no scraping — so the answer is immediate."""
+    """⚡ Scan one keyword, completely:
+    1. INSTANT — match it against everything stored (cached articles + read
+       e-paper pages) and land on the results, inline, no browser.
+    2. FRESH — launch the full source scan in the background: every website is
+       scraped for exact matches (each hit screenshotted, quick hits backfilled
+       first) and today's e-paper editions are fetched/read/matched (each hit
+       carries its page scan). Results merge in automatically when done."""
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
     res = run_quick_match(keyword_ids=[kid])
-    found = sum(
-        1 for mk in db.execute(select(Mention.matched_keywords)).scalars()
-        if kw.text in (mk or [])
-    )
-    if res.get("mentions"):
-        # New hits have no screenshots yet (quick scans don't open a browser) —
-        # capture them in a background subprocess so the cards fill in shortly.
-        scan_manager.start_scan(backfill_only=True, keyword_label=f"images · {kw.text}")
+    scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
+    scan_runner.start_scan(keyword_ids=[kid], label=kw.text)
     return RedirectResponse(
-        f"/mentions?keyword={kw.text}&checked={res['articles_checked']}"
-        f"&pages={res['pages_checked']}&found={found}",
+        f"/newspapers?kw={kw.text}&checked={res['articles_checked']}"
+        f"&pages={res['pages_checked']}#results",
         status_code=303,
     )
 
