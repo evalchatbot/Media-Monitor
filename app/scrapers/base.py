@@ -232,20 +232,27 @@ class BaseScraper:
             # Full-page shot only if explicitly enabled (memory-heavy on long pages).
             full = None
             if settings.capture_full_page_screenshots:
-                page.screenshot(path=str(full_path), full_page=True)
+                page.screenshot(path=str(full_path), full_page=True, animations="disabled")
                 full = full_path
 
             # Cropped article shot (bounded size) — this is what the UI displays.
+            # animations="disabled" + a short timeout matter: sites with infinite
+            # CSS animations (e.g. Jang's tickers) never reach Playwright's
+            # "stable" state, and an element shot would hang its full 30s and
+            # sink the whole capture. If the element still won't settle, fall
+            # through to a plain viewport shot rather than failing.
             cropped = None
             if crop_selector:
                 el = page.query_selector(crop_selector)
                 if el:
-                    el.screenshot(path=str(crop_path))
-                    cropped = crop_path
-            # If nothing captured yet, take a bounded viewport screenshot (never
-            # full_page here — that's the memory hog).
+                    try:
+                        el.screenshot(path=str(crop_path), timeout=8000, animations="disabled")
+                        cropped = crop_path
+                    except Exception as exc:
+                        logger.info("%s: element shot fell back to viewport (%s)",
+                                    self.name, type(exc).__name__)
             if cropped is None and full is None:
-                page.screenshot(path=str(crop_path))
+                page.screenshot(path=str(crop_path), animations="disabled")
                 cropped = crop_path
 
             from app.scrapers.footer import add_footer
