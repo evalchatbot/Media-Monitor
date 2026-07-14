@@ -77,7 +77,12 @@ class Settings(BaseSettings):
     whatsapp_access_token: str = ""
     whatsapp_recipient: str = ""
 
-    # --- LLM scoring (relevance + sentiment via Claude) ---
+    # --- LLM providers ---
+    # Groq (default provider when set): powers e-paper page reading (vision)
+    # and relevance/sentiment scoring. Llama-4 multimodal models.
+    groq_api_key: str = ""
+    groq_model: str = "meta-llama/llama-4-maverick-17b-128e-instruct"
+    # Anthropic (used when no Groq key is set).
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"   # current latest; override via LLM_MODEL
     enable_llm_scoring: bool = False

@@ -40,16 +40,16 @@ python -m tests.test_keywords            # matching precision suite
 
 Each is a paste into `.env`, then restart the app. Nothing else to change.
 
-**Claude API key — unlocks e-paper page reading (and scoring, if enabled)**
+**Vision/LLM key — unlocks e-paper page reading (and scoring, if enabled)**
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+GROQ_API_KEY=gsk_...            # active provider (Llama-4 vision on Groq)
+# or: ANTHROPIC_API_KEY=sk-ant-...   (used when no Groq key; higher fidelity)
 ```
-Without it, e-paper pages are still fetched daily and browsable in the console;
-they sit at `ocr_status='no_key'` and are read automatically on the first scan
-after the key appears. To also score every mention:
+Without a key, e-paper pages are still fetched daily and browsable in the
+console; they sit at `ocr_status='no_key'` and are read automatically on the
+first scan after a key appears. To also score every mention:
 ```
 ENABLE_LLM_SCORING=true
-LLM_MODEL=claude-haiku-4-5      # cheapest; or claude-sonnet-5 for higher quality
 ```
 
 **Email digest (Gmail example)** — enable 2-Step Verification, then create an

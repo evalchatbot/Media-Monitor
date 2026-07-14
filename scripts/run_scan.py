@@ -28,12 +28,21 @@ def main() -> None:
     parser.add_argument("--keyword-ids", default="", help="comma-separated keyword ids")
     parser.add_argument("--label", default="", help="keyword label (for status display)")
     parser.add_argument("--capped", action="store_true", help="bounded fetch (scheduled scans)")
+    parser.add_argument("--backfill-only", action="store_true",
+                        help="skip scanning; only capture missing detection screenshots")
     args = parser.parse_args()
 
     keyword_ids = [int(x) for x in args.keyword_ids.split(",") if x.strip()] or None
 
     init_db()
-    summary = run_newspaper_scan(keyword_ids=keyword_ids, uncapped=not args.capped)
+    from app.newspaper.screenshots import backfill_screenshots
+
+    if args.backfill_only:
+        summary = backfill_screenshots(limit=40)
+    else:
+        summary = run_newspaper_scan(keyword_ids=keyword_ids, uncapped=not args.capped)
+        # Give quick-scan detections their visuals while the browser is warm.
+        summary["screenshots_backfilled"] = backfill_screenshots(limit=25).get("captured", 0)
 
     _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _STATUS_FILE.write_text(

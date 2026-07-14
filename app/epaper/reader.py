@@ -1,21 +1,29 @@
-"""Read a scanned e-paper page into text with Claude vision.
+"""Read a scanned e-paper page into text with a vision LLM.
 
 E-paper pages are images of the printed paper — Urdu ones in Nastaliq script,
-which conventional OCR (tesseract) can't read reliably. Claude's vision reads
-both English and Nastaliq Urdu well, so one call per page yields the text that
+which conventional OCR (tesseract) can't read reliably. A multimodal LLM reads
+both English and Nastaliq Urdu, so one call per page yields the text that
 keyword matching then runs on (with the exact same matcher the website articles
 use). The text is cached on the EPaperPage row, so each page is read ONCE ever;
 re-matching new keywords later costs nothing.
 
-Needs ANTHROPIC_API_KEY. Without it the pipeline marks pages 'no_key' and the
-UI explains what to add — pages are still fetched and browsable.
+Providers (first available key wins):
+  GROQ_API_KEY       — Groq, Llama-4 multimodal (default GROQ_MODEL, with an
+                       automatic fallback to Scout if the model is unavailable)
+  ANTHROPIC_API_KEY  — Claude vision
+
+Without any key the pipeline marks pages 'no_key' and the UI explains what to
+add — pages are still fetched and browsable.
 """
 from __future__ import annotations
 
 import base64
 import io
 import logging
+import time
 from pathlib import Path
+
+import httpx
 
 from config import settings
 
@@ -24,6 +32,9 @@ logger = logging.getLogger(__name__)
 # Newsprint is dense; cap the long edge so token cost stays sane while headlines
 # and body text stay legible to the model.
 _MAX_EDGE = 1568
+
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 _PROMPT = """This image is one full page of a Pakistani newspaper's print edition. \
 It may be in English or in Urdu (Nastaliq script).
@@ -40,14 +51,77 @@ Output the transcription only — no commentary, no translation."""
 
 
 def has_key() -> bool:
-    return bool(settings.anthropic_api_key)
+    return bool(settings.groq_api_key or settings.anthropic_api_key)
+
+
+def provider() -> str:
+    if settings.groq_api_key:
+        return "groq"
+    if settings.anthropic_api_key:
+        return "anthropic"
+    return "none"
 
 
 def read_page(image_path: str | Path) -> str:
     """Return the page's text. Raises on API failure (caller records status)."""
+    if settings.groq_api_key:
+        return _read_groq(Path(image_path))
+    if settings.anthropic_api_key:
+        return _read_anthropic(Path(image_path))
+    raise RuntimeError("no vision API key configured")
+
+
+# ----------------------------------------------------------------- groq -----
+def _read_groq(image_path: Path) -> str:
+    b64, media_type = _encode(image_path)
+    payload = {
+        "model": settings.groq_model,
+        "temperature": 0,
+        "max_tokens": 6000,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{media_type};base64,{b64}"}},
+                {"type": "text", "text": _PROMPT},
+            ],
+        }],
+    }
+    headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
+
+    last: Exception | None = None
+    for attempt in range(5):
+        try:
+            r = httpx.post(_GROQ_URL, headers=headers, json=payload, timeout=180)
+        except Exception as exc:
+            last = exc
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 404 and payload["model"] != _GROQ_FALLBACK_MODEL:
+            logger.info("groq: %s unavailable — falling back to %s",
+                        payload["model"], _GROQ_FALLBACK_MODEL)
+            payload["model"] = _GROQ_FALLBACK_MODEL
+            continue
+        if r.status_code in (429, 500, 502, 503):
+            # Rate limit / transient — honour Retry-After when present.
+            wait = float(r.headers.get("retry-after") or (3 * (attempt + 1)))
+            logger.info("groq: %s — retrying in %.0fs", r.status_code, wait)
+            time.sleep(min(wait, 60))
+            continue
+        r.raise_for_status()
+        data = r.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        text = text.strip()
+        logger.info("e-paper read (groq): %s -> %d chars", image_path.name, len(text))
+        return text
+    raise RuntimeError(f"groq read failed after retries: {last}")
+
+
+# ------------------------------------------------------------- anthropic ----
+def _read_anthropic(image_path: Path) -> str:
     import anthropic
 
-    b64, media_type = _encode(Path(image_path))
+    b64, media_type = _encode(image_path)
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     model = settings.epaper_ocr_model or settings.llm_model
     resp = client.messages.create(
@@ -63,7 +137,7 @@ def read_page(image_path: str | Path) -> str:
         }],
     )
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-    logger.info("e-paper read: %s -> %d chars", Path(image_path).name, len(text))
+    logger.info("e-paper read (claude): %s -> %d chars", image_path.name, len(text))
     return text
 
 

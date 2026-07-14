@@ -674,10 +674,11 @@ def dashboard(db: Session = Depends(get_db)):
     health = (
         _health_row("Scheduled scans", settings.scheduler_enabled,
                     "on" if settings.scheduler_enabled else "manual only")
-        + _health_row("E-paper reading (Claude vision)", reader.has_key(),
-                      "ready" if reader.has_key() else "needs ANTHROPIC_API_KEY")
-        + _health_row("LLM scoring", settings.enable_llm_scoring and bool(settings.anthropic_api_key),
-                      "on" if (settings.enable_llm_scoring and settings.anthropic_api_key) else "off")
+        + _health_row("E-paper reading (vision)", reader.has_key(),
+                      {"groq": "ready · Groq", "anthropic": "ready · Claude"}.get(
+                          reader.provider(), "needs GROQ_API_KEY"))
+        + _health_row("LLM scoring", settings.enable_llm_scoring and reader.has_key(),
+                      "on" if (settings.enable_llm_scoring and reader.has_key()) else "off")
         + _health_row("WhatsApp alerts", settings.notifier == "whatsapp" and bool(settings.whatsapp_access_token),
                       "live" if (settings.notifier == "whatsapp" and settings.whatsapp_access_token) else "dry-run")
         + _health_row("Email digest", settings.smtp_configured,
@@ -911,9 +912,9 @@ def epaper_page(date: str | None = None, db: Session = Depends(get_db)):
 
     unsupported = " · ".join(html.escape(v) for v in sources.UNSUPPORTED.values())
     key_banner = "" if key_ok else (
-        '<div class="banner">⚠ Reading pages needs <b>ANTHROPIC_API_KEY</b> in your .env — '
-        "page scans are still fetched and browsable, but keyword matching inside them "
-        "starts once the key is set (already-fetched pages are read automatically on the next scan).</div>"
+        '<div class="banner">⚠ Reading pages needs <b>GROQ_API_KEY</b> (or ANTHROPIC_API_KEY) '
+        "in your .env — page scans are still fetched and browsable, but keyword matching inside "
+        "them starts once a key is set (stored pages are read automatically on the next scan).</div>"
     )
     fetch_all = (
         '<button class="btn-lg" disabled><span class="spin"></span>Working…</button>' if running
@@ -1083,6 +1084,10 @@ def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
         1 for mk in db.execute(select(Mention.matched_keywords)).scalars()
         if kw.text in (mk or [])
     )
+    if res.get("mentions"):
+        # New hits have no screenshots yet (quick scans don't open a browser) —
+        # capture them in a background subprocess so the cards fill in shortly.
+        scan_manager.start_scan(backfill_only=True, keyword_label=f"images · {kw.text}")
     return RedirectResponse(
         f"/mentions?keyword={kw.text}&checked={res['articles_checked']}"
         f"&pages={res['pages_checked']}&found={found}",

@@ -54,11 +54,14 @@ def start_scan(
     keyword_ids: list[int] | None = None,
     keyword_label: str | None = None,
     capped: bool = False,
+    backfill_only: bool = False,
 ) -> bool:
     """Launch a scan as a subprocess. False if one is already running.
 
     capped=False (manual): crawl the whole front page.
     capped=True (scheduled): bounded fetch per run.
+    backfill_only=True: no scanning — just capture missing detection screenshots
+    (kicked automatically after a ⚡ Quick Scan finds something new).
     """
     global _proc, _current_label
     with _lock:
@@ -71,6 +74,8 @@ def start_scan(
             cmd += ["--label", keyword_label]
         if capped:
             cmd += ["--capped"]
+        if backfill_only:
+            cmd += ["--backfill-only"]
         logger.info("Launching scan subprocess: %s", " ".join(cmd))
         _proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), **_detached_kwargs())
         _current_label = keyword_label

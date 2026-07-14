@@ -115,8 +115,10 @@ def _download(pg: sources.EPage) -> Path | None:
 
 # ------------------------------------------------------------------- read ---
 def _read_pages(session, summary) -> None:
+    # 'failed' is retried too — failures are usually transient (rate limits,
+    # network); a page that keeps failing just costs one request per cycle.
     pending = session.execute(select(EPaperPage).where(
-        EPaperPage.ocr_status.in_(("pending", "no_key")),
+        EPaperPage.ocr_status.in_(("pending", "no_key", "failed")),
         EPaperPage.image_path.is_not(None),
     ).order_by(EPaperPage.date.desc(), EPaperPage.page_no)).scalars().all()
     if not pending:
@@ -129,7 +131,11 @@ def _read_pages(session, summary) -> None:
         summary["no_key"] = len(pending)
         logger.info("e-paper: %d pages await ANTHROPIC_API_KEY for reading", len(pending))
         return
-    for row in pending:
+    import time as _time
+
+    for i, row in enumerate(pending):
+        if i:
+            _time.sleep(1.2)  # stay well inside free-tier rate limits
         try:
             row.ocr_text = reader.read_page(row.image_path)
             row.ocr_status = "done"

@@ -17,8 +17,8 @@ default mode; going fully live is just adding credentials and flipping a flag
 | Database     | SQLAlchemy — SQLite (dev) or Supabase Postgres (`DATABASE_URL`) |
 | Scraping     | Playwright (real browser) + BeautifulSoup |
 | Matching     | Word-boundary + length-scaled fuzzy (rapidfuzz), EN + UR normalization |
-| E-paper OCR  | Claude vision — reads scanned pages incl. Urdu Nastaliq (config key) |
-| Scoring      | Claude relevance + sentiment (config flag) |
+| E-paper OCR  | Vision LLM — Groq Llama-4 (default) or Claude; reads scanned pages incl. Urdu Nastaliq |
+| Scoring      | Groq/Claude relevance + sentiment (config flag) |
 | Alerts       | console + `data/alerts.log` always; WhatsApp (Meta Cloud API) optional |
 | Digest       | SMTP email at 07:00 PKT; writes HTML file if no SMTP |
 
@@ -79,8 +79,8 @@ python -m tests.test_keywords            # keyword-matching precision suite
 |----------------------------|----------------------------------|-----------------------------------------|
 | Newspaper website monitoring | fully live                     | — (nothing)                             |
 | E-paper page fetching + browsing | fully live                 | — (nothing)                             |
-| E-paper keyword matching (page reading) | pages archived, awaiting key | `ANTHROPIC_API_KEY`          |
-| Relevance + sentiment      | off                              | `ENABLE_LLM_SCORING=true` + `ANTHROPIC_API_KEY` |
+| E-paper keyword matching (page reading) | pages archived, awaiting key | `GROQ_API_KEY` (or `ANTHROPIC_API_KEY`) |
+| Relevance + sentiment      | off                              | `ENABLE_LLM_SCORING=true` + a provider key |
 | WhatsApp alerts            | dry-run (logs payload)           | `NOTIFIER=whatsapp` + Meta creds + approved template |
 | Email digest               | writes HTML file                 | `SMTP_HOST`/creds + `DIGEST_*`          |
 
