@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Karachi"
     # Set false to run the web UI without the background scheduler (auto-scans).
     scheduler_enabled: bool = True
+    # The system monitors CURRENT coverage only: content dated before this is
+    # never fetched or matched (e-paper editions, dated articles).
+    monitor_since: str = "2026-01-01"
+
+    @property
+    def monitor_since_date(self):
+        from datetime import date
+
+        try:
+            return date.fromisoformat(self.monitor_since)
+        except ValueError:
+            return date(2026, 1, 1)
 
     # --- Database ---
     database_url: str = "sqlite:///./data/media_monitoring.db"

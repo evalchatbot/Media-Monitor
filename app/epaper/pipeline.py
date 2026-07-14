@@ -57,7 +57,7 @@ def run_epaper_scan(keyword_ids=None, fetch: bool = True, papers: list[str] | No
             _fetch_editions(session, papers, summary)
         _read_pages(session, summary)
         if keywords:
-            _match_pages(session, keywords, notifier, summary)
+            match_stored_pages(session, keywords, notifier, summary, since_days=_MATCH_DAYS)
         return summary
     finally:
         session.close()
@@ -141,14 +141,23 @@ def _read_pages(session, summary) -> None:
 
 
 # ------------------------------------------------------------------ match ---
-def _match_pages(session, keywords, notifier, summary) -> None:
-    since = (datetime.now(_PKT).date() - timedelta(days=_MATCH_DAYS)).isoformat()
+def match_stored_pages(session, keywords, notifier, summary,
+                       since_days: int | None = _MATCH_DAYS) -> None:
+    """Match keywords against already-read pages. `since_days=None` = every
+    stored page (used by the instant per-keyword Quick Scan); scans use a small
+    window since older pages were already matched when they arrived. Content is
+    never matched from before the monitoring window (MONITOR_SINCE)."""
+    floor = settings.monitor_since_date.isoformat()
+    since = floor if since_days is None else max(
+        floor, (datetime.now(_PKT).date() - timedelta(days=since_days)).isoformat()
+    )
     pages = session.execute(select(EPaperPage).where(
         EPaperPage.ocr_status == "done", EPaperPage.date >= since,
     )).scalars().all()
     for row in pages:
         if not row.ocr_text:
             continue
+        summary["pages_checked"] = summary.get("pages_checked", 0) + 1
         matches = find_matches(row.ocr_text, keywords)
         if not matches:
             continue

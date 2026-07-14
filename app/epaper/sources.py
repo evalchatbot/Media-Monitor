@@ -244,6 +244,10 @@ def list_pages(slug: str, d: _date | None = None, city: str | None = None) -> li
     from datetime import datetime, timedelta, timezone
 
     d = d or datetime.now(timezone(timedelta(hours=5))).date()
+    if d < settings.monitor_since_date:
+        logger.info("e-paper %s: %s predates the monitoring window (%s) — skipped",
+                    slug, d.isoformat(), settings.monitor_since)
+        return []
     city = city or settings.epaper_city
     entry = SOURCES.get(slug)
     if not entry:

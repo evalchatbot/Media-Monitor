@@ -116,6 +116,138 @@ def run_newspaper_scan(keyword_ids: list[int] | None = None, uncapped: bool = Fa
         session.close()
 
 
+# In-process corpus cache so a ⚡ Quick Scan doesn't re-pull hundreds of article
+# bodies from a REMOTE Postgres on every click. A cheap (count, max id) stamp
+# detects when a scan subprocess added articles and triggers a reload.
+_CORPUS: dict = {"stamp": None, "rows": []}
+
+
+def _load_corpus(session) -> list:
+    from sqlalchemy import func as _f
+
+    stamp = tuple(session.execute(
+        select(_f.count(ArticleCache.id), _f.coalesce(_f.max(ArticleCache.id), 0))
+        .where(ArticleCache.module == "newspaper")
+    ).one())
+    if _CORPUS["stamp"] == stamp:
+        return _CORPUS["rows"]
+    rows = session.execute(
+        select(ArticleCache.external_id, ArticleCache.source, ArticleCache.section,
+               ArticleCache.title, ArticleCache.url, ArticleCache.body)
+        .where(ArticleCache.module == "newspaper")
+    ).all()
+    _CORPUS["stamp"] = stamp
+    _CORPUS["rows"] = rows
+    logger.info("quick-scan corpus loaded: %d articles", len(rows))
+    return rows
+
+
+def warm_quick_corpus() -> None:
+    """Pre-load the corpus (called in a background thread at app startup so the
+    first ⚡ Quick Scan is as fast as every later one). DB-only; thread-safe."""
+    try:
+        session = SessionLocal()
+        try:
+            _load_corpus(session)
+        finally:
+            session.close()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("quick-scan corpus warm-up failed: %s", exc)
+
+
+def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -> dict:
+    """Instant scan: match keywords against EVERYTHING already stored — every
+    cached website article and every read e-paper page. No scraping, no browser,
+    no LLM, and (crucially, for a remote Postgres) no per-row round-trips: the
+    corpus comes from an in-process cache, matching runs in memory, and all new
+    hits land in ONE commit. This is what the per-keyword ⚡ Scan button calls,
+    inline in the web process. New mentions look exactly like scan mentions,
+    minus the screenshot (no page fetch)."""
+    session = SessionLocal()
+    notifier = get_notifier()
+    summary = {"articles_checked": 0, "pages_checked": 0, "mentions": 0, "alerts": 0}
+    try:
+        keywords = _active_keywords(session, keyword_ids)
+        if not keywords:
+            return summary
+
+        articles = _load_corpus(session)
+        existing = {
+            m.external_id: m
+            for m in session.execute(
+                select(Mention).where(Mention.module == "newspaper")
+            ).scalars()
+        }
+
+        to_alert: list[tuple[Mention, list[str]]] = []
+        for ca in articles:
+            summary["articles_checked"] += 1
+            haystack = f"{ca.title}\n{ca.body}"
+            matches = find_matches(haystack, keywords)
+            if not matches:
+                continue
+            matched_kw = sorted({m.keyword for m in matches})
+            mention = existing.get(ca.external_id)
+            if mention is not None:
+                new_kw = [k for k in matched_kw if k not in (mention.matched_keywords or [])]
+                if not new_kw:
+                    continue
+                mention.matched_keywords = sorted(
+                    set(mention.matched_keywords or []) | set(matched_kw)
+                )
+                to_alert.append((mention, new_kw))
+                continue
+            snippet = _make_snippet(haystack, matched_kw)
+            mention = Mention(
+                module="newspaper",
+                external_id=ca.external_id,
+                source=ca.source,
+                section=ca.section,
+                title=ca.title,
+                url=ca.url,
+                matched_keywords=matched_kw,
+                snippet=snippet,
+                summary=snippet,
+            )
+            session.add(mention)
+            existing[ca.external_id] = mention
+            summary["mentions"] += 1
+            to_alert.append((mention, matched_kw))
+
+        try:
+            session.commit()  # ONE round-trip for every hit
+        except IntegrityError:
+            # A concurrent scan inserted one of the same articles between our
+            # read and this commit. Start over on fresh state (once).
+            session.rollback()
+            session.close()
+            if _retry:
+                return run_quick_match(keyword_ids, _retry=False)
+            raise
+
+        # Alerts after the data is safe; notified flags land in one commit too.
+        any_alert = False
+        for mention, kws in to_alert:
+            ok = notifier.send(Alert(
+                source=mention.source, title=mention.title,
+                summary=mention.summary or "", sentiment=mention.sentiment,
+                url=mention.url, matched_keywords=kws,
+            ))
+            if ok:
+                mention.notified = True
+                summary["alerts"] += 1
+                any_alert = True
+        if any_alert:
+            session.commit()
+
+        from app.epaper.pipeline import match_stored_pages
+
+        match_stored_pages(session, keywords, notifier, summary, since_days=None)
+        return summary
+    finally:
+        session.close()
+
+
 def _finish_run(session, run: ScrapeRun, status: str, error: str | None) -> None:
     run.status = status
     run.error = error
@@ -184,7 +316,10 @@ def _ensure_cached(session, scraper, articles: list[Article], summary, budget: d
 
 
 def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, summary) -> bool:
-    """Match keywords against one cached article; create or update its mention."""
+    """Match keywords against one cached article; create or update its mention.
+
+    `scraper=None` (Quick Scan) skips the screenshot capture — everything else
+    is identical, so a quick hit and a scan hit are the same Mention row."""
     haystack = f"{ca.title}\n{ca.body}"
     matches = find_matches(haystack, keywords)
     if not matches:
@@ -218,12 +353,14 @@ def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, sum
         logger.info("Skipping '%s' — LLM marked Not Relevant", ca.title[:60])
         return False
 
-    art = Article(source=ca.source, title=ca.title, url=ca.url, section=ca.section,
-                  external_id=ca.external_id)
-    crop_selector = getattr(scraper, "ARTICLE_CROP_SELECTOR", None)
-    full_path, crop_path = scraper.capture_screenshots(
-        art, settings.storage_dir / scraper.name, crop_selector
-    )
+    full_path = crop_path = None
+    if scraper is not None:
+        art = Article(source=ca.source, title=ca.title, url=ca.url, section=ca.section,
+                      external_id=ca.external_id)
+        crop_selector = getattr(scraper, "ARTICLE_CROP_SELECTOR", None)
+        full_path, crop_path = scraper.capture_screenshots(
+            art, settings.storage_dir / scraper.name, crop_selector
+        )
 
     mention = Mention(
         module="newspaper",

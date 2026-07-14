@@ -32,7 +32,7 @@ from app.db.base import SessionLocal, init_db
 from app.db.models import EPaperPage, Keyword, Mention, ScrapeRun
 from app.epaper import reader, scan_runner, sources
 from app.newspaper import scan_manager
-from app.newspaper.pipeline import run_newspaper_scan
+from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
 from app.scrapers.sites import SITE_CONFIGS
 from app.scheduler import shutdown_scheduler, start_scheduler
 
@@ -47,6 +47,12 @@ async def lifespan(app: FastAPI):
     init_db()
     if settings.scheduler_enabled:
         start_scheduler()
+    # Pre-warm the ⚡ Quick Scan corpus so the first click is instant too.
+    import threading
+
+    from app.newspaper.pipeline import warm_quick_corpus
+
+    threading.Thread(target=warm_quick_corpus, daemon=True).start()
     yield
     shutdown_scheduler()
 
@@ -318,7 +324,8 @@ tbody tr:hover{background:var(--surface-2)}
   display:flex;align-items:center;justify-content:center;gap:.5rem}
 .scanbar .spin{border-color:rgba(255,255,255,.5);border-top-color:#fff}
 .donebar{background:var(--accent-soft);color:var(--accent-strong);border-bottom:1px solid var(--accent-border);text-align:center;padding:.5rem 1rem;font-weight:600;font-size:.86rem;animation:fadeUp .4s both}
-.banner{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn);border-radius:var(--r-sm);padding:.8rem 1rem;margin-bottom:1.2rem;font-weight:600;font-size:.88rem}
+.banner{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn);border-radius:var(--r-sm);padding:.8rem 1rem;margin-bottom:1.2rem;font-weight:600;font-size:.88rem;animation:fadeUp .4s both}
+.banner.ok{background:var(--accent-soft);border-color:var(--accent-border);color:var(--accent-strong)}
 .hint{background:var(--surface-2);border:1px solid var(--line-strong);color:var(--muted);border-radius:var(--r-sm);padding:.75rem 1rem;font-size:.86rem;margin:.6rem 0 0}
 
 /* ===== Section heading ===== */
@@ -790,7 +797,7 @@ def _keyword_table(keywords, counts: dict, scanning: bool, edit) -> str:
         status = ('<button class="ghost sm" title="Click to pause — paused keywords are skipped">🟢 Active</button>'
                   if k.active else '<button class="sm" title="Click to activate">⏸ Paused</button>')
         dim = "" if k.active else ' style="opacity:.55"'
-        scan_disabled = "disabled" if (scanning or not k.active) else ""
+        scan_disabled = "disabled" if not k.active else ""
         rows += (
             f"<tr{dim}>"
             f'<td><a class="kwname" href="{kwlink}">{html.escape(k.text)}</a></td>'
@@ -800,7 +807,7 @@ def _keyword_table(keywords, counts: dict, scanning: bool, edit) -> str:
             f'<td class="row" style="justify-content:flex-end">'
             f'<a class="btn ghost sm" href="/newspapers?edit={k.id}">Edit</a>'
             f'<form method="post" action="/ui/keywords/{k.id}/scan" style="margin:0">'
-            f'<button class="sm" {scan_disabled} title="Scan this keyword now">▶ Scan</button></form>'
+            f'<button class="sm" {scan_disabled} title="Instant: checks every stored article + e-paper page and shows the results">⚡ Scan</button></form>'
             f'<form method="post" action="/ui/keywords/{k.id}/delete" style="margin:0" '
             f"onsubmit=\"return confirm('Delete keyword “{html.escape(k.text)}”?')\">"
             f'<button class="ghost sm">Delete</button></form></td></tr>'
@@ -833,9 +840,12 @@ def newspapers_page(edit: int | None = None, db: Session = Depends(get_db)):
         <button type="submit">+ Add keyword</button>
       </form>
       <form method="post" action="/ui/scan/newspaper" style="margin:0">{scan_all}</form>
-      <div class="hint">Matching is precise: whole words only (no “rape” → “grape”),
-      light inflection for English (protest → protests/protesting), Urdu script &amp;
-      diacritic variants unified, and fuzziness scaled to keyword length.</div>
+      <div class="hint">⚡ <b>Scan</b> on a keyword is instant — it checks every stored
+      article and e-paper page and takes you straight to the results.
+      <b>Scan all keywords now</b> scrapes the sites for fresh content first (takes minutes).
+      Matching is precise: whole words only (no “rape” → “grape”), light inflection for
+      English (protest → protests/protesting), Urdu script &amp; diacritic variants unified,
+      fuzziness scaled to keyword length. Monitoring window: <b>{settings.monitor_since[:4]} onwards</b>.</div>
     </div>
     <div class="card">{table}</div>
     """
@@ -937,7 +947,8 @@ def epaper_page(date: str | None = None, db: Session = Depends(get_db)):
 # ==========================================================================
 @app.get("/mentions", response_class=HTMLResponse)
 def detections_page(keyword: str | None = None, src: str | None = None,
-                    db: Session = Depends(get_db)):
+                    checked: int | None = None, pages: int | None = None,
+                    found: int | None = None, db: Session = Depends(get_db)):
     mentions = (
         db.execute(select(Mention).order_by(Mention.detected_at.desc()).limit(500))
         .scalars().all()
@@ -992,7 +1003,16 @@ def detections_page(keyword: str | None = None, src: str | None = None,
         "onsubmit=\"return confirm('Delete ALL detections? This cannot be undone.')\">"
         '<button class="ghost">🗑 Clear all</button></form>'
     )
+    quick_banner = ""
+    if checked is not None:
+        quick_banner = (
+            f'<div class="banner ok">⚡ Quick scan done — checked '
+            f'<b>{checked}</b> stored article(s) and <b>{pages or 0}</b> e-paper page(s)'
+            + (f" · <b>{found}</b> detection(s) for this keyword" if found is not None else "")
+            + ". Fresh content keeps arriving via scheduled scans and “Scan all”.</div>"
+        )
     body = f"""
+    {quick_banner}
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:.2rem">
       <p class="sub" style="margin:0">{len(mentions)} detection(s){' for “' + html.escape(keyword) + '”' if keyword else ''}</p>
       {clear_btn}
@@ -1052,12 +1072,22 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
 
 @app.post("/ui/keywords/{kid}/scan")
 def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
+    """⚡ Quick Scan: instantly match this keyword against everything already
+    stored (every cached article + every read e-paper page) and show results.
+    Runs inline — no browser, no scraping — so the answer is immediate."""
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
-    # Websites now; e-paper re-match runs against already-read pages (no fetch).
-    scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
-    return RedirectResponse(f"/mentions?keyword={kw.text}", status_code=303)
+    res = run_quick_match(keyword_ids=[kid])
+    found = sum(
+        1 for mk in db.execute(select(Mention.matched_keywords)).scalars()
+        if kw.text in (mk or [])
+    )
+    return RedirectResponse(
+        f"/mentions?keyword={kw.text}&checked={res['articles_checked']}"
+        f"&pages={res['pages_checked']}&found={found}",
+        status_code=303,
+    )
 
 
 @app.post("/ui/scan")
