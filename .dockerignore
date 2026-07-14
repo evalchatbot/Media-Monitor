@@ -1,0 +1,14 @@
+# Never bake secrets or local data into the image.
+.env
+data/
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+docs/
+tests/
+*.md
+.gitattributes
+.gitignore
