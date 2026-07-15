@@ -424,20 +424,31 @@ def _crop(src: Path, box: dict, out: Path, pad_pct: float = 2.0) -> bool:
         return False
 
 
-_TARGET_W = 1500  # display width clips are brought up to
+_TARGET_W = 1700   # display width clips are brought up to
+_MAX_SCALE = 3.2   # don't over-upscale a tiny crop into mush
 
 
 def _enhance(path: Path) -> None:
-    """Upscale small clips to a consistent display width and sharpen, so text
-    from low-res source scans stays legible. Saved 4:4:4 q95 (crisp text edges)."""
+    """Make a scanned-newsprint crop as legible as the source allows: upscale to
+    a consistent display width, then a contrast + sharpen pass tuned for text —
+    gray newsprint is stretched so ink goes dark and paper goes white (the
+    biggest perceived-quality gain), and edges are crisped. Saved 4:4:4 q95."""
     try:
-        from PIL import Image, ImageFilter
+        from PIL import Image, ImageFilter, ImageOps
 
         img = Image.open(path).convert("RGB")
         w, h = img.size
         if w < _TARGET_W:
-            img = img.resize((_TARGET_W, round(h * _TARGET_W / w)), Image.LANCZOS)
-            img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=95, threshold=2))
+            scale = min(_TARGET_W / w, _MAX_SCALE)
+            # A tiny pre-denoise stops the upscaler amplifying JPEG blocking on
+            # the lowest-res scans (Dawn); skipped when the crop is already big.
+            if w < 700:
+                img = img.filter(ImageFilter.MedianFilter(3))
+            img = img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+        # Stretch levels (tone-preserving): clip 0.4% tails so faded ink blackens
+        # and the page whitens — makes text pop without wrecking photos.
+        img = ImageOps.autocontrast(img, cutoff=(0.4, 0.2), preserve_tone=True)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.7, percent=115, threshold=2))
         img.save(path, quality=95, subsampling=0)
     except Exception as exc:
         logger.warning("clip enhance failed for %s: %s", path, exc)
