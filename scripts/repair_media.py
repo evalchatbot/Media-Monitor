@@ -89,21 +89,20 @@ def main() -> None:
             from app.epaper.pipeline import _snippet
 
             langs = {k.text: k.language for k in session.execute(select(Keyword)).scalars()}
-            clipped = 0
+            clipped = rl_streak = done_first = 0
+            stopped = False
             ep_mentions = session.execute(
                 select(Mention).where(Mention.module == "epaper")).scalars().all()
-            for i, m in enumerate(ep_mentions):
-                row = by_key.get(m.external_id)
-                if not (row and _alive(row.image_path) and (m.matched_keywords or [])):
-                    continue
-                already_clip = (m.screenshot_path and "_clip_" in m.screenshot_path
-                                and _alive(m.screenshot_path))
-                if already_clip and not args.force:
-                    continue
-                if i:
-                    # Pace for the provider's rate limit (Gemini free tier is
-                    # per-minute; Groq is generous). ~2 vision calls per clip.
+            todo = [m for m in ep_mentions
+                    if by_key.get(m.external_id) and _alive(by_key[m.external_id].image_path)
+                    and (m.matched_keywords or [])
+                    and not (m.screenshot_path and "_clip_" in m.screenshot_path
+                             and _alive(m.screenshot_path) and not args.force)]
+            for m in todo:
+                row = by_key[m.external_id]
+                if done_first:
                     _t.sleep(4.0 if settings.gemini_api_key else 1.2)
+                done_first = 1
                 kw = m.matched_keywords[0]
                 c = _clip.make_clipping(row.image_path, kw,
                                         _snippet(row.ocr_text, [kw]), row.source,
@@ -115,8 +114,19 @@ def main() -> None:
                     m.screenshot_path = c
                     session.commit()
                     clipped += 1
-            print(f"[2b ] press-clippings cut for existing detections: {clipped} "
-                  f"(of {len(ep_mentions)}; rejected crops keep the full page)")
+                    rl_streak = 0
+                elif _clip.pop_rate_limited():
+                    rl_streak += 1
+                    if rl_streak >= 3:      # quota exhausted — stop, don't hammer
+                        stopped = True
+                        break
+                else:
+                    rl_streak = 0
+            print(f"[2b ] press-clippings cut: {clipped} of {len(todo)} attempted"
+                  f"{' (rejected crops keep the full page)' if not stopped else ''}")
+            if stopped:
+                print("      ⚠ Gemini free-tier quota reached — stopped early. Progress is "
+                      "SAVED. Re-run WITHOUT --force in a few minutes to continue the rest.")
 
         # -- 3. website screenshots -----------------------------------------
         cleared = 0

@@ -37,6 +37,19 @@ from app.epaper.reader import _MAX_EDGE, _encode
 
 logger = logging.getLogger(__name__)
 
+# Set when a call gives up after exhausting 429 retries, so a batch job (reclip)
+# can tell "rate-limited" apart from "genuinely couldn't clip" and stop early.
+_RATE_LIMITED = False
+
+
+def pop_rate_limited() -> bool:
+    """True if the last make_clipping() failed due to rate limiting (consumes)."""
+    global _RATE_LIMITED
+    v = _RATE_LIMITED
+    _RATE_LIMITED = False
+    return v
+
+
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
                "{model}:generateContent")
@@ -81,6 +94,8 @@ def make_clipping(page_path: str | Path, keyword: str, snippet: str,
                   source: str, page_no: int, link: str,
                   language: str = "en") -> str | None:
     """Return the path of a stamped, verified clipping — or None (use full page)."""
+    global _RATE_LIMITED
+    _RATE_LIMITED = False
     page_path = Path(page_path)
     if not page_path.exists() or not (settings.gemini_api_key or settings.groq_api_key):
         return None
@@ -212,6 +227,7 @@ def _locate_gemini(page_path: Path, needle: str, hint: str) -> dict | None:
         ]}],
         "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
+    global _RATE_LIMITED
     for attempt in range(4):
         try:
             r = httpx.post(url, params={"key": settings.gemini_api_key},
@@ -220,6 +236,8 @@ def _locate_gemini(page_path: Path, needle: str, hint: str) -> dict | None:
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (429, 500, 503):
+            if r.status_code == 429 and attempt == 3:
+                _RATE_LIMITED = True
             time.sleep(_gemini_wait(r, attempt))
             continue
         if r.status_code != 200:
@@ -294,6 +312,7 @@ def _ask_gemini_json(prompt, image_path, image_b64=None) -> dict | None:
         ]}],
         "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
+    global _RATE_LIMITED
     for attempt in range(4):
         try:
             r = httpx.post(url, params={"key": settings.gemini_api_key}, json=body, timeout=120)
@@ -301,6 +320,8 @@ def _ask_gemini_json(prompt, image_path, image_b64=None) -> dict | None:
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (429, 500, 503):
+            if r.status_code == 429 and attempt == 3:
+                _RATE_LIMITED = True
             time.sleep(_gemini_wait(r, attempt))
             continue
         if r.status_code != 200:
