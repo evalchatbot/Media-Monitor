@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     # Scout is the Llama-4 vision model generally available on Groq accounts.
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    # Optional: Google Gemini for PRECISE press-clipping boxes (grounding is
+    # its strength). Free key at https://aistudio.google.com/apikey — when set,
+    # the clipper uses Gemini for locate/repair/verify; reading stays on Groq.
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     # Anthropic (used when no Groq key is set).
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"   # current latest; override via LLM_MODEL

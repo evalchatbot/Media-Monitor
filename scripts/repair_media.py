@@ -39,6 +39,9 @@ def main() -> None:
     ap.add_argument("--reclip-epaper", action="store_true",
                     help="cut press-clippings for existing e-paper detections "
                          "(vision-located, verified; full page kept as fallback)")
+    ap.add_argument("--force", action="store_true",
+                    help="with --reclip-epaper: redo detections that already "
+                         "have a clipping (use after improving the clipper)")
     args = ap.parse_args()
 
     init_db()
@@ -94,7 +97,7 @@ def main() -> None:
                     continue
                 already_clip = (m.screenshot_path and "_clip_" in m.screenshot_path
                                 and _alive(m.screenshot_path))
-                if already_clip:
+                if already_clip and not args.force:
                     continue
                 if i:
                     _t.sleep(1.2)  # two vision calls per clipping — pace for rate limits
