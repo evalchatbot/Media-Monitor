@@ -20,6 +20,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from config import settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import EPaperPage, Mention
 
@@ -100,7 +101,9 @@ def main() -> None:
                 if already_clip and not args.force:
                     continue
                 if i:
-                    _t.sleep(1.2)  # two vision calls per clipping — pace for rate limits
+                    # Pace for the provider's rate limit (Gemini free tier is
+                    # per-minute; Groq is generous). ~2 vision calls per clip.
+                    _t.sleep(4.0 if settings.gemini_api_key else 1.2)
                 kw = m.matched_keywords[0]
                 c = _clip.make_clipping(row.image_path, kw,
                                         _snippet(row.ocr_text, [kw]), row.source,

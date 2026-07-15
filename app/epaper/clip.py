@@ -88,30 +88,33 @@ def make_clipping(page_path: str | Path, keyword: str, snippet: str,
     needle = needle[:220]
     hint = " (Urdu, Nastaliq script)" if language == "ur" else ""
 
-    box = (_locate_gemini(page_path, needle, hint) if settings.gemini_api_key
+    use_gemini = bool(settings.gemini_api_key)
+    box = (_locate_gemini(page_path, needle, hint) if use_gemini
            else _locate_grid(page_path, needle, hint))
     if not box:
         return None
 
     out = page_path.with_name(f"{page_path.stem}_clip_{abs(hash(keyword)) % 99999}.jpg")
-    if not _crop(page_path, box, out):
+    # Gemini boxes are precise — trust them with a little extra padding and skip
+    # the (call-hungry) repair loop, so a clip is just locate + verify. The grid
+    # path IS coordinate-guessy, so it keeps the completeness repair.
+    if not _crop(page_path, box, out, pad_pct=3.5 if use_gemini else 2.0):
         return None
-
-    # Repair pass(es): heal cut edges instead of shipping half an article.
-    for _ in range(2):
-        flags = _ask_json(_REPAIR_PROMPT.format(needle=needle, lang_hint=hint), out)
-        if not flags:
-            break
-        grow = {"t": 8 * bool(flags.get("cut_top") or not flags.get("headline_visible", True)),
-                "b": 8 * bool(flags.get("cut_bottom")),
-                "l": 7 * bool(flags.get("cut_left")),
-                "r": 7 * bool(flags.get("cut_right"))}
-        if not any(grow.values()):
-            break
-        box = {"l": max(0, box["l"] - grow["l"]), "t": max(0, box["t"] - grow["t"]),
-               "r": min(100, box["r"] + grow["r"]), "b": min(100, box["b"] + grow["b"])}
-        if not _crop(page_path, box, out):
-            break
+    if not use_gemini:
+        for _ in range(2):
+            flags = _ask_json(_REPAIR_PROMPT.format(needle=needle, lang_hint=hint), out)
+            if not flags:
+                break
+            grow = {"t": 8 * bool(flags.get("cut_top") or not flags.get("headline_visible", True)),
+                    "b": 8 * bool(flags.get("cut_bottom")),
+                    "l": 7 * bool(flags.get("cut_left")),
+                    "r": 7 * bool(flags.get("cut_right"))}
+            if not any(grow.values()):
+                break
+            box = {"l": max(0, box["l"] - grow["l"]), "t": max(0, box["t"] - grow["t"]),
+                   "r": min(100, box["r"] + grow["r"]), "b": min(100, box["b"] + grow["b"])}
+            if not _crop(page_path, box, out):
+                break
 
     v = _ask_json(_VERIFY_PROMPT.format(needle=needle, lang_hint=hint), out)
     if not (v and v.get("contains")):
@@ -209,7 +212,7 @@ def _locate_gemini(page_path: Path, needle: str, hint: str) -> dict | None:
         ]}],
         "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             r = httpx.post(url, params={"key": settings.gemini_api_key},
                            json=body, timeout=120)
@@ -217,10 +220,10 @@ def _locate_gemini(page_path: Path, needle: str, hint: str) -> dict | None:
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (429, 500, 503):
-            time.sleep(min(float(r.headers.get("retry-after") or 4 * (attempt + 1)), 45))
+            time.sleep(_gemini_wait(r, attempt))
             continue
         if r.status_code != 200:
-            logger.warning("clip locate (gemini): %s", r.status_code)
+            logger.warning("clip locate (gemini): %s %s", r.status_code, r.text[:120])
             return None
         try:
             txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -291,14 +294,14 @@ def _ask_gemini_json(prompt, image_path, image_b64=None) -> dict | None:
         ]}],
         "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             r = httpx.post(url, params={"key": settings.gemini_api_key}, json=body, timeout=120)
         except Exception:
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (429, 500, 503):
-            time.sleep(min(float(r.headers.get("retry-after") or 4 * (attempt + 1)), 45))
+            time.sleep(_gemini_wait(r, attempt))
             continue
         if r.status_code != 200:
             return None
@@ -307,6 +310,22 @@ def _ask_gemini_json(prompt, image_path, image_b64=None) -> dict | None:
         except Exception:
             return None
     return None
+
+
+def _gemini_wait(resp, attempt: int) -> float:
+    """Honour Google's RetryInfo (free tier is per-minute), else escalate."""
+    try:
+        for d in resp.json().get("error", {}).get("details", []):
+            if "RetryInfo" in d.get("@type", ""):
+                s = d.get("retryDelay", "")
+                if s.endswith("s"):
+                    return min(float(s[:-1]) + 1, 65)
+    except Exception:
+        pass
+    hdr = resp.headers.get("retry-after")
+    if hdr and hdr.isdigit():
+        return min(float(hdr) + 1, 65)
+    return min(12 * (attempt + 1), 65)
 
 
 def _sane(box: dict) -> dict | None:
