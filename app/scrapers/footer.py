@@ -80,7 +80,11 @@ def add_footer(
             fill=(150, 150, 150),
         )
 
-        canvas.save(image_path)
+        # PIL's default JPEG quality (75) visibly softens newsprint — save high.
+        if str(image_path).lower().endswith((".jpg", ".jpeg")):
+            canvas.save(image_path, quality=92, subsampling=1)
+        else:
+            canvas.save(image_path)
         return True
     except Exception as exc:  # pragma: no cover
         logger.warning("Footer overlay failed for %s: %s", image_path, exc)

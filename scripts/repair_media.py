@@ -36,6 +36,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill-rounds", type=int, default=3,
                     help="website screenshot re-capture rounds (40 shots each)")
+    ap.add_argument("--reclip-epaper", action="store_true",
+                    help="cut press-clippings for existing e-paper detections "
+                         "(vision-located, verified; full page kept as fallback)")
     args = ap.parse_args()
 
     init_db()
@@ -72,6 +75,42 @@ def main() -> None:
             session.commit()
             rebuilt += bool(shot)
         print(f"[2/3] e-paper detection shots rebuilt: {rebuilt}")
+
+        # -- 2b. optional: press-clippings for existing e-paper detections ---
+        if args.reclip_epaper:
+            import time as _t
+
+            from app.db.models import Keyword
+            from app.epaper import clip as _clip
+            from app.epaper.pipeline import _snippet
+
+            langs = {k.text: k.language for k in session.execute(select(Keyword)).scalars()}
+            clipped = 0
+            ep_mentions = session.execute(
+                select(Mention).where(Mention.module == "epaper")).scalars().all()
+            for i, m in enumerate(ep_mentions):
+                row = by_key.get(m.external_id)
+                if not (row and _alive(row.image_path) and (m.matched_keywords or [])):
+                    continue
+                already_clip = (m.screenshot_path and "_clip_" in m.screenshot_path
+                                and _alive(m.screenshot_path))
+                if already_clip:
+                    continue
+                if i:
+                    _t.sleep(1.2)  # two vision calls per clipping — pace for rate limits
+                kw = m.matched_keywords[0]
+                c = _clip.make_clipping(row.image_path, kw,
+                                        _snippet(row.ocr_text, [kw]), row.source,
+                                        row.page_no, row.viewer_url or row.image_url,
+                                        language=langs.get(kw, "en"))
+                if c:
+                    if not (m.full_screenshot_path and _alive(m.full_screenshot_path)):
+                        m.full_screenshot_path = m.screenshot_path
+                    m.screenshot_path = c
+                    session.commit()
+                    clipped += 1
+            print(f"[2b ] press-clippings cut for existing detections: {clipped} "
+                  f"(of {len(ep_mentions)}; rejected crops keep the full page)")
 
         # -- 3. website screenshots -----------------------------------------
         cleared = 0

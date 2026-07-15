@@ -633,10 +633,16 @@ def _media_url(abs_path: str | None) -> str | None:
 
 def _detection_card(m: Mention) -> str:
     thumb = _media_url(m.screenshot_path) or _media_url(m.full_screenshot_path)
+    full = _media_url(m.full_screenshot_path)
     badge = ""
     if m.module == "epaper" and m.section:
         pg = m.section.rsplit("page", 1)[-1].strip()
-        badge = f'<span class="pagebadge">🗞 p.{html.escape(pg)}</span>'
+        # Card shows the clipping; the badge opens the FULL page in the viewer.
+        if full and full != thumb:
+            badge = (f'<span class="pagebadge zoom" style="cursor:zoom-in" '
+                     f'data-full="{full}" title="Open the full page">🗞 p.{html.escape(pg)} · full</span>')
+        else:
+            badge = f'<span class="pagebadge">🗞 p.{html.escape(pg)}</span>'
     img = (f'<div class="shot">{badge}<img loading="lazy" class="zoom" src="{thumb}" '
            f'data-full="{thumb}"></div>') if thumb else ""
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in (m.matched_keywords or []))

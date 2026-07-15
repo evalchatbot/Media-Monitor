@@ -64,6 +64,7 @@ class BaseScraper:
     _pw = None
     _browser = None
     _context = None
+    _shot_context = None  # separate context: 2x scale + media allowed (screenshots only)
     _robots_cache: dict[str, urllib.robotparser.RobotFileParser] = field(default_factory=dict)
 
     # -- Browser lifecycle -----------------------------------------------
@@ -104,9 +105,28 @@ class BaseScraper:
                 else route.continue_(),
             )
 
+    def _ensure_shot_context(self):
+        """Context used ONLY for screenshots: 2x pixel density for crisp text
+        and media UNBLOCKED so articles look like the real page. Scans keep the
+        lean media-blocked context; screenshots are few, so the extra weight is
+        paid exactly where it buys quality."""
+        if self._shot_context is not None:
+            return
+        self._ensure_browser()
+        from config import settings
+
+        self._shot_context = self._browser.new_context(
+            user_agent=_USER_AGENT,
+            viewport={"width": 1280, "height": 1500},
+            device_scale_factor=max(1, settings.screenshot_scale),
+            locale="en-US",
+        )
+
     def close(self) -> None:
         """Tear down the browser. Always call in a finally after a scan."""
         try:
+            if self._shot_context:
+                self._shot_context.close()
             if self._context:
                 self._context.close()
             if self._browser:
@@ -116,7 +136,7 @@ class BaseScraper:
         except Exception:  # pragma: no cover
             pass
         finally:
-            self._context = self._browser = self._pw = None
+            self._shot_context = self._context = self._browser = self._pw = None
 
     # -- robots.txt ------------------------------------------------------
     def _robots_allows(self, url: str) -> bool:
@@ -208,7 +228,7 @@ class BaseScraper:
         late-rendering element — the right trade for backfill passes.
         """
         try:
-            self._ensure_browser()
+            self._ensure_shot_context()
         except Exception as exc:
             logger.warning("Browser unavailable; skipping screenshots: %s", exc)
             return None, None
@@ -220,7 +240,7 @@ class BaseScraper:
         full_path = out_dir / f"{stem}_full.png"
         crop_path = out_dir / f"{stem}.png"
 
-        page = self._context.new_page()
+        page = self._shot_context.new_page()
         try:
             # Never `networkidle`: ad/tracker sockets keep the network busy
             # forever on these sites, so it reliably times out.

@@ -66,10 +66,11 @@ class Settings(BaseSettings):
     # Full-page screenshots of long articles allocate large bitmaps (memory
     # spikes). Off by default — the cropped article shot is what's displayed.
     capture_full_page_screenshots: bool = False
-    # Block images/media/fonts while scraping: big memory + speed win, keeps the
-    # browser lean so it won't destabilise the web server. Screenshots become
-    # text-only (still readable). Set false for image-rich screenshots.
+    # Block images/media/fonts while SCRAPING (listing/body fetches): big memory
+    # + speed win. Screenshots use their own context with media loaded.
     block_media_in_scans: bool = True
+    # Device pixel ratio for screenshots (2 = retina-crisp text; 1 = lighter).
+    screenshot_scale: int = 2
 
     # --- Notifications ---
     notifier: str = "console"
@@ -81,7 +82,8 @@ class Settings(BaseSettings):
     # Groq (default provider when set): powers e-paper page reading (vision)
     # and relevance/sentiment scoring. Llama-4 multimodal models.
     groq_api_key: str = ""
-    groq_model: str = "meta-llama/llama-4-maverick-17b-128e-instruct"
+    # Scout is the Llama-4 vision model generally available on Groq accounts.
+    groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     # Anthropic (used when no Groq key is set).
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"   # current latest; override via LLM_MODEL

@@ -194,6 +194,18 @@ def match_stored_pages(session, keywords, notifier, summary,
         scored = scoring.score(f"{row.source} e-paper page {row.page_no}",
                                row.ocr_text, matched_kw) or {}
         shot = _detection_shot(row)
+        # Press-clipping: cut the matched item out of the page (verified crop).
+        # Card shows the clipping; the stamped full page stays a click away.
+        kw_lang = {m.keyword: m.language for m in matches}
+        clipping = None
+        if row.image_path:
+            from app.epaper import clip as _clip
+
+            clipping = _clip.make_clipping(
+                row.image_path, matched_kw[0], snippet, row.source,
+                row.page_no, row.viewer_url or row.image_url,
+                language=kw_lang.get(matched_kw[0], "en"),
+            )
         mention = Mention(
             module="epaper",
             external_id=ext_id,
@@ -206,7 +218,8 @@ def match_stored_pages(session, keywords, notifier, summary,
             summary=scored.get("summary") or snippet,
             relevance=scored.get("relevance"),
             sentiment=scored.get("sentiment"),
-            screenshot_path=shot,
+            screenshot_path=clipping or shot,
+            full_screenshot_path=shot,
         )
         session.add(mention)
         try:
