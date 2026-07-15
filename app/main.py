@@ -303,6 +303,10 @@ tbody tr:hover{background:var(--surface-2)}
 .det .ttl{font-weight:700;line-height:1.35;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
 .det .ttl:hover{opacity:.7}
 .det .meta{color:var(--faint);font-size:.78rem;font-weight:500}
+.det .excerpt{color:var(--muted);font-size:.82rem;line-height:1.5;max-height:3.9em;overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+mark{background:#ffe600;color:#141414;border-radius:3px;padding:0 .12em;font-weight:700}
+@media (prefers-color-scheme:dark){mark{background:#ffd23f;color:#141414}}
 
 /* ===== Newspapers page ===== */
 .papers{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:1rem;margin-bottom:1.4rem}
@@ -631,6 +635,42 @@ def _media_url(abs_path: str | None) -> str | None:
         return None
 
 
+def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
+    """HTML-escaped excerpt with each matched keyword wrapped in <mark>, so the
+    card shows exactly what hit — works for website articles and e-paper text
+    alike. Matches the keyword and its normalized form, case-insensitively."""
+    if not text:
+        return ""
+    import re as _re
+
+    from app.core.keywords import normalize
+
+    # Strip markdown artifacts the vision OCR emits (## headers, ** bold, etc.).
+    text = _re.sub(r"[#*`_]{1,}", " ", text)
+    text = _re.sub(r"\s{2,}", " ", text).strip()
+    variants = set()
+    for kw in keywords or []:
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        variants.add(kw)
+        for lang in ("en", "ur"):
+            nk = normalize(kw, lang)
+            if nk:
+                variants.add(nk)
+    if not variants:
+        return html.escape(text)
+    pat = _re.compile("(" + "|".join(_re.escape(v) for v in
+                      sorted(variants, key=len, reverse=True)) + ")", _re.IGNORECASE)
+    out, i = [], 0
+    for mt in pat.finditer(text):
+        out.append(html.escape(text[i:mt.start()]))
+        out.append(f"<mark>{html.escape(mt.group(0))}</mark>")
+        i = mt.end()
+    out.append(html.escape(text[i:]))
+    return "".join(out)
+
+
 def _detection_card(m: Mention) -> str:
     thumb = _media_url(m.screenshot_path) or _media_url(m.full_screenshot_path)
     full = _media_url(m.full_screenshot_path)
@@ -649,8 +689,11 @@ def _detection_card(m: Mention) -> str:
     when = m.detected_at.astimezone(_PKT).strftime("%d %b %Y, %H:%M") if m.detected_at else ""
     icon = "🗞 E-Paper" if m.module == "epaper" else "📰"
     meta = " · ".join(x for x in [icon, m.source, m.sentiment, when] if x)
+    excerpt = _highlight_excerpt(m.snippet, m.matched_keywords or [])
+    excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
     return (f'<div class="det">{img}<div class="body">'
             f'<a class="ttl" href="{html.escape(m.url)}" target="_blank">{html.escape(m.title)}</a>'
+            f'{excerpt_html}'
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
 
 

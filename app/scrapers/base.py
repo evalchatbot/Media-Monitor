@@ -29,6 +29,46 @@ _USER_AGENT = (
 # Bot identity we present to robots.txt (we still honour its rules).
 _ROBOTS_AGENT = "MediaMonitorBot"
 
+# Injected before a screenshot: wrap keyword hits in a bright <mark> and scroll
+# the first into view. Substring/case-insensitive match (Urdu is matched as
+# typed); DOM-safe (skips script/style, caps replacements, one settle).
+_HIGHLIGHT_JS = r"""(arg) => {
+  const kws = (arg.kws || []).map(k => (k||'').trim()).filter(Boolean);
+  if (!kws.length) return 0;
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rx = new RegExp('(' + kws.map(esc).join('|') + ')', 'gi');
+  const low = kws.map(k => k.toLowerCase());
+  const root = document.querySelector(arg.sel) || document.body;
+  if (!root) return 0;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const hits = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    const v = node.nodeValue;
+    if (!v) continue;
+    const p = node.parentNode;
+    if (!p) continue;
+    const tag = p.nodeName;
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'MARK' || tag === 'TEXTAREA') continue;
+    const lv = v.toLowerCase();
+    if (low.some(k => lv.includes(k))) hits.push(node);
+  }
+  let count = 0, first = null;
+  for (const n of hits) {
+    const span = document.createElement('span');
+    span.innerHTML = n.nodeValue.replace(rx, '<mark class="__mm">$1</mark>');
+    n.parentNode.replaceChild(span, n);
+    if (!first) first = span.querySelector('mark.__mm');
+    if (++count >= 250) break;
+  }
+  const st = document.createElement('style');
+  st.textContent = 'mark.__mm{background:#ffe600 !important;color:#111 !important;' +
+    'padding:0 .12em;border-radius:2px;box-shadow:0 0 0 2px #ffe600;font-weight:700}';
+  document.head.appendChild(st);
+  if (first) first.scrollIntoView({block: 'center', inline: 'nearest'});
+  return count;
+}"""
+
 
 class ScrapeBlockedError(RuntimeError):
     """Raised when robots.txt disallows a target URL."""
@@ -218,6 +258,7 @@ class BaseScraper:
         out_dir: Path,
         crop_selector: str | None = None,
         wait_until: str = "load",
+        highlight: list[str] | None = None,
     ) -> tuple[Path | None, Path | None]:
         """Capture (full_page_png, cropped_article_png).
 
@@ -246,6 +287,17 @@ class BaseScraper:
             # forever on these sites, so it reliably times out.
             page.goto(article.url, wait_until=wait_until, timeout=45000)
             page.wait_for_timeout(1500)  # let layout/images settle
+
+            # Highlight the matched keyword(s) in the live page and scroll the
+            # first hit into view, so the screenshot shows WHERE the match is.
+            if highlight:
+                try:
+                    n = page.evaluate(_HIGHLIGHT_JS,
+                                      {"kws": highlight, "sel": crop_selector or "body"})
+                    if n:
+                        page.wait_for_timeout(350)
+                except Exception as exc:
+                    logger.debug("highlight injection skipped: %s", exc)
 
             from config import settings
 

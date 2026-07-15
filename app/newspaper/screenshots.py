@@ -60,6 +60,7 @@ def backfill_screenshots(limit: int = 25) -> dict:
                             art, settings.storage_dir / sc.name,
                             getattr(sc, "ARTICLE_CROP_SELECTOR", None),
                             wait_until="domcontentloaded",
+                            highlight=m.matched_keywords or [],
                         )
                     except Exception as exc:
                         logger.warning("backfill: screenshot failed for %s: %s", m.url, exc)

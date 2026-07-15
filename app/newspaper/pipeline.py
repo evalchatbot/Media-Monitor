@@ -359,7 +359,8 @@ def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, sum
                       external_id=ca.external_id)
         crop_selector = getattr(scraper, "ARTICLE_CROP_SELECTOR", None)
         full_path, crop_path = scraper.capture_screenshots(
-            art, settings.storage_dir / scraper.name, crop_selector
+            art, settings.storage_dir / scraper.name, crop_selector,
+            highlight=matched_kw,
         )
 
     mention = Mention(

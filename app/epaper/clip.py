@@ -84,9 +84,13 @@ Inspect the EDGES. Respond ONLY with JSON:
 "cut_left": true|false, "cut_right": true|false}}
 A side is "cut" when text/columns of THIS item continue past that edge."""
 
-_VERIFY_PROMPT = """This image is a clipping from a newspaper page. Does it contain
-this text (or its headline){lang_hint}: "{needle}"?
-Respond ONLY with JSON: {{"contains": true|false}}"""
+_VERIFY_PROMPT = """This image is a clipping cut from a newspaper page.
+1) Does it contain this passage or its headline{lang_hint}: "{needle}"?
+2) If yes, give the bounding box around ONE clear occurrence of the exact term
+   "{keyword}" inside it (prefer an occurrence in a headline; a tight box around
+   just those words, not the whole article).
+Respond ONLY with JSON: {{"contains": true|false, "box_2d": [ymin, xmin, ymax, xmax]}}
+box_2d normalized 0-1000, or null if that term isn't visible."""
 
 
 # ------------------------------------------------------------------ public --
@@ -131,11 +135,21 @@ def make_clipping(page_path: str | Path, keyword: str, snippet: str,
             if not _crop(page_path, box, out):
                 break
 
-    v = _ask_json(_VERIFY_PROMPT.format(needle=needle, lang_hint=hint), out)
+    v = _ask_json(_VERIFY_PROMPT.format(needle=needle, keyword=keyword[:60], lang_hint=hint), out)
     if not (v and v.get("contains")):
         out.unlink(missing_ok=True)
         logger.info("clip rejected on verification (%s p%s, %r)", source, page_no, keyword)
         return None
+
+    # Upscale + sharpen so low-res source scans (Dawn is only 660px wide) read
+    # crisply instead of being blurred bigger by the browser.
+    _enhance(out)
+    # Highlight the matched term on the clip (Gemini returns its box in verify —
+    # free, no extra call). A slightly-off highlighter smear reads worse than a
+    # box outline, so we outline.
+    kwbox = _box2d(v.get("box_2d")) if use_gemini else None
+    if kwbox:
+        _highlight(out, kwbox)
 
     from app.scrapers.footer import add_footer
 
@@ -361,7 +375,20 @@ def _sane(box: dict) -> dict | None:
     return box
 
 
+def _box2d(v) -> dict | None:
+    """Gemini box_2d [ymin,xmin,ymax,xmax] (0-1000) -> percent dict."""
+    try:
+        ymin, xmin, ymax, xmax = [float(x) / 10 for x in v]
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= xmin < xmax <= 100 and 0 <= ymin < ymax <= 100):
+        return None
+    return {"l": xmin, "t": ymin, "r": xmax, "b": ymax}
+
+
 def _crop(src: Path, box: dict, out: Path, pad_pct: float = 2.0) -> bool:
+    """Crop the ORIGINAL scan at full resolution (clean; enhancement is a later,
+    single step so repair re-crops don't compound)."""
     try:
         from PIL import Image
 
@@ -373,8 +400,56 @@ def _crop(src: Path, box: dict, out: Path, pad_pct: float = 2.0) -> bool:
         b = min(H, int((box["b"] + pad_pct) / 100 * H))
         if r - l < 40 or b - t < 40:
             return False
-        img.crop((l, t, r, b)).save(out, quality=92, subsampling=1)
+        img.crop((l, t, r, b)).save(out, quality=95, subsampling=0)
         return True
     except Exception as exc:
         logger.warning("clip crop failed for %s: %s", src, exc)
         return False
+
+
+_TARGET_W = 1500  # display width clips are brought up to
+
+
+def _enhance(path: Path) -> None:
+    """Upscale small clips to a consistent display width and sharpen, so text
+    from low-res source scans stays legible. Saved 4:4:4 q95 (crisp text edges)."""
+    try:
+        from PIL import Image, ImageFilter
+
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        if w < _TARGET_W:
+            img = img.resize((_TARGET_W, round(h * _TARGET_W / w)), Image.LANCZOS)
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=95, threshold=2))
+        img.save(path, quality=95, subsampling=0)
+    except Exception as exc:
+        logger.warning("clip enhance failed for %s: %s", path, exc)
+
+
+def _highlight(path: Path, box: dict) -> None:
+    """Outline the matched term's region (semi-transparent — never obscures)."""
+    try:
+        from PIL import Image, ImageDraw
+
+        img = Image.open(path).convert("RGB")
+        W, H = img.size
+        pad_x, pad_y = W * 0.006, H * 0.004
+        l = max(0, box["l"] / 100 * W - pad_x)
+        t = max(0, box["t"] / 100 * H - pad_y)
+        r = min(W, box["r"] / 100 * W + pad_x)
+        b = min(H, box["b"] / 100 * H + pad_y)
+        if r - l < 4 or b - t < 4:
+            return
+        # If the "term" box covers most of the clip, the model didn't pinpoint —
+        # skip rather than frame the whole article.
+        if (box["r"] - box["l"]) * (box["b"] - box["t"]) > 55 * 100:
+            return
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        od.rectangle([l, t, r, b], fill=(255, 231, 0, 46))          # faint highlighter
+        line = max(3, int(H / 320))
+        od.rectangle([l, t, r, b], outline=(230, 150, 0, 235), width=line)  # amber frame
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        img.save(path, quality=95, subsampling=0)
+    except Exception as exc:
+        logger.warning("clip highlight failed for %s: %s", path, exc)
