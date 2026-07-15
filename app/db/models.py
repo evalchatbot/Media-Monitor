@@ -135,6 +135,9 @@ class EPaperPage(Base):
     image_path: Mapped[str | None] = mapped_column(Text, nullable=True)  # local copy
     viewer_url: Mapped[str] = mapped_column(Text, default="")         # human-facing page link
     ocr_text: Mapped[str] = mapped_column(Text, default="")
+    # For papers that expose a publisher image-map: [{"box":{l,t,r,b %},"text"}],
+    # one per article — used for exact, AI-free press clippings.
+    regions: Mapped[list] = mapped_column(JSON, default=list)
     # 'pending' (not read yet) | 'done' | 'failed' | 'no_key' (needs ANTHROPIC_API_KEY)
     ocr_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

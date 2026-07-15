@@ -94,6 +94,23 @@ box_2d normalized 0-1000, or null if that term isn't visible."""
 
 
 # ------------------------------------------------------------------ public --
+def clip_from_box(page_path: str | Path, box: dict, source: str, page_no: int,
+                  link: str) -> str | None:
+    """Crop an EXACT, publisher-provided article box (from an image-map) — no AI.
+    Enhanced + footer-stamped like a vision clip. `box` is percent {l,t,r,b}."""
+    page_path = Path(page_path)
+    if not page_path.exists():
+        return None
+    out = page_path.with_name(f"{page_path.stem}_clip_{abs(hash((box['l'], box['t']))) % 99999}.jpg")
+    if not _crop(page_path, box, out, pad_pct=1.0):
+        return None
+    _enhance(out)
+    from app.scrapers.footer import add_footer
+
+    add_footer(out, source, f"E-Paper p{page_no} · clipping", link)
+    return str(out)
+
+
 def make_clipping(page_path: str | Path, keyword: str, snippet: str,
                   source: str, page_no: int, link: str,
                   language: str = "en") -> str | None:

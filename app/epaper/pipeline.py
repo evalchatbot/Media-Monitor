@@ -123,17 +123,31 @@ def _read_pages(session, summary) -> None:
     ).order_by(EPaperPage.date.desc(), EPaperPage.page_no)).scalars().all()
     if not pending:
         return
+
+    from app.epaper import imagemap
+
+    # 1) Papers with a publisher image-map: exact regions + clean article text,
+    #    straight from the page — no LLM, no key, no rate limit.
+    map_pages = [p for p in pending if imagemap.supports(p.paper)]
+    for row in map_pages:
+        if _read_via_map(session, row, summary):
+            summary["read"] = summary.get("read", 0) + 1
+
+    # 2) Everything else needs the vision reader (a key).
+    vision = [p for p in pending if not imagemap.supports(p.paper) and p.ocr_status != "done"]
+    if not vision:
+        return
     if not reader.has_key():
-        for row in pending:
+        for row in vision:
             if row.ocr_status != "no_key":
                 row.ocr_status = "no_key"
         session.commit()
-        summary["no_key"] = len(pending)
-        logger.info("e-paper: %d pages await ANTHROPIC_API_KEY for reading", len(pending))
+        summary["no_key"] = len(vision)
+        logger.info("e-paper: %d pages await a vision API key for reading", len(vision))
         return
     import time as _time
 
-    for i, row in enumerate(pending):
+    for i, row in enumerate(vision):
         if i:
             _time.sleep(1.2)  # stay well inside free-tier rate limits
         try:
@@ -144,6 +158,34 @@ def _read_pages(session, summary) -> None:
             logger.warning("e-paper read failed %s p%d: %s", row.paper, row.page_no, exc)
             row.ocr_status = "failed"
         session.commit()
+
+
+def _read_via_map(session, row, summary) -> bool:
+    """Populate a page's regions + text from the publisher image-map. Returns
+    True on success; leaves the row 'failed' (retryable) if the map is
+    unavailable this run (e.g. an ad-only page with no article regions)."""
+    from app.epaper import imagemap
+
+    try:
+        from PIL import Image
+
+        with Image.open(row.image_path) as im:
+            w, h = im.size
+    except Exception:
+        row.ocr_status = "failed"
+        session.commit()
+        return False
+    res = imagemap.extract(row.paper, row.viewer_url, w, h)
+    if not res:
+        row.ocr_status = "failed"
+        session.commit()
+        return False
+    regions, page_text = res
+    row.regions = [{"box": r.box, "text": r.text} for r in regions]
+    row.ocr_text = page_text
+    row.ocr_status = "done"
+    session.commit()
+    return True
 
 
 # ------------------------------------------------------------------ match ---
@@ -197,15 +239,7 @@ def match_stored_pages(session, keywords, notifier, summary,
         # Press-clipping: cut the matched item out of the page (verified crop).
         # Card shows the clipping; the stamped full page stays a click away.
         kw_lang = {m.keyword: m.language for m in matches}
-        clipping = None
-        if row.image_path:
-            from app.epaper import clip as _clip
-
-            clipping = _clip.make_clipping(
-                row.image_path, matched_kw[0], snippet, row.source,
-                row.page_no, row.viewer_url or row.image_url,
-                language=kw_lang.get(matched_kw[0], "en"),
-            )
+        clipping = _make_clip(row, matched_kw, kw_lang, snippet)
         mention = Mention(
             module="epaper",
             external_id=ext_id,
@@ -229,6 +263,32 @@ def match_stored_pages(session, keywords, notifier, summary,
             continue
         summary["mentions"] += 1
         _alert(notifier, session, mention, matched_kw, summary)
+
+
+def _make_clip(row: EPaperPage, matched_kw: list[str], kw_lang: dict,
+               snippet: str) -> str | None:
+    """A press-clipping for this detection, best method first:
+    1. EXACT — if the page has publisher image-map regions, find the region
+       whose text matches the keyword and crop it precisely (no AI).
+    2. VISION — otherwise ask the vision model to locate + verify a crop.
+    Returns a clip path, or None (caller falls back to the full page)."""
+    if not row.image_path:
+        return None
+    from app.epaper import clip as _clip
+
+    link = row.viewer_url or row.image_url
+    # 1) exact region crop
+    for kw in matched_kw:
+        lang = kw_lang.get(kw, "en")
+        for reg in (row.regions or []):
+            text, box = reg.get("text"), reg.get("box")
+            if text and box and find_matches(text, [(kw, lang)]):
+                clip = _clip.clip_from_box(row.image_path, box, row.source, row.page_no, link)
+                if clip:
+                    return clip
+    # 2) vision fallback
+    return _clip.make_clipping(row.image_path, matched_kw[0], snippet, row.source,
+                               row.page_no, link, language=kw_lang.get(matched_kw[0], "en"))
 
 
 def _detection_shot(row: EPaperPage) -> str | None:

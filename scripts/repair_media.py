@@ -84,11 +84,21 @@ def main() -> None:
         if args.reclip_epaper:
             import time as _t
 
+            from PIL import Image
+
             from app.db.models import Keyword
-            from app.epaper import clip as _clip
-            from app.epaper.pipeline import _snippet
+            from app.epaper import clip as _clip, imagemap
+            from app.epaper.pipeline import _make_clip, _read_via_map, _snippet
 
             langs = {k.text: k.language for k in session.execute(select(Keyword)).scalars()}
+
+            # First, populate image-map regions for supported papers (Jang / The
+            # News) — cheap httpx, so their clips are exact and AI-free.
+            for row in by_key.values():
+                if imagemap.supports(row.paper) and not (row.regions and _alive(row.image_path)):
+                    if _alive(row.image_path):
+                        _read_via_map(session, row, {})
+
             clipped = rl_streak = done_first = 0
             stopped = False
             ep_mentions = session.execute(
@@ -100,14 +110,13 @@ def main() -> None:
                              and _alive(m.screenshot_path) and not args.force)]
             for m in todo:
                 row = by_key[m.external_id]
-                if done_first:
-                    _t.sleep(4.0 if settings.gemini_api_key else 1.2)
+                is_map = bool(row.regions)
+                if done_first and not is_map:
+                    _t.sleep(4.0 if settings.gemini_api_key else 1.2)  # pace vision only
                 done_first = 1
-                kw = m.matched_keywords[0]
-                c = _clip.make_clipping(row.image_path, kw,
-                                        _snippet(row.ocr_text, [kw]), row.source,
-                                        row.page_no, row.viewer_url or row.image_url,
-                                        language=langs.get(kw, "en"))
+                kw_lang = {kw: langs.get(kw, "en") for kw in m.matched_keywords}
+                c = _make_clip(row, m.matched_keywords, kw_lang,
+                               _snippet(row.ocr_text, m.matched_keywords))
                 if c:
                     if not (m.full_screenshot_path and _alive(m.full_screenshot_path)):
                         m.full_screenshot_path = m.screenshot_path

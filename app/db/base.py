@@ -53,6 +53,24 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite(models)
+    _ensure_columns()
+
+
+def _ensure_columns() -> None:
+    """Add columns introduced after a table already exists (create_all won't
+    ALTER). Portable across SQLite and Postgres/Supabase."""
+    from sqlalchemy import inspect
+
+    insp = inspect(engine)
+    if "epaper_pages" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("epaper_pages")}
+    if "regions" not in cols:
+        json_t = "jsonb" if engine.dialect.name == "postgresql" else "json"
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"ALTER TABLE epaper_pages ADD COLUMN regions {json_t} DEFAULT '[]'"
+            )
 
 
 def _migrate_sqlite(models) -> None:

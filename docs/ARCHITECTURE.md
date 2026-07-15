@@ -90,12 +90,25 @@ Geo** (TV channels — no print edition). Pages upload progressively through the
 morning, so adapters probe every page number up to `EPAPER_MAX_PAGES` and keep
 what exists; the next scheduled cycle picks up late pages.
 
-**Reading:** a page scan is an image (Urdu papers in Nastaliq — beyond
-conventional OCR), so `app/epaper/reader.py` sends each page once to Claude
-vision and caches the extraction on `EPaperPage.ocr_text`. Matching — including
-keywords added later — runs on the cached text with the same matcher websites
-use. Without `ANTHROPIC_API_KEY`, pages are still fetched and browsable
-(`ocr_status='no_key'`); they're read automatically once the key appears.
+**Reading & clipping — two paths, best first:**
+
+1. **Image-map (Jang, The News)** — `app/epaper/imagemap.py`. These platforms
+   ship an HTML `<area>` map: one region per article, whose polygon is the
+   article's exact box (in the same pixel space as the page scan we download)
+   and whose link points at a detail page with clean article text. So we skip
+   OCR/vision entirely: store per-article regions + text (`EPaperPage.regions`,
+   `ocr_text`), match keywords on the clean text, and cut the matched article by
+   cropping its exact polygon. Pure httpx — no LLM, no key, no rate limit,
+   pixel-perfect cutouts.
+2. **Vision (Dawn, Express, and any paper without a usable map)** —
+   `app/epaper/reader.py` sends each page once to a vision model (Groq Llama-4,
+   or Claude) and caches the text on `EPaperPage.ocr_text`; `app/epaper/clip.py`
+   then locates + verifies a crop (grid method for weak models; native boxes
+   with Gemini). Without any vision key, pages are still fetched and browsable
+   (`ocr_status='no_key'`) and read once a key appears.
+
+Both paths feed the same matcher and produce the same detections; a clip falls
+back to the stamped full page if neither method yields a confident crop.
 
 ## Key design decisions (diverge from the original brief — intentional, for a local Windows build)
 

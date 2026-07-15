@@ -84,6 +84,7 @@ create table if not exists epaper_pages (
     viewer_url  text         not null default '',
     ocr_text    text         not null default '',
     ocr_status  varchar(16)  not null default 'pending', -- pending|done|failed|no_key
+    regions     jsonb        not null default '[]'::jsonb, -- [{box:{l,t,r,b %}, text}] per article (image-map papers)
     fetched_at  timestamptz  not null default now(),
     constraint uq_epaper_page unique (paper, city, date, page_no)
 );
