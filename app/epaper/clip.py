@@ -158,8 +158,7 @@ def make_clipping(page_path: str | Path, keyword: str, snippet: str,
         logger.info("clip rejected on verification (%s p%s, %r)", source, page_no, keyword)
         return None
 
-    # Upscale + sharpen so low-res source scans (Dawn is only 660px wide) read
-    # crisply instead of being blurred bigger by the browser.
+    # Light contrast pass so low-res source scans read clearly without mushy upscaling.
     _enhance(out)
     # Highlight the matched term on the clip (Gemini returns its box in verify —
     # free, no extra call). A slightly-off highlighter smear reads worse than a
@@ -424,32 +423,44 @@ def _crop(src: Path, box: dict, out: Path, pad_pct: float = 2.0) -> bool:
         return False
 
 
-_TARGET_W = 1700   # display width clips are brought up to
-_MAX_SCALE = 3.2   # don't over-upscale a tiny crop into mush
+# Gentle contrast only — aggressive upscaling turns newsprint crops into mush.
+_MIN_W = 500       # only upscale crops narrower than this
+_MAX_SCALE = 1.15  # at most 15% larger; keeps letter shapes intact
 
 
 def _enhance(path: Path) -> None:
-    """Make a scanned-newsprint crop as legible as the source allows: upscale to
-    a consistent display width, then a contrast + sharpen pass tuned for text —
-    gray newsprint is stretched so ink goes dark and paper goes white (the
-    biggest perceived-quality gain), and edges are crisped. Saved 4:4:4 q95."""
-    try:
-        from PIL import Image, ImageFilter, ImageOps
+    """Light contrast pass for scanned newsprint — no heavy upscaling.
 
-        img = Image.open(path).convert("RGB")
-        w, h = img.size
-        if w < _TARGET_W:
-            scale = min(_TARGET_W / w, _MAX_SCALE)
-            # A tiny pre-denoise stops the upscaler amplifying JPEG blocking on
-            # the lowest-res scans (Dawn); skipped when the crop is already big.
-            if w < 700:
-                img = img.filter(ImageFilter.MedianFilter(3))
-            img = img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
-        # Stretch levels (tone-preserving): clip 0.4% tails so faded ink blackens
-        # and the page whitens — makes text pop without wrecking photos.
-        img = ImageOps.autocontrast(img, cutoff=(0.4, 0.2), preserve_tone=True)
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.7, percent=115, threshold=2))
-        img.save(path, quality=95, subsampling=0)
+    A subtle CLAHE on luminance darkens ink and whitens paper without the
+    interpolation blur that comes from stretching a small crop to 1700px."""
+    try:
+        import cv2
+
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        h, w = img.shape[:2]
+
+        if w < _MIN_W:
+            scale = min(_MIN_W / w, _MAX_SCALE)
+            if scale > 1.0:
+                img = cv2.resize(
+                    img,
+                    (round(w * scale), round(h * scale)),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        # Very light unsharp mask — crisp edges without halos.
+        blurred = cv2.GaussianBlur(img, (0, 0), 0.8)
+        img = cv2.addWeighted(img, 1.12, blurred, -0.12, 0)
+
+        cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     except Exception as exc:
         logger.warning("clip enhance failed for %s: %s", path, exc)
 

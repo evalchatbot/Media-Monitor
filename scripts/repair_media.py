@@ -11,6 +11,7 @@ render without images. This one-shot repair, run ON the new host:
    (bounded backfill rounds; scheduled scans keep topping up afterwards)
 
 Usage:  python -m scripts.repair_media [--backfill-rounds 3]
+        python -m scripts.repair_media --re-enhance-epaper   # fix existing clips
 """
 from __future__ import annotations
 
@@ -40,10 +41,18 @@ def main() -> None:
     ap.add_argument("--reclip-epaper", action="store_true",
                     help="cut press-clippings for existing e-paper detections "
                          "(vision-located, verified; full page kept as fallback)")
+    ap.add_argument("--re-enhance-epaper", action="store_true",
+                    help="re-cut ALL existing e-paper clippings from original "
+                         "page scans with the current contrast enhancement "
+                         "(same as --reclip-epaper --force; use on Railway "
+                         "after fixing upscaling)")
     ap.add_argument("--force", action="store_true",
                     help="with --reclip-epaper: redo detections that already "
                          "have a clipping (use after improving the clipper)")
     args = ap.parse_args()
+    if args.re_enhance_epaper:
+        args.reclip_epaper = True
+        args.force = True
 
     init_db()
     from app.epaper import pipeline as ep

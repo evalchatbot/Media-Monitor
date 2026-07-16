@@ -31,3 +31,4 @@ anthropic==0.42.0
 
 # --- Screenshot footer overlay + e-paper image handling ---
 pillow==11.1.0
+opencv-python-headless==4.10.0.84
