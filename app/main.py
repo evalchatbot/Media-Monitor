@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -35,6 +36,7 @@ from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
 from app.scrapers.sites import SITE_CONFIGS
 from app.scheduler import shutdown_scheduler, start_scheduler
+from app import sources_probe
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -240,6 +242,28 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   border-radius:var(--r-sm);padding:.75rem 1rem;margin-bottom:1rem;font-weight:600;font-size:.88rem}
 .banner.ok{background:var(--blue-soft);border-color:var(--blue-mist);color:var(--blue-deep)}
 
+/* Add-source modal */
+#src-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
+  padding:1rem;background:rgba(44,58,72,.45);backdrop-filter:blur(6px)}
+#src-modal.open{display:flex}
+#src-modal .box{width:min(440px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
+  border:1px solid var(--line);border-radius:var(--r);padding:1.35rem 1.4rem;box-shadow:var(--shadow)}
+#src-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
+#src-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem}
+#src-modal .kinds{display:flex;gap:.5rem;margin-bottom:.9rem}
+#src-modal .kinds label{flex:1;display:flex;align-items:center;justify-content:center;gap:.4rem;
+  padding:.65rem;border:1px solid var(--line);border-radius:var(--r-sm);background:#fffdf9;
+  cursor:pointer;font-weight:600;font-size:.88rem;text-transform:none;letter-spacing:0;margin:0}
+#src-modal .kinds label:has(input:checked){border-color:var(--blue);background:var(--blue-soft);color:var(--blue-deep)}
+#src-modal input[type=url],#src-modal input[type=text]{width:100%;padding:.65rem .9rem;margin-bottom:.7rem;
+  border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9}
+#src-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem}
+#src-modal #src-result{margin-top:.9rem;padding:.75rem .9rem;border-radius:var(--r-sm);font-size:.88rem;
+  font-weight:600;line-height:1.45;display:none}
+#src-modal #src-result.show{display:block}
+#src-modal #src-result.ok{background:var(--blue-soft);border:1px solid var(--blue-mist);color:var(--blue-deep)}
+#src-modal #src-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
+
 .spin{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;
   border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
 @keyframes s{to{transform:rotate(360deg)}}
@@ -366,6 +390,67 @@ _JS = """
     }catch(err){}
   }
   setInterval(poll,3000);
+
+  /* Add newspaper / e-paper modal */
+  var modal=document.getElementById('src-modal');
+  var openBtn=document.getElementById('papers-add');
+  var closeBtn=document.getElementById('src-close');
+  var checkBtn=document.getElementById('src-check');
+  var saveBtn=document.getElementById('src-save');
+  var result=document.getElementById('src-result');
+  var lastProbe=null;
+  function openModal(){
+    if(!modal)return;
+    modal.classList.add('open');
+    lastProbe=null;
+    if(result){result.className='';result.textContent='';result.classList.remove('show')}
+    if(saveBtn)saveBtn.style.display='none';
+  }
+  function closeModal(){if(modal)modal.classList.remove('open')}
+  if(openBtn)openBtn.addEventListener('click',openModal);
+  if(closeBtn)closeBtn.addEventListener('click',closeModal);
+  if(modal)modal.addEventListener('click',function(e){if(e.target===modal)closeModal()});
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'&&modal&&modal.classList.contains('open'))closeModal();
+  });
+  if(checkBtn)checkBtn.addEventListener('click',async function(){
+    var kind=(document.querySelector('input[name=src-kind]:checked')||{}).value;
+    var url=(document.getElementById('src-url')||{}).value||'';
+    var name=(document.getElementById('src-name')||{}).value||'';
+    checkBtn.disabled=true;checkBtn.innerHTML='<span class="spin"></span> Checking…';
+    try{
+      var r=await fetch('/api/probe-source',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:kind,url:url,name:name})}).then(function(x){return x.json()});
+      lastProbe=r;
+      if(result){
+        result.textContent=r.summary||'No result';
+        result.className='show '+(r.ok?'ok':'bad');
+      }
+      if(saveBtn)saveBtn.style.display=r.ok?'inline-flex':'none';
+    }catch(err){
+      if(result){result.textContent='Check failed — try again.';result.className='show bad'}
+      if(saveBtn)saveBtn.style.display='none';
+    }
+    checkBtn.disabled=false;checkBtn.textContent='Check link';
+  });
+  if(saveBtn)saveBtn.addEventListener('click',async function(){
+    if(!lastProbe||!lastProbe.ok)return;
+    var name=(document.getElementById('src-name')||{}).value||'';
+    var kind=(document.querySelector('input[name=src-kind]:checked')||{}).value;
+    saveBtn.disabled=true;
+    try{
+      var r=await fetch('/api/custom-sources',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name,kind:kind,url:lastProbe.url||(document.getElementById('src-url')||{}).value,
+          summary:lastProbe.summary,detail:lastProbe.detail||{}})}).then(function(x){return x.json()});
+      if(r.ok)location.reload();
+      else if(result){result.textContent=r.summary||'Could not save.';result.className='show bad'}
+    }catch(err){
+      if(result){result.textContent='Save failed.';result.className='show bad'}
+    }
+    saveBtn.disabled=false;
+  });
 })();
 """
 
@@ -375,6 +460,7 @@ def _paper_names() -> list[str]:
     names: list[str] = ["Dawn"]
     names.extend(c.source for c in SITE_CONFIGS)
     names.extend(meta[0] for meta in sources.SOURCES.values())
+    names.extend(r["name"] for r in sources_probe.custom_sources() if r.get("name"))
     out, seen = [], set()
     for n in names:
         if n not in seen:
@@ -473,7 +559,7 @@ def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
     return "".join(out)
 
 
-def _detection_card(m: Mention) -> str:
+def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> str:
     thumb = _media_url(m.screenshot_path) or _media_url(m.full_screenshot_path)
     full = _media_url(m.full_screenshot_path) or thumb
     badge = ""
@@ -492,11 +578,14 @@ def _detection_card(m: Mention) -> str:
                f'data-full="{zoom}" alt=""></div>')
     else:
         img = ('<div class="shot missing"><span class="noprev">No preview</span></div>')
-    tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in (m.matched_keywords or []))
+    # Only highlight the active filter keyword(s) — not every past match on the row.
+    hl = highlight_keywords if highlight_keywords is not None else (m.matched_keywords or [])
+    show_tags = hl if highlight_keywords is not None else (m.matched_keywords or [])
+    tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in show_tags)
     when = m.detected_at.astimezone(_PKT).strftime("%d %b %Y, %H:%M") if m.detected_at else ""
     kind = "E-Paper" if m.module == "epaper" else "Web"
     meta = " · ".join(x for x in [kind, m.source, m.sentiment, when] if x)
-    excerpt = _highlight_excerpt(m.snippet, m.matched_keywords or [])
+    excerpt = _highlight_excerpt(m.snippet, hl)
     excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
     return (f'<div class="det">{img}<div class="body">'
             f'<a class="ttl" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
@@ -589,8 +678,10 @@ def home(request: Request, db: Session = Depends(get_db)):
             ]
 
         shown = mentions[:80]
+        hl = [keyword] if keyword else None
         if shown:
-            grid = f'<div class="grid">{"".join(_detection_card(m) for m in shown)}</div>'
+            grid = (f'<div class="grid">'
+                    f'{"".join(_detection_card(m, highlight_keywords=hl) for m in shown)}</div>')
             more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
                     f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
         else:
@@ -662,6 +753,7 @@ def home(request: Request, db: Session = Depends(get_db)):
           <div class="paper-tools">
             <button type="button" class="ghost" id="papers-all">Select all</button>
             <button type="button" class="ghost" id="papers-none">Clear</button>
+            <button type="button" class="ghost" id="papers-add">+ Add more</button>
           </div>
           <div class="papers">{boxes}</div>
         </div>
@@ -671,6 +763,27 @@ def home(request: Request, db: Session = Depends(get_db)):
         </div>
         <p class="hint">Jobs and schedules are unchanged — this page only browses what they already found.</p>
       </form>
+    </div>
+    <div id="src-modal" role="dialog" aria-modal="true" aria-labelledby="src-title">
+      <div class="box">
+        <h3 id="src-title">Add a publication</h3>
+        <p class="sub">We check the link and tell you quickly whether it looks usable.</p>
+        <div class="kinds">
+          <label><input type="radio" name="src-kind" value="newspaper" checked> Newspaper</label>
+          <label><input type="radio" name="src-kind" value="epaper"> E-Paper</label>
+        </div>
+        <label class="cap" for="src-name" style="display:block;margin-bottom:.35rem">Display name</label>
+        <input type="text" id="src-name" placeholder="e.g. Geo News" maxlength="80">
+        <label class="cap" for="src-url" style="display:block;margin-bottom:.35rem">Link</label>
+        <input type="url" id="src-url" placeholder="https://…">
+        <div id="src-result"></div>
+        <div class="row-btns">
+          <button type="button" id="src-check">Check link</button>
+          <button type="button" id="src-save" style="display:none">Save to list</button>
+          <button type="button" class="ghost" id="src-close">Close</button>
+        </div>
+        <p class="hint" style="margin-top:.85rem">Saved names appear in the filter list. Full automatic scraping still needs a site adapter for most new papers.</p>
+      </div>
     </div>
     {results_html}
     """
@@ -785,6 +898,43 @@ def ui_clear_detections(db: Session = Depends(get_db)):
 # ==========================================================================
 # JSON API (unchanged — for scripts / poller)
 # ==========================================================================
+class _ProbeIn(BaseModel):
+    kind: str
+    url: str
+    name: str = ""
+
+
+class _CustomSourceIn(BaseModel):
+    name: str
+    kind: str
+    url: str
+    summary: str = ""
+    detail: dict = Field(default_factory=dict)
+
+
+@app.post("/api/probe-source")
+def api_probe_source(body: _ProbeIn):
+    """Check a newspaper or e-paper URL and return a short capability summary."""
+    return sources_probe.probe(body.kind, body.url)
+
+
+@app.post("/api/custom-sources")
+def api_save_custom_source(body: _CustomSourceIn):
+    name = body.name.strip()
+    if not name:
+        return {"ok": False, "summary": "Enter a display name before saving."}
+    if not body.url.startswith(("http://", "https://")):
+        return {"ok": False, "summary": "Need a valid URL to save."}
+    sources_probe.save_custom_source({
+        "name": name,
+        "kind": body.kind,
+        "url": body.url,
+        "summary": body.summary,
+        "detail": body.detail,
+    })
+    return {"ok": True, "summary": f"Saved “{name}” to the filter list."}
+
+
 @app.get("/api/keywords")
 def list_keywords(db: Session = Depends(get_db)):
     rows = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
