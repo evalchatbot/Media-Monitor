@@ -200,22 +200,38 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-bar{margin-top:.65rem}
 .kw-bar .cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;
   letter-spacing:.06em;margin-bottom:.4rem}
-.kw-tags{display:flex;flex-wrap:wrap;gap:.4rem}
-.kw-pick{display:inline-flex;align-items:center;padding:.28rem .7rem;border-radius:999px;
-  border:1px solid var(--line);background:#fffdf9;color:var(--ink);font-size:.8rem;font-weight:600;
-  cursor:pointer;font-family:inherit;box-shadow:none;transition:background .15s,border-color .15s,color .15s;font-weight:600}
-.kw-pick:hover{background:var(--blue-soft);border-color:var(--blue);color:var(--blue-deep);
-  transform:none;box-shadow:none;opacity:1}
-.kw-pick.on{background:var(--blue-deep);border-color:transparent;color:#fff;
+.kw-tags{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center}
+.kw-chip{display:inline-flex;align-items:stretch;border-radius:999px;overflow:hidden;
+  border:1px solid var(--line);background:#fffdf9;transition:border-color .15s,background .15s,box-shadow .15s}
+.kw-chip:hover{border-color:var(--blue);background:var(--blue-soft)}
+.kw-chip.on{border-color:transparent;background:var(--blue-deep);
   box-shadow:0 4px 12px -6px rgba(74,138,176,.55)}
-.kw-pick.on:hover{opacity:.95;background:var(--blue)}
-.kw-add{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;margin-top:0}
+.kw-pick{display:inline-flex;align-items:center;padding:.28rem .55rem .28rem .7rem;border:0;border-radius:0;
+  background:transparent;color:var(--ink);font-size:.8rem;font-weight:600;
+  cursor:pointer;font-family:inherit;box-shadow:none}
+.kw-pick:hover{transform:none;box-shadow:none;opacity:1;background:transparent}
+.kw-chip.on .kw-pick{color:#fff}
+.kw-chip.on:hover{background:var(--blue)}
+.kw-x{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;padding:0;
+  border:0;border-left:1px solid var(--line);border-radius:0;background:transparent;
+  color:var(--faint);font-size:.95rem;font-weight:700;line-height:1;cursor:pointer;
+  font-family:inherit;box-shadow:none}
+.kw-x:hover{background:rgba(176,69,43,.12);color:#b0452b;transform:none;box-shadow:none;opacity:1}
+.kw-chip.on .kw-x{border-left-color:rgba(255,255,255,.28);color:rgba(255,255,255,.85)}
+.kw-chip.on .kw-x:hover{background:rgba(0,0,0,.18);color:#fff}
+.kw-pick.kw-all{border:1px solid var(--line);border-radius:999px;padding:.28rem .7rem;background:#fffdf9}
+.kw-pick.kw-all.on{background:var(--blue-deep);border-color:transparent;color:#fff;
+  box-shadow:0 4px 12px -6px rgba(74,138,176,.55)}
+.kw-pick.kw-all:hover{background:var(--blue-soft);border-color:var(--blue);color:var(--blue-deep)}
+.kw-pick.kw-all.on:hover{background:var(--blue);color:#fff}
+.kw-add{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;margin:0}
 .cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
-.kw-add input{flex:1;min-width:140px;max-width:260px;padding:.45rem .75rem;border:1px solid var(--line-strong);
+.kw-add input{flex:1;min-width:160px;max-width:100%;padding:.65rem .9rem;border:1px solid var(--line-strong);
   border-radius:999px;font:inherit;background:#fffdf9;color:var(--ink)}
-.kw-add select{padding:.45rem .6rem;border:1px solid var(--line-strong);border-radius:999px;
+.kw-add input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px var(--blue-soft)}
+.kw-add select{padding:.65rem .7rem;border:1px solid var(--line-strong);border-radius:999px;
   font:inherit;background:#fffdf9;color:var(--ink)}
-.kw-add button{padding:.42rem .85rem;font-size:.8rem}
+.kw-add button{padding:.55rem 1rem;font-size:.88rem}
 mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-weight:700}
 
 .empty{color:var(--muted);text-align:center;padding:2.2rem 1.2rem;border:1.5px dashed var(--line-strong);
@@ -319,14 +335,17 @@ _JS = """
     document.querySelectorAll('input[name=paper]').forEach(function(c){c.checked=false});
   });
 
-  /* Watchlist tags → fill keyword + run search */
+  /* Watchlist tags → fill keyword + run search (× is a separate delete form) */
   var q=document.getElementById('q'), form=document.getElementById('search');
   document.querySelectorAll('.kw-pick').forEach(function(btn){
     btn.addEventListener('click',function(){
       if(!q||!form)return;
       q.value=btn.getAttribute('data-kw')||'';
-      document.querySelectorAll('.kw-pick').forEach(function(b){b.classList.remove('on')});
-      btn.classList.add('on');
+      document.querySelectorAll('.kw-chip,.kw-pick.kw-all').forEach(function(el){
+        el.classList.remove('on');
+      });
+      var chip=btn.closest('.kw-chip');
+      if(chip)chip.classList.add('on');else btn.classList.add('on');
       form.requestSubmit?form.requestSubmit():form.submit();
     });
   });
@@ -598,11 +617,15 @@ def home(request: Request, db: Session = Depends(get_db)):
     ).scalars().all()
     kw_l = keyword.casefold()
     kw_tags = (
-        f'<button type="button" class="kw-pick{" on" if not keyword else ""}" data-kw="">All</button>'
+        f'<button type="button" class="kw-pick kw-all{" on" if not keyword else ""}" data-kw="">All</button>'
         + "".join(
-            f'<button type="button" class="kw-pick'
-            f'{" on" if kw_l == k.text.casefold() else ""}" '
+            f'<span class="kw-chip{" on" if kw_l == k.text.casefold() else ""}">'
+            f'<button type="button" class="kw-pick" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+            f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
+            f"onsubmit=\"return confirm('Remove “{html.escape(k.text, quote=True)}” from the watchlist?')\">"
+            f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
+            f'×</button></form></span>'
             for k in active_kws
         )
     )
@@ -613,46 +636,40 @@ def home(request: Request, db: Session = Depends(get_db)):
       <h1>Find coverage</h1>
       <p>Filter by date, keyword, and newspapers. Scheduled scans keep filling this quietly.</p>
     </div>
-    <form class="panel" method="get" action="/" id="search">
+    <div class="panel">
       <h2>Search</h2>
       <div class="field">
         <label for="date">Date</label>
-        <input type="date" id="date" name="date" value="{html.escape(date_s)}" required>
+        <input form="search" type="date" id="date" name="date" value="{html.escape(date_s)}" required>
       </div>
       <div class="field">
-        <label for="q">Keyword</label>
-        <input type="text" id="q" name="q" value="{html.escape(keyword)}"
-               placeholder="Click a tag below, or type — leave blank for all"
-               list="kwlist" autocomplete="off">
-        <datalist id="kwlist">{"".join(
-            f'<option value="{html.escape(k.text)}">' for k in active_kws
-        )}</datalist>
+        <label>Add to watchlist</label>
+        <form class="kw-add" method="post" action="/ui/keywords">
+          <input name="text" placeholder="Type a keyword jobs should match" required maxlength="120">
+          <select name="language"><option value="en">EN</option><option value="ur">UR</option></select>
+          <button type="submit">+ Add</button>
+        </form>
         <div class="kw-bar">
-          <div class="cap">Watchlist · used by scheduled jobs · click to filter</div>
-          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one below.</span>'}</div>
+          <div class="cap">Watchlist · click to filter · × to delete</div>
+          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one above.</span>'}</div>
         </div>
       </div>
-      <div class="field">
-        <label>Newspapers</label>
-        <div class="paper-tools">
-          <button type="button" class="ghost" id="papers-all">Select all</button>
-          <button type="button" class="ghost" id="papers-none">Clear</button>
+      <form method="get" action="/" id="search">
+        <input type="hidden" name="q" id="q" value="{html.escape(keyword)}">
+        <input type="hidden" name="go" value="1">
+        <div class="field">
+          <label>Newspapers</label>
+          <div class="paper-tools">
+            <button type="button" class="ghost" id="papers-all">Select all</button>
+            <button type="button" class="ghost" id="papers-none">Clear</button>
+          </div>
+          <div class="papers">{boxes}</div>
         </div>
-        <div class="papers">{boxes}</div>
-      </div>
-      <input type="hidden" name="go" value="1">
-      <div class="actions">
-        <button type="submit">Show results</button>
-        <a class="btn ghost" href="/">Reset</a>
-      </div>
-      <p class="hint">Jobs and schedules are unchanged — this page only browses what they already found.</p>
-    </form>
-    <div class="panel" style="padding:1rem 1.25rem">
-      <div class="cap" style="margin-bottom:.5rem">Add to watchlist</div>
-      <form class="kw-add" method="post" action="/ui/keywords" style="margin:0">
-        <input name="text" placeholder="New keyword for jobs to match" required maxlength="120">
-        <select name="language"><option value="en">EN</option><option value="ur">UR</option></select>
-        <button type="submit">+ Add</button>
+        <div class="actions">
+          <button type="submit">Show results</button>
+          <a class="btn ghost" href="/">Reset</a>
+        </div>
+        <p class="hint">Jobs and schedules are unchanged — this page only browses what they already found.</p>
       </form>
     </div>
     {results_html}
