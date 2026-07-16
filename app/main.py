@@ -586,9 +586,9 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> 
                f'data-full="{zoom}" alt=""></div>')
     else:
         img = ('<div class="shot missing"><span class="noprev">No preview</span></div>')
-    # Only highlight the active filter keyword(s) — not every past match on the row.
-    hl = highlight_keywords if highlight_keywords is not None else (m.matched_keywords or [])
-    show_tags = hl if highlight_keywords is not None else (m.matched_keywords or [])
+    # Only highlight / tag watchlist keywords that are still active (or the filter).
+    hl = list(highlight_keywords or [])
+    show_tags = hl
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in show_tags)
     when = m.detected_at.astimezone(_PKT).strftime("%d %b %Y, %H:%M") if m.detected_at else ""
     kind = "E-Paper" if m.module == "epaper" else "Web"
@@ -599,6 +599,59 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> 
             f'<a class="ttl" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
             f'{html.escape(m.title)}</a>{excerpt_html}'
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
+
+
+def _known_keyword_fold(db: Session) -> set[str]:
+    """All keyword strings still in the watchlist table (active or paused)."""
+    return {
+        (k.text or "").casefold()
+        for k in db.execute(select(Keyword)).scalars().all()
+        if k.text
+    }
+
+
+def _active_keyword_fold(db: Session) -> dict[str, str]:
+    """casefold -> canonical text for active watchlist keywords."""
+    out: dict[str, str] = {}
+    for k in db.execute(select(Keyword).where(Keyword.active.is_(True))).scalars().all():
+        if k.text:
+            out[(k.text or "").casefold()] = k.text
+    return out
+
+
+def _live_matched(m: Mention, active_fold: dict[str, str]) -> list[str]:
+    """matched_keywords that are still on the active watchlist (canonical text)."""
+    seen, out = set(), []
+    for k in (m.matched_keywords or []):
+        fold = (k or "").casefold()
+        if fold in active_fold and fold not in seen:
+            seen.add(fold)
+            out.append(active_fold[fold])
+    return out
+
+
+def _scrub_deleted_keywords(db: Session) -> dict:
+    """Strip keyword labels that no longer exist in the watchlist; drop empty mentions."""
+    known = _known_keyword_fold(db)
+    deleted = updated = files = 0
+    rows = db.execute(select(Mention)).scalars().all()
+    for m in rows:
+        kws = list(m.matched_keywords or [])
+        remaining = [k for k in kws if (k or "").casefold() in known]
+        if len(remaining) == len(kws):
+            continue
+        if remaining:
+            m.matched_keywords = remaining
+            updated += 1
+            continue
+        for attr in ("screenshot_path", "full_screenshot_path"):
+            if _unlink_orphan_media(db, getattr(m, attr), m.id):
+                files += 1
+        db.delete(m)
+        deleted += 1
+    if deleted or updated:
+        db.commit()
+    return {"mentions_deleted": deleted, "mentions_updated": updated, "files_deleted": files}
 
 
 def _utc(dt):
@@ -761,6 +814,10 @@ def home(request: Request, db: Session = Depends(get_db)):
         )
 
     results_html = ""
+    # Drop labels for keywords that were deleted earlier (before purge existed).
+    _scrub_deleted_keywords(db)
+    active_fold = _active_keyword_fold(db)
+
     if searched:
         day_start = datetime(show_date.year, show_date.month, show_date.day, tzinfo=_PKT)
         day_end = day_start + timedelta(days=1)
@@ -779,20 +836,31 @@ def home(request: Request, db: Session = Depends(get_db)):
         else:
             mentions = []
 
+        # Only watchlist-active keywords count — never resurface a removed label
+        # via title/snippet text alone.
         if keyword:
             kw_l = keyword.casefold()
-            mentions = [
-                m for m in mentions
-                if any(kw_l in (k or "").casefold() for k in (m.matched_keywords or []))
-                or kw_l in (m.title or "").casefold()
-                or kw_l in (m.snippet or "").casefold()
-            ]
+            if kw_l not in active_fold:
+                mentions = []
+            else:
+                mentions = [
+                    m for m in mentions
+                    if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
+                ]
+        else:
+            mentions = [m for m in mentions if _live_matched(m, active_fold)]
 
         shown = mentions[:80]
-        hl = [keyword] if keyword else None
         if shown:
-            grid = (f'<div class="grid">'
-                    f'{"".join(_detection_card(m, highlight_keywords=hl) for m in shown)}</div>')
+            cards = []
+            for m in shown:
+                live = _live_matched(m, active_fold)
+                if keyword:
+                    hl = [active_fold[keyword.casefold()]]
+                else:
+                    hl = live
+                cards.append(_detection_card(m, highlight_keywords=hl))
+            grid = f'<div class="grid">{"".join(cards)}</div>'
             more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
                     f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
         else:
@@ -974,6 +1042,10 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=303)
     text = kw.text
     purged = _purge_keyword_results(db, text)
+    # Catch any other deleted labels left on older rows.
+    extra = _scrub_deleted_keywords(db)
+    purged["mentions_deleted"] += extra["mentions_deleted"]
+    purged["files_deleted"] += extra["files_deleted"]
     # Re-load in case the earlier commit expired the instance.
     kw = db.get(Keyword, kid)
     if kw:
