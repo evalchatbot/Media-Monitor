@@ -630,10 +630,104 @@ def _live_matched(m: Mention, active_fold: dict[str, str]) -> list[str]:
     return out
 
 
+def _refresh_mention_visuals(db: Session, m: Mention) -> bool:
+    """Rebuild cutout/screenshot so baked-in highlights match current keywords only."""
+    kws = [k for k in (m.matched_keywords or []) if k]
+    if not kws:
+        return False
+    old_shot, old_full = m.screenshot_path, m.full_screenshot_path
+
+    if m.module == "epaper":
+        parts = (m.external_id or "").split(":")
+        if len(parts) < 4 or not parts[3].startswith("p"):
+            return False
+        try:
+            page_no = int(parts[3][1:])
+        except ValueError:
+            return False
+        row = db.execute(
+            select(EPaperPage).where(
+                EPaperPage.paper == parts[0],
+                EPaperPage.city == parts[1],
+                EPaperPage.date == parts[2],
+                EPaperPage.page_no == page_no,
+            )
+        ).scalar_one_or_none()
+        if not row or not row.image_path:
+            return False
+        from app.epaper.pipeline import _detection_shot, _make_clip, _snippet
+
+        langs = {
+            k.text: k.language
+            for k in db.execute(select(Keyword)).scalars().all()
+            if k.text
+        }
+        kw_lang = {k: langs.get(k, "en") for k in kws}
+        snippet = m.snippet or _snippet(row.ocr_text or "", kws)
+        clip = _make_clip(row, kws, kw_lang, snippet)
+        shot = _detection_shot(row)
+        m.screenshot_path = clip or shot
+        m.full_screenshot_path = shot or m.full_screenshot_path
+        db.flush()
+        if old_shot and old_shot != m.screenshot_path:
+            _unlink_orphan_media(db, old_shot, m.id)
+        if old_full and old_full != m.full_screenshot_path:
+            _unlink_orphan_media(db, old_full, m.id)
+        return True
+
+    # Website: drop old baked highlights; backfill re-captures with current keywords.
+    m.screenshot_path = None
+    m.full_screenshot_path = None
+    db.flush()
+    _unlink_orphan_media(db, old_shot, m.id)
+    _unlink_orphan_media(db, old_full, m.id)
+    return True
+
+
+def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
+    """Remove a keyword from all mentions; delete mentions left with no keywords
+    and free their orphaned screenshot files. Remaining hits get fresh visuals
+    so old keyword highlights are not left on the image."""
+    needle = keyword_text.casefold()
+    deleted = updated = files = refreshed = 0
+    rows = db.execute(select(Mention)).scalars().all()
+    need_web_backfill = False
+    for m in rows:
+        kws = list(m.matched_keywords or [])
+        remaining = [k for k in kws if (k or "").casefold() != needle]
+        if len(remaining) == len(kws):
+            continue
+        if remaining:
+            m.matched_keywords = remaining
+            updated += 1
+            if _refresh_mention_visuals(db, m):
+                refreshed += 1
+                if m.module == "newspaper":
+                    need_web_backfill = True
+            continue
+        for attr in ("screenshot_path", "full_screenshot_path"):
+            if _unlink_orphan_media(db, getattr(m, attr), m.id):
+                files += 1
+        db.delete(m)
+        deleted += 1
+    if deleted or updated:
+        db.commit()
+    if need_web_backfill:
+        try:
+            from app.newspaper.screenshots import backfill_screenshots
+            backfill_screenshots(limit=40)
+        except Exception as exc:
+            logger.warning("post-purge screenshot backfill failed: %s", exc)
+    return {"mentions_deleted": deleted, "mentions_updated": updated,
+            "files_deleted": files, "visuals_refreshed": refreshed}
+
+
 def _scrub_deleted_keywords(db: Session) -> dict:
-    """Strip keyword labels that no longer exist in the watchlist; drop empty mentions."""
+    """Strip keyword labels that no longer exist in the watchlist; drop empty mentions.
+    Rebuild visuals on rows that keep other keywords so old highlights disappear."""
     known = _known_keyword_fold(db)
-    deleted = updated = files = 0
+    deleted = updated = files = refreshed = 0
+    need_web_backfill = False
     rows = db.execute(select(Mention)).scalars().all()
     for m in rows:
         kws = list(m.matched_keywords or [])
@@ -643,6 +737,10 @@ def _scrub_deleted_keywords(db: Session) -> dict:
         if remaining:
             m.matched_keywords = remaining
             updated += 1
+            if _refresh_mention_visuals(db, m):
+                refreshed += 1
+                if m.module == "newspaper":
+                    need_web_backfill = True
             continue
         for attr in ("screenshot_path", "full_screenshot_path"):
             if _unlink_orphan_media(db, getattr(m, attr), m.id):
@@ -651,7 +749,14 @@ def _scrub_deleted_keywords(db: Session) -> dict:
         deleted += 1
     if deleted or updated:
         db.commit()
-    return {"mentions_deleted": deleted, "mentions_updated": updated, "files_deleted": files}
+    if need_web_backfill:
+        try:
+            from app.newspaper.screenshots import backfill_screenshots
+            backfill_screenshots(limit=40)
+        except Exception as exc:
+            logger.warning("post-scrub screenshot backfill failed: %s", exc)
+    return {"mentions_deleted": deleted, "mentions_updated": updated,
+            "files_deleted": files, "visuals_refreshed": refreshed}
 
 
 def _utc(dt):
@@ -699,31 +804,6 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
         return True
     except OSError:
         return False
-
-
-def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
-    """Remove a keyword from all mentions; delete mentions left with no keywords
-    and free their orphaned screenshot files."""
-    needle = keyword_text.casefold()
-    deleted = updated = files = 0
-    rows = db.execute(select(Mention)).scalars().all()
-    for m in rows:
-        kws = list(m.matched_keywords or [])
-        remaining = [k for k in kws if (k or "").casefold() != needle]
-        if len(remaining) == len(kws):
-            continue
-        if remaining:
-            m.matched_keywords = remaining
-            updated += 1
-            continue
-        for attr in ("screenshot_path", "full_screenshot_path"):
-            if _unlink_orphan_media(db, getattr(m, attr), m.id):
-                files += 1
-        db.delete(m)
-        deleted += 1
-    if deleted or updated:
-        db.commit()
-    return {"mentions_deleted": deleted, "mentions_updated": updated, "files_deleted": files}
 
 
 def _start_keyword_scan(kw: Keyword) -> dict:

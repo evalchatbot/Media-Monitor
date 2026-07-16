@@ -228,6 +228,20 @@ def match_stored_pages(session, keywords, notifier, summary,
             if not new_kw:
                 continue
             mention.matched_keywords = sorted(set(mention.matched_keywords or []) | set(matched_kw))
+            # Remake cutout so the image highlight matches current keywords only.
+            kw_lang = {m.keyword: m.language for m in matches}
+            snippet = _snippet(row.ocr_text, mention.matched_keywords)
+            old_clip = mention.screenshot_path
+            clip = _make_clip(row, mention.matched_keywords, kw_lang, snippet)
+            if clip:
+                mention.screenshot_path = clip
+                if old_clip and old_clip != clip:
+                    try:
+                        p = Path(old_clip)
+                        if p.exists() and "_clip_" in p.name:
+                            p.unlink()
+                    except OSError:
+                        pass
             session.commit()
             _alert(notifier, session, mention, new_kw, summary)
             continue

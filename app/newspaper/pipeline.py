@@ -340,6 +340,9 @@ def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, sum
         if not new_kw:
             return False
         mention.matched_keywords = sorted(set(mention.matched_keywords or []) | set(matched_kw))
+        # Drop old screenshot so backfill re-captures with highlights for current keywords only.
+        mention.screenshot_path = None
+        mention.full_screenshot_path = None
         session.commit()
         _send_alert(notifier, session, mention, mention.screenshot_path, summary, new_kw)
         return False
