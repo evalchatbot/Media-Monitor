@@ -197,6 +197,25 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
 .tag{display:inline-flex;background:var(--blue-soft);color:var(--blue-deep);border-radius:999px;
   padding:.12rem .5rem;font-size:.72rem;font-weight:700;margin:2px 3px 2px 0;border:1px solid var(--blue-mist)}
+.kw-bar{margin-top:.65rem}
+.kw-bar .cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:.4rem}
+.kw-tags{display:flex;flex-wrap:wrap;gap:.4rem}
+.kw-pick{display:inline-flex;align-items:center;padding:.28rem .7rem;border-radius:999px;
+  border:1px solid var(--line);background:#fffdf9;color:var(--ink);font-size:.8rem;font-weight:600;
+  cursor:pointer;font-family:inherit;box-shadow:none;transition:background .15s,border-color .15s,color .15s;font-weight:600}
+.kw-pick:hover{background:var(--blue-soft);border-color:var(--blue);color:var(--blue-deep);
+  transform:none;box-shadow:none;opacity:1}
+.kw-pick.on{background:var(--blue-deep);border-color:transparent;color:#fff;
+  box-shadow:0 4px 12px -6px rgba(74,138,176,.55)}
+.kw-pick.on:hover{opacity:.95;background:var(--blue)}
+.kw-add{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;margin-top:0}
+.cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
+.kw-add input{flex:1;min-width:140px;max-width:260px;padding:.45rem .75rem;border:1px solid var(--line-strong);
+  border-radius:999px;font:inherit;background:#fffdf9;color:var(--ink)}
+.kw-add select{padding:.45rem .6rem;border:1px solid var(--line-strong);border-radius:999px;
+  font:inherit;background:#fffdf9;color:var(--ink)}
+.kw-add button{padding:.42rem .85rem;font-size:.8rem}
 mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-weight:700}
 
 .empty{color:var(--muted);text-align:center;padding:2.2rem 1.2rem;border:1.5px dashed var(--line-strong);
@@ -298,6 +317,18 @@ _JS = """
   });
   if(none)none.addEventListener('click',function(){
     document.querySelectorAll('input[name=paper]').forEach(function(c){c.checked=false});
+  });
+
+  /* Watchlist tags → fill keyword + run search */
+  var q=document.getElementById('q'), form=document.getElementById('search');
+  document.querySelectorAll('.kw-pick').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      if(!q||!form)return;
+      q.value=btn.getAttribute('data-kw')||'';
+      document.querySelectorAll('.kw-pick').forEach(function(b){b.classList.remove('on')});
+      btn.classList.add('on');
+      form.requestSubmit?form.requestSubmit():form.submit();
+    });
   });
 
   var wasScanning=__SCANNING__;
@@ -562,6 +593,20 @@ def home(request: Request, db: Session = Depends(get_db)):
             "then show results.</div>"
         )
 
+    active_kws = db.execute(
+        select(Keyword).where(Keyword.active.is_(True)).order_by(Keyword.text)
+    ).scalars().all()
+    kw_l = keyword.casefold()
+    kw_tags = (
+        f'<button type="button" class="kw-pick{" on" if not keyword else ""}" data-kw="">All</button>'
+        + "".join(
+            f'<button type="button" class="kw-pick'
+            f'{" on" if kw_l == k.text.casefold() else ""}" '
+            f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+            for k in active_kws
+        )
+    )
+
     body = f"""
     {banner}
     <div class="hero">
@@ -577,13 +622,15 @@ def home(request: Request, db: Session = Depends(get_db)):
       <div class="field">
         <label for="q">Keyword</label>
         <input type="text" id="q" name="q" value="{html.escape(keyword)}"
-               placeholder="e.g. JAAC, budget, flood — leave blank for all"
+               placeholder="Click a tag below, or type — leave blank for all"
                list="kwlist" autocomplete="off">
         <datalist id="kwlist">{"".join(
-            f'<option value="{html.escape(k.text)}">'
-            for k in db.execute(select(Keyword).where(Keyword.active.is_(True))
-                                .order_by(Keyword.text)).scalars().all()
+            f'<option value="{html.escape(k.text)}">' for k in active_kws
         )}</datalist>
+        <div class="kw-bar">
+          <div class="cap">Watchlist · used by scheduled jobs · click to filter</div>
+          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one below.</span>'}</div>
+        </div>
       </div>
       <div class="field">
         <label>Newspapers</label>
@@ -600,6 +647,14 @@ def home(request: Request, db: Session = Depends(get_db)):
       </div>
       <p class="hint">Jobs and schedules are unchanged — this page only browses what they already found.</p>
     </form>
+    <div class="panel" style="padding:1rem 1.25rem">
+      <div class="cap" style="margin-bottom:.5rem">Add to watchlist</div>
+      <form class="kw-add" method="post" action="/ui/keywords" style="margin:0">
+        <input name="text" placeholder="New keyword for jobs to match" required maxlength="120">
+        <select name="language"><option value="en">EN</option><option value="ur">UR</option></select>
+        <button type="submit">+ Add</button>
+      </form>
+    </div>
     {results_html}
     """
     return _shell("Media Monitor", body)
