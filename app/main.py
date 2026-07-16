@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -221,6 +221,14 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-x:hover{background:rgba(176,69,43,.12);color:#b0452b;transform:none;box-shadow:none;opacity:1}
 .kw-chip.on .kw-x{border-left-color:rgba(255,255,255,.28);color:rgba(255,255,255,.85)}
 .kw-chip.on .kw-x:hover{background:rgba(0,0,0,.18);color:#fff}
+.kw-play{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;padding:0;
+  border:0;border-left:1px solid var(--line);border-radius:0;background:transparent;
+  color:var(--blue-deep);font-size:.72rem;font-weight:700;line-height:1;cursor:pointer;
+  font-family:inherit;box-shadow:none}
+.kw-play:hover{background:rgba(74,138,176,.15);color:var(--blue-deep);transform:none;box-shadow:none;opacity:1}
+.kw-chip.on .kw-play{border-left-color:rgba(255,255,255,.28);color:#fff}
+.kw-chip.on .kw-play:hover{background:rgba(0,0,0,.18);color:#fff}
+.kw-del,.kw-play-form{margin:0;display:inline-flex}
 .kw-pick.kw-all{border:1px solid var(--line);border-radius:999px;padding:.28rem .7rem;background:#fffdf9}
 .kw-pick.kw-all.on{background:var(--blue-deep);border-color:transparent;color:#fff;
   box-shadow:0 4px 12px -6px rgba(74,138,176,.55)}
@@ -598,8 +606,85 @@ def _utc(dt):
 
 
 def _home_redirect(extra: dict | None = None) -> RedirectResponse:
-    q = urlencode({k: v for k, v in (extra or {}).items() if v is not None})
+    q = urlencode({k: str(v) for k, v in (extra or {}).items() if v is not None})
     return RedirectResponse("/" + (f"?{q}" if q else ""), status_code=303)
+
+
+def _storage_file(path: str | None) -> Path | None:
+    """Resolve a DB media path to a local Path if the file exists."""
+    if not path:
+        return None
+    p = Path(path)
+    if p.exists():
+        return p
+    raw = str(path).replace("\\", "/")
+    idx = raw.lower().rfind("/storage/")
+    if idx >= 0:
+        cand = settings.storage_dir / raw[idx + len("/storage/"):].lstrip("/")
+        if cand.exists():
+            return cand
+    return None
+
+
+def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
+    """Delete a media file only if no other mention still references it."""
+    if not path:
+        return False
+    still = db.execute(
+        select(Mention.id).where(
+            Mention.id != except_id,
+            or_(Mention.screenshot_path == path, Mention.full_screenshot_path == path),
+        ).limit(1)
+    ).first()
+    if still:
+        return False
+    f = _storage_file(path)
+    if not f:
+        return False
+    try:
+        f.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
+    """Remove a keyword from all mentions; delete mentions left with no keywords
+    and free their orphaned screenshot files."""
+    needle = keyword_text.casefold()
+    deleted = updated = files = 0
+    rows = db.execute(select(Mention)).scalars().all()
+    for m in rows:
+        kws = list(m.matched_keywords or [])
+        remaining = [k for k in kws if (k or "").casefold() != needle]
+        if len(remaining) == len(kws):
+            continue
+        if remaining:
+            m.matched_keywords = remaining
+            updated += 1
+            continue
+        for attr in ("screenshot_path", "full_screenshot_path"):
+            if _unlink_orphan_media(db, getattr(m, attr), m.id):
+                files += 1
+        db.delete(m)
+        deleted += 1
+    if deleted or updated:
+        db.commit()
+    return {"mentions_deleted": deleted, "mentions_updated": updated, "files_deleted": files}
+
+
+def _start_keyword_scan(kw: Keyword) -> dict:
+    """Instant corpus match + background fresh scan for ONE keyword only.
+
+    Dedup is enforced by Mention(module, external_id) uniqueness — re-scans
+    update the same row (merge keywords / refresh shot) instead of duplicating.
+    """
+    res = run_quick_match(keyword_ids=[kw.id])
+    news_ok = scan_manager.start_scan(
+        keyword_ids=[kw.id], keyword_label=kw.text, capped=True)
+    ep_ok = scan_runner.start_scan(keyword_ids=[kw.id], label=kw.text)
+    res["live_started"] = bool(news_ok or ep_ok)
+    return res
 
 
 # ==========================================================================
@@ -641,12 +726,38 @@ def home(request: Request, db: Session = Depends(get_db)):
         )
 
     banner = ""
-    checked = qp.get("checked")
-    if checked is not None:
+    news_st = scan_manager.status()
+    ep_st = scan_runner.status()
+    scanning_now = bool(news_st.get("running") or ep_st.get("running"))
+    if qp.get("removed"):
         banner = (
-            f'<div class="banner ok">Quick check finished — {html.escape(checked)} stored '
-            f'article(s) and {html.escape(qp.get("pages") or "0")} e-paper page(s). '
-            f"Fresh scans keep filling in.</div>"
+            f'<div class="banner ok">Removed <b>{html.escape(qp.get("removed"))}</b> and '
+            f'deleted <b>{html.escape(qp.get("purged") or "0")}</b> related result(s)'
+            f'{(" · " + html.escape(qp["files"]) + " file(s) freed") if qp.get("files") else ""}.'
+            f"</div>"
+        )
+    elif qp.get("scanning") or (scanning_now and keyword):
+        who = html.escape(keyword or news_st.get("keyword") or ep_st.get("label") or "keyword")
+        if qp.get("busy"):
+            banner = (
+                f'<div class="banner ok"><span class="spin"></span> Instant match for '
+                f'<b>“{who}”</b> done'
+                + (f' · <b>{html.escape(qp.get("found") or "0")}</b> hit(s) from storage' if qp.get("found") is not None else "")
+                + ". A live scan is already running — new hits merge into the same records "
+                f"(no duplicates) when it finishes.</div>"
+            )
+        else:
+            banner = (
+                f'<div class="banner ok"><span class="spin"></span> Scanning for <b>“{who}”</b>… '
+                f"Matching stored articles &amp; e-paper pages now; a fresh live scan is running. "
+                f"New hits merge with existing ones (deduped by article/page) — no duplicates.</div>"
+            )
+    elif qp.get("checked") is not None:
+        banner = (
+            f'<div class="banner ok">Quick check finished — {html.escape(qp.get("checked") or "0")} stored '
+            f'article(s) and {html.escape(qp.get("pages") or "0")} e-paper page(s)'
+            + (f' · <b>{html.escape(qp.get("found") or "0")}</b> new hit(s)' if qp.get("found") is not None else "")
+            + ". Fresh scans keep filling in.</div>"
         )
 
     results_html = ""
@@ -713,6 +824,9 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'<span class="kw-chip{" on" if kw_l == k.text.casefold() else ""}">'
             f'<button type="button" class="kw-pick" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+            f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
+            f'<button type="submit" class="kw-play" title="Scan this keyword now" '
+            f'aria-label="Scan">▶</button></form>'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
             f"onsubmit=\"return confirm('Remove “{html.escape(k.text, quote=True)}” from the watchlist?')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
@@ -736,12 +850,12 @@ def home(request: Request, db: Session = Depends(get_db)):
       <div class="field">
         <label>Add to watchlist</label>
         <form class="kw-add" method="post" action="/ui/keywords">
-          <input name="text" placeholder="Type a keyword jobs should match" required maxlength="120">
+          <input name="text" placeholder="New keyword — scan starts immediately" required maxlength="120">
           <select name="language"><option value="en">EN</option><option value="ur">UR</option></select>
           <button type="submit">+ Add</button>
         </form>
         <div class="kw-bar">
-          <div class="cap">Watchlist · click to filter · × to delete</div>
+          <div class="cap">Watchlist · click to filter · ▶ scan · × delete</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one above.</span>'}</div>
         </div>
       </div>
@@ -804,14 +918,33 @@ def _gone_pages():
 def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
                    db: Session = Depends(get_db)):
     text = text.strip()
-    if text:
-        exists = db.execute(
-            select(Keyword).where(Keyword.text == text, Keyword.language == language)
-        ).first()
-        if not exists:
-            db.add(Keyword(text=text, language=language, module="newspaper", active=True))
-            db.commit()
-    return _home_redirect({"q": text} if text else None)
+    if not text:
+        return RedirectResponse("/", status_code=303)
+    language = language if language in ("en", "ur") else "en"
+    existing = db.execute(
+        select(Keyword).where(Keyword.text == text, Keyword.language == language)
+    ).scalar_one_or_none()
+    today = datetime.now(_PKT).date().isoformat()
+    if existing:
+        # Already on the watchlist — just open its results, don't re-fire a scan.
+        return _home_redirect({"q": text, "go": "1", "date": today})
+
+    kw = Keyword(text=text, language=language, module="newspaper", active=True)
+    db.add(kw)
+    db.commit()
+    db.refresh(kw)
+
+    res = _start_keyword_scan(kw)
+    return _home_redirect({
+        "q": kw.text,
+        "go": "1",
+        "date": today,
+        "scanning": "1",
+        "busy": "1" if not res.get("live_started") else None,
+        "checked": res.get("articles_checked", 0),
+        "pages": res.get("pages_checked", 0),
+        "found": res.get("mentions", 0),
+    })
 
 
 @app.post("/ui/keywords/{kid}/edit")
@@ -837,10 +970,22 @@ def ui_toggle_keyword(kid: int, db: Session = Depends(get_db)):
 @app.post("/ui/keywords/{kid}/delete")
 def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
+    if not kw:
+        return RedirectResponse("/", status_code=303)
+    text = kw.text
+    purged = _purge_keyword_results(db, text)
+    # Re-load in case the earlier commit expired the instance.
+    kw = db.get(Keyword, kid)
     if kw:
         db.delete(kw)
         db.commit()
-    return RedirectResponse("/", status_code=303)
+    return _home_redirect({
+        "removed": text,
+        "purged": purged["mentions_deleted"],
+        "files": purged["files_deleted"] or None,
+        "go": "1",
+        "date": datetime.now(_PKT).date().isoformat(),
+    })
 
 
 @app.post("/ui/keywords/{kid}/scan")
@@ -848,15 +993,16 @@ def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
-    res = run_quick_match(keyword_ids=[kid])
-    scan_manager.start_scan(keyword_ids=[kid], keyword_label=kw.text, capped=True)
-    scan_runner.start_scan(keyword_ids=[kid], label=kw.text)
+    res = _start_keyword_scan(kw)
     return _home_redirect({
         "q": kw.text,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
-        "checked": res["articles_checked"],
-        "pages": res["pages_checked"],
+        "scanning": "1",
+        "busy": "1" if not res.get("live_started") else None,
+        "checked": res.get("articles_checked", 0),
+        "pages": res.get("pages_checked", 0),
+        "found": res.get("mentions", 0),
     })
 
 
