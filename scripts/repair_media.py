@@ -112,16 +112,41 @@ def main() -> None:
             stopped = False
             ep_mentions = session.execute(
                 select(Mention).where(Mention.module == "epaper")).scalars().all()
-            todo = [m for m in ep_mentions
-                    if by_key.get(m.external_id) and _alive(by_key[m.external_id].image_path)
-                    and (m.matched_keywords or [])
-                    and not (m.screenshot_path and "_clip_" in m.screenshot_path
-                             and _alive(m.screenshot_path) and not args.force)]
+
+            def _has_clip(m: Mention) -> bool:
+                return bool(m.screenshot_path and "_clip_" in m.screenshot_path
+                            and _alive(m.screenshot_path))
+
+            def _looks_old_upscale(path: str) -> bool:
+                # Old enhancer stretched crops toward ~1700px; new one barely scales.
+                # Resume-safe: already re-cut clips stay narrow and are skipped.
+                try:
+                    return Image.open(path).size[0] >= 1200
+                except Exception:
+                    return True
+
+            todo = []
+            for m in ep_mentions:
+                row = by_key.get(m.external_id)
+                if not (row and _alive(row.image_path) and (m.matched_keywords or [])):
+                    continue
+                if args.re_enhance_epaper:
+                    if not _has_clip(m) or _looks_old_upscale(m.screenshot_path):
+                        todo.append(m)
+                elif args.force or not _has_clip(m):
+                    todo.append(m)
+
+            # Image-map clips first (no Gemini); vision papers after, paced.
+            todo.sort(key=lambda m: 0 if by_key[m.external_id].regions else 1)
+            map_n = sum(1 for m in todo if by_key[m.external_id].regions)
+            print(f"[2b ] re-cutting {len(todo)} clips "
+                  f"({map_n} image-map / AI-free, {len(todo) - map_n} need vision)…")
+
             for m in todo:
                 row = by_key[m.external_id]
                 is_map = bool(row.regions)
                 if done_first and not is_map:
-                    _t.sleep(4.0 if settings.gemini_api_key else 1.2)  # pace vision only
+                    _t.sleep(6.0 if settings.gemini_api_key else 1.2)  # free-tier pacing
                 done_first = 1
                 kw_lang = {kw: langs.get(kw, "en") for kw in m.matched_keywords}
                 c = _make_clip(row, m.matched_keywords, kw_lang,
@@ -144,7 +169,8 @@ def main() -> None:
                   f"{' (rejected crops keep the full page)' if not stopped else ''}")
             if stopped:
                 print("      ⚠ Gemini free-tier quota reached — stopped early. Progress is "
-                      "SAVED. Re-run WITHOUT --force in a few minutes to continue the rest.")
+                      "SAVED. Wait a few minutes, then re-run the SAME command "
+                      "(--re-enhance-epaper); already-fixed narrow clips are skipped.")
 
         # -- 3. website screenshots -----------------------------------------
         cleared = 0
