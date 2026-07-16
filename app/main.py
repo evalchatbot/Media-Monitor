@@ -685,41 +685,25 @@ def _refresh_mention_visuals(db: Session, m: Mention) -> bool:
 
 
 def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
-    """Remove a keyword from all mentions; delete mentions left with no keywords
-    and free their orphaned screenshot files. Remaining hits get fresh visuals
-    so old keyword highlights are not left on the image."""
+    """Strict delete: remove EVERY mention that matched this keyword (even if
+    other keywords were also on the same card). Caller expects a fresh ▶ / scan
+    to rebuild hits for any remaining watchlist terms."""
     needle = keyword_text.casefold()
-    deleted = updated = files = refreshed = 0
+    deleted = files = 0
     rows = db.execute(select(Mention)).scalars().all()
-    need_web_backfill = False
     for m in rows:
         kws = list(m.matched_keywords or [])
-        remaining = [k for k in kws if (k or "").casefold() != needle]
-        if len(remaining) == len(kws):
-            continue
-        if remaining:
-            m.matched_keywords = remaining
-            updated += 1
-            if _refresh_mention_visuals(db, m):
-                refreshed += 1
-                if m.module == "newspaper":
-                    need_web_backfill = True
+        if not any((k or "").casefold() == needle for k in kws):
             continue
         for attr in ("screenshot_path", "full_screenshot_path"):
             if _unlink_orphan_media(db, getattr(m, attr), m.id):
                 files += 1
         db.delete(m)
         deleted += 1
-    if deleted or updated:
+    if deleted:
         db.commit()
-    if need_web_backfill:
-        try:
-            from app.newspaper.screenshots import backfill_screenshots
-            backfill_screenshots(limit=40)
-        except Exception as exc:
-            logger.warning("post-purge screenshot backfill failed: %s", exc)
-    return {"mentions_deleted": deleted, "mentions_updated": updated,
-            "files_deleted": files, "visuals_refreshed": refreshed}
+    return {"mentions_deleted": deleted, "mentions_updated": 0,
+            "files_deleted": files, "visuals_refreshed": 0}
 
 
 def _scrub_deleted_keywords(db: Session) -> dict:
@@ -976,7 +960,7 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'<button type="submit" class="kw-play" title="Scan this keyword now" '
             f'aria-label="Scan">▶</button></form>'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Remove “{html.escape(k.text, quote=True)}” from the watchlist?')\">"
+            f"onsubmit=\"return confirm('Remove “{html.escape(k.text, quote=True)}” and DELETE all its results? Other keywords will need ▶ to rebuild shared cards.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
             for k in active_kws
