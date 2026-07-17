@@ -20,6 +20,7 @@ from config import settings
 
 from app.core import scoring
 from app.core.keywords import find_matches
+from app.core import result_policy
 from app.db.base import SessionLocal
 from app.db.models import EPaperPage, Keyword, Mention
 from app.epaper import reader, sources
@@ -57,7 +58,11 @@ def run_epaper_scan(keyword_ids=None, fetch: bool = True, papers: list[str] | No
             _fetch_editions(session, papers, summary)
         _read_pages(session, summary)
         if keywords:
-            match_stored_pages(session, keywords, notifier, summary, since_days=_MATCH_DAYS)
+            match_stored_pages(
+                session, keywords, notifier, summary,
+                since_days=_MATCH_DAYS, cap_new=False,
+            )
+            summary["policy"] = result_policy.enforce_limits(session)
         return summary
     finally:
         session.close()
@@ -190,7 +195,9 @@ def _read_via_map(session, row, summary) -> bool:
 
 # ------------------------------------------------------------------ match ---
 def match_stored_pages(session, keywords, notifier, summary,
-                       since_days: int | None = _MATCH_DAYS) -> None:
+                       since_days: int | None = _MATCH_DAYS,
+                       cap_new: bool = False,
+                       deferred_alerts: list[tuple[int, list[str]]] | None = None) -> None:
     """Match keywords against already-read pages. `since_days=None` = every
     stored page (used by the instant per-keyword Quick Scan); scans use a small
     window since older pages were already matched when they arrived. Content is
@@ -199,10 +206,19 @@ def match_stored_pages(session, keywords, notifier, summary,
     since = floor if since_days is None else max(
         floor, (datetime.now(_PKT).date() - timedelta(days=since_days)).isoformat()
     )
-    pages = session.execute(select(EPaperPage).where(
-        EPaperPage.ocr_status == "done", EPaperPage.date >= since,
-    )).scalars().all()
+    pages = session.execute(
+        select(EPaperPage).where(
+            EPaperPage.ocr_status == "done", EPaperPage.date >= since,
+        ).order_by(EPaperPage.date.desc(), EPaperPage.page_no)
+    ).scalars().all()
+    counts = (
+        {(k[0] or "").casefold(): 0 for k in keywords}
+        if cap_new else {}
+    )
     for row in pages:
+        if cap_new and result_policy.all_full(counts):
+            summary["limit_reached"] = True
+            break
         if not row.ocr_text:
             continue
         summary["pages_checked"] = summary.get("pages_checked", 0) + 1
@@ -210,6 +226,17 @@ def match_stored_pages(session, keywords, notifier, summary,
         if not matches:
             continue
         matched_kw = sorted({m.keyword for m in matches})
+        admitted = matched_kw
+        if cap_new:
+            admitted = []
+            for label in matched_kw:
+                folded = label.casefold()
+                if counts.get(folded, 0) >= settings.keyword_result_limit:
+                    continue
+                counts[folded] = counts.get(folded, 0) + 1
+                admitted.append(label)
+            if not admitted:
+                continue
         ext_id = f"{row.paper}:{row.city}:{row.date}:p{row.page_no}"
 
         mention = session.execute(select(Mention).where(
@@ -224,36 +251,65 @@ def match_stored_pages(session, keywords, notifier, summary,
                 if shot:
                     mention.screenshot_path = shot
                     session.commit()
-            new_kw = [k for k in matched_kw if k not in (mention.matched_keywords or [])]
-            if not new_kw:
-                continue
-            mention.matched_keywords = sorted(set(mention.matched_keywords or []) | set(matched_kw))
-            # Remake cutout so the image highlight matches current keywords only.
             kw_lang = {m.keyword: m.language for m in matches}
-            snippet = _snippet(row.ocr_text, mention.matched_keywords)
-            old_clip = mention.screenshot_path
-            clip = _make_clip(row, mention.matched_keywords, kw_lang, snippet)
-            if clip:
-                mention.screenshot_path = clip
-                if old_clip and old_clip != clip:
-                    try:
-                        p = Path(old_clip)
-                        if p.exists() and "_clip_" in p.name:
-                            p.unlink()
-                    except OSError:
-                        pass
+            present = {(k or "").casefold() for k in (mention.matched_keywords or [])}
+            new_kw = [k for k in admitted if k.casefold() not in present]
+            if new_kw:
+                mention.matched_keywords = sorted(
+                    set(mention.matched_keywords or []) | set(new_kw)
+                )
+
+            # One page may match unrelated articles. Keep a separately located
+            # clipping for every keyword instead of reusing the first one.
+            media = {
+                label: path for label, path in (mention.keyword_media or {}).items()
+                if path and Path(path).exists()
+            }
+            media_fold = {(label or "").casefold() for label in media}
+            mention_fold = {
+                (label or "").casefold() for label in (mention.matched_keywords or [])
+            }
+            relevant = [
+                k for k in admitted
+                if k.casefold() in mention_fold and k.casefold() not in media_fold
+            ]
+            for keyword in relevant:
+                snippet = _snippet(row.ocr_text, [keyword])
+                clip = _make_clip(
+                    row, [keyword], {keyword: kw_lang.get(keyword, "en")}, snippet
+                )
+                if clip:
+                    media[keyword] = clip
+                    if not mention.screenshot_path:
+                        mention.screenshot_path = clip
+            mention.keyword_media = media
+            if mention.published_at is None:
+                mention.published_at = _page_datetime(row.date)
             session.commit()
-            _alert(notifier, session, mention, new_kw, summary)
+            if new_kw:
+                if deferred_alerts is not None:
+                    deferred_alerts.append((mention.id, new_kw))
+                else:
+                    _alert(notifier, session, mention, new_kw, summary)
             continue
 
-        snippet = _snippet(row.ocr_text, matched_kw)
+        snippet = _snippet(row.ocr_text, admitted)
         scored = scoring.score(f"{row.source} e-paper page {row.page_no}",
-                               row.ocr_text, matched_kw) or {}
+                               row.ocr_text, admitted) or {}
         shot = _detection_shot(row)
         # Press-clipping: cut the matched item out of the page (verified crop).
         # Card shows the clipping; the stamped full page stays a click away.
         kw_lang = {m.keyword: m.language for m in matches}
-        clipping = _make_clip(row, matched_kw, kw_lang, snippet)
+        media = {}
+        for keyword in admitted:
+            keyword_snippet = _snippet(row.ocr_text, [keyword])
+            clip = _make_clip(
+                row, [keyword], {keyword: kw_lang.get(keyword, "en")},
+                keyword_snippet,
+            )
+            if clip:
+                media[keyword] = clip
+        clipping = next(iter(media.values()), None)
         mention = Mention(
             module="epaper",
             external_id=ext_id,
@@ -261,13 +317,15 @@ def match_stored_pages(session, keywords, notifier, summary,
             section=f"E-Paper · {row.city.title()} · page {row.page_no}",
             title=f"{row.source} print edition — {_nice_date(row.date)}, page {row.page_no}",
             url=row.viewer_url or row.image_url,
-            matched_keywords=matched_kw,
+            matched_keywords=admitted,
+            keyword_media=media,
             snippet=snippet,
             summary=scored.get("summary") or snippet,
             relevance=scored.get("relevance"),
             sentiment=scored.get("sentiment"),
             screenshot_path=clipping or shot,
             full_screenshot_path=shot,
+            published_at=_page_datetime(row.date),
         )
         session.add(mention)
         try:
@@ -276,7 +334,10 @@ def match_stored_pages(session, keywords, notifier, summary,
             session.rollback()
             continue
         summary["mentions"] += 1
-        _alert(notifier, session, mention, matched_kw, summary)
+        if deferred_alerts is not None:
+            deferred_alerts.append((mention.id, admitted))
+        else:
+            _alert(notifier, session, mention, admitted, summary)
 
 
 def _make_clip(row: EPaperPage, matched_kw: list[str], kw_lang: dict,
@@ -338,6 +399,13 @@ def _nice_date(iso: str) -> str:
         return datetime.strptime(iso, "%Y-%m-%d").strftime("%d %b %Y")
     except ValueError:
         return iso
+
+
+def _page_datetime(iso: str) -> datetime | None:
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").replace(tzinfo=_PKT).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _snippet(text: str, keywords, width: int = 180) -> str:

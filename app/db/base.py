@@ -62,15 +62,23 @@ def _ensure_columns() -> None:
     from sqlalchemy import inspect
 
     insp = inspect(engine)
-    if "epaper_pages" not in insp.get_table_names():
-        return
-    cols = {c["name"] for c in insp.get_columns("epaper_pages")}
-    if "regions" not in cols:
-        json_t = "jsonb" if engine.dialect.name == "postgresql" else "json"
-        with engine.begin() as conn:
-            conn.exec_driver_sql(
-                f"ALTER TABLE epaper_pages ADD COLUMN regions {json_t} DEFAULT '[]'"
-            )
+    tables = set(insp.get_table_names())
+    json_t = "jsonb" if engine.dialect.name == "postgresql" else "json"
+    if "epaper_pages" in tables:
+        cols = {c["name"] for c in insp.get_columns("epaper_pages")}
+        if "regions" not in cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE epaper_pages ADD COLUMN regions {json_t} DEFAULT '[]'"
+                )
+    if "mentions" in tables:
+        cols = {c["name"] for c in insp.get_columns("mentions")}
+        if "keyword_media" not in cols:
+            default = "'{}'::jsonb" if engine.dialect.name == "postgresql" else "'{}'"
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE mentions ADD COLUMN keyword_media {json_t} DEFAULT {default}"
+                )
 
 
 def _migrate_sqlite(models) -> None:

@@ -17,7 +17,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from app.db.base import SessionLocal
-from app.db.models import Mention
+from app.db.models import Keyword, Mention
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,23 @@ def build_digest(hours: int = 24) -> tuple[str, int]:
             .scalars()
             .all()
         )
+        active = {
+            k.text.casefold(): k.text
+            for k in session.execute(
+                select(Keyword).where(Keyword.active.is_(True))
+            ).scalars()
+        }
+        visible = []
+        for mention in mentions:
+            labels = [
+                active[label.casefold()]
+                for label in (mention.matched_keywords or [])
+                if label and label.casefold() in active
+            ]
+            if labels:
+                mention.matched_keywords = labels
+                visible.append(mention)
+        mentions = visible
     finally:
         session.close()
 
@@ -104,14 +121,30 @@ def _sentiment_counts(items: list[Mention]) -> str:
 
 
 def _mention_row(m: Mention) -> str:
-    thumb = _thumb_data_uri(m.screenshot_path) or _thumb_data_uri(m.full_screenshot_path)
+    media = m.keyword_media or {}
+    keyword_shot = next(
+        (
+            path for label in (m.matched_keywords or [])
+            for stored, path in media.items()
+            if stored.casefold() == label.casefold()
+        ),
+        None,
+    )
+    thumb = (
+        _thumb_data_uri(keyword_shot)
+        or _thumb_data_uri(m.screenshot_path)
+        or _thumb_data_uri(m.full_screenshot_path)
+    )
     img = (
         f'<img src="{thumb}" width="{_THUMB_W}" style="border:1px solid #ddd;border-radius:6px;display:block">'
         if thumb
         else ""
     )
     kws = ", ".join(m.matched_keywords or [])
-    when = m.detected_at.astimezone(PKT).strftime("%d %b %H:%M PKT") if m.detected_at else ""
+    occurred = m.published_at or m.detected_at
+    if occurred and occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=timezone.utc)
+    when = occurred.astimezone(PKT).strftime("%d %b %H:%M PKT") if occurred else ""
     tag = "🗞 e-paper" if m.module == "epaper" else "📰 article"
     return f"""
     <table style="margin:10px 0;border-collapse:collapse"><tr>

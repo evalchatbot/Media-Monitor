@@ -15,7 +15,7 @@ from sqlalchemy import select
 from config import settings
 
 from app.db.base import SessionLocal
-from app.db.models import Mention
+from app.db.models import Keyword, Mention
 from app.scrapers.base import Article
 from app.scrapers.sites import build_scrapers
 
@@ -33,6 +33,16 @@ def backfill_screenshots(limit: int = 25) -> dict:
             .where(Mention.module == "newspaper", Mention.screenshot_path.is_(None))
             .order_by(Mention.detected_at.desc())
         ).scalars().all()
+        active = {
+            k.text.casefold(): k.text
+            for k in session.execute(
+                select(Keyword).where(Keyword.active.is_(True))
+            ).scalars()
+        }
+        rows = [
+            m for m in rows
+            if any((label or "").casefold() in active for label in (m.matched_keywords or []))
+        ]
         summary["missing"] = len(rows)
         if not rows:
             return summary
@@ -53,6 +63,11 @@ def backfill_screenshots(limit: int = 25) -> dict:
                 continue
             try:
                 for m in (x for x in todo if x.source == source):
+                    highlights = [
+                        active[label.casefold()]
+                        for label in (m.matched_keywords or [])
+                        if label and label.casefold() in active
+                    ]
                     art = Article(source=m.source, title=m.title, url=m.url,
                                   section=m.section, external_id=m.external_id)
                     try:
@@ -60,7 +75,7 @@ def backfill_screenshots(limit: int = 25) -> dict:
                             art, settings.storage_dir / sc.name,
                             getattr(sc, "ARTICLE_CROP_SELECTOR", None),
                             wait_until="domcontentloaded",
-                            highlight=m.matched_keywords or [],
+                            highlight=highlights,
                         )
                     except Exception as exc:
                         logger.warning("backfill: screenshot failed for %s: %s", m.url, exc)

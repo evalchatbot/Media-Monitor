@@ -23,6 +23,7 @@ only ever on the model's copy), and saves at JPEG q92.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
 import time
@@ -101,7 +102,10 @@ def clip_from_box(page_path: str | Path, box: dict, source: str, page_no: int,
     page_path = Path(page_path)
     if not page_path.exists():
         return None
-    out = page_path.with_name(f"{page_path.stem}_clip_{abs(hash((box['l'], box['t']))) % 99999}.jpg")
+    fingerprint = hashlib.sha1(
+        json.dumps(box, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    out = page_path.with_name(f"{page_path.stem}_clip_box_{fingerprint}.jpg")
     if not _crop(page_path, box, out, pad_pct=1.0):
         return None
     _enhance(out)
@@ -130,7 +134,10 @@ def make_clipping(page_path: str | Path, keyword: str, snippet: str,
     if not box:
         return None
 
-    out = page_path.with_name(f"{page_path.stem}_clip_{abs(hash(keyword)) % 99999}.jpg")
+    fingerprint = hashlib.sha1(
+        f"{language}:{keyword}".encode("utf-8")
+    ).hexdigest()[:12]
+    out = page_path.with_name(f"{page_path.stem}_clip_kw_{fingerprint}.jpg")
     # Gemini boxes are precise — trust them with a little extra padding and skip
     # the (call-hungry) repair loop, so a clip is just locate + verify. The grid
     # path IS coordinate-guessy, so it keeps the completeness repair.

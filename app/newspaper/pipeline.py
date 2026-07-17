@@ -22,6 +22,7 @@ from config import settings
 
 from app.core import scoring
 from app.core.keywords import find_matches
+from app.core import result_policy
 from app.db.base import SessionLocal
 from app.db.models import ArticleCache, Keyword, Mention, ScrapeRun
 from app.notifiers import get_notifier
@@ -64,6 +65,8 @@ def run_newspaper_scan(keyword_ids: list[int] | None = None, uncapped: bool = Fa
         if not keywords:
             logger.info("No active keywords to match; nothing to do.")
             return summary
+        # Live/current matches are allowed to enter, then the shared policy
+        # keeps the newest 25 and evicts older associations.
 
         # PER-SITE new-fetch cap (None = unlimited on manual/uncapped scans).
         # This MUST be per-site: a single shared pool was drained entirely by the
@@ -111,6 +114,7 @@ def run_newspaper_scan(keyword_ids: list[int] | None = None, uncapped: bool = Fa
             finally:
                 scraper.close()
 
+        summary["policy"] = result_policy.enforce_limits(session)
         return summary
     finally:
         session.close()
@@ -128,13 +132,18 @@ def _load_corpus(session) -> list:
     stamp = tuple(session.execute(
         select(_f.count(ArticleCache.id), _f.coalesce(_f.max(ArticleCache.id), 0))
         .where(ArticleCache.module == "newspaper")
-    ).one())
+    ).one()) + (result_policy.cutoff().date().isoformat(),)
     if _CORPUS["stamp"] == stamp:
         return _CORPUS["rows"]
     rows = session.execute(
         select(ArticleCache.external_id, ArticleCache.source, ArticleCache.section,
-               ArticleCache.title, ArticleCache.url, ArticleCache.body)
-        .where(ArticleCache.module == "newspaper")
+               ArticleCache.title, ArticleCache.url, ArticleCache.body,
+               ArticleCache.fetched_at)
+        .where(
+            ArticleCache.module == "newspaper",
+            ArticleCache.fetched_at >= result_policy.cutoff(),
+        )
+        .order_by(ArticleCache.fetched_at.desc())
     ).all()
     _CORPUS["stamp"] = stamp
     _CORPUS["rows"] = rows
@@ -170,6 +179,10 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
         keywords = _active_keywords(session, keyword_ids)
         if not keywords:
             return summary
+        # This is a scan budget, not the number already retained. We inspect the
+        # newest 25 matching article candidates even when a keyword already has
+        # 25 older results; enforce_limits() then keeps the newest 25 globally.
+        counts = {(k[0] or "").casefold(): 0 for k in keywords}
 
         articles = _load_corpus(session)
         existing = {
@@ -181,23 +194,38 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
 
         to_alert: list[tuple[Mention, list[str]]] = []
         for ca in articles:
+            if result_policy.all_full(counts):
+                summary["limit_reached"] = True
+                break
             summary["articles_checked"] += 1
             haystack = f"{ca.title}\n{ca.body}"
             matches = find_matches(haystack, keywords)
             if not matches:
                 continue
             matched_kw = sorted({m.keyword for m in matches})
+            admitted = []
+            for label in matched_kw:
+                folded = label.casefold()
+                if counts.get(folded, 0) >= settings.keyword_result_limit:
+                    continue
+                counts[folded] = counts.get(folded, 0) + 1
+                admitted.append(label)
+            if not admitted:
+                continue
             mention = existing.get(ca.external_id)
             if mention is not None:
-                new_kw = [k for k in matched_kw if k not in (mention.matched_keywords or [])]
+                if mention.published_at is None:
+                    mention.published_at = ca.fetched_at
+                present = {(k or "").casefold() for k in (mention.matched_keywords or [])}
+                new_kw = [k for k in admitted if k.casefold() not in present]
                 if not new_kw:
                     continue
                 mention.matched_keywords = sorted(
-                    set(mention.matched_keywords or []) | set(matched_kw)
+                    set(mention.matched_keywords or []) | set(new_kw)
                 )
                 to_alert.append((mention, new_kw))
                 continue
-            snippet = _make_snippet(haystack, matched_kw)
+            snippet = _make_snippet(haystack, admitted)
             mention = Mention(
                 module="newspaper",
                 external_id=ca.external_id,
@@ -205,14 +233,15 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
                 section=ca.section,
                 title=ca.title,
                 url=ca.url,
-                matched_keywords=matched_kw,
+                matched_keywords=admitted,
                 snippet=snippet,
                 summary=snippet,
+                published_at=ca.fetched_at,
             )
             session.add(mention)
             existing[ca.external_id] = mention
             summary["mentions"] += 1
-            to_alert.append((mention, matched_kw))
+            to_alert.append((mention, admitted))
 
         try:
             session.commit()  # ONE round-trip for every hit
@@ -225,24 +254,46 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
                 return run_quick_match(keyword_ids, _retry=False)
             raise
 
-        # Alerts after the data is safe; notified flags land in one commit too.
-        any_alert = False
-        for mention, kws in to_alert:
-            ok = notifier.send(Alert(
-                source=mention.source, title=mention.title,
-                summary=mention.summary or "", sentiment=mention.sentiment,
-                url=mention.url, matched_keywords=kws,
-            ))
-            if ok:
-                mention.notified = True
-                summary["alerts"] += 1
-                any_alert = True
-        if any_alert:
-            session.commit()
+        deferred_alerts = [(mention.id, kws) for mention, kws in to_alert]
 
         from app.epaper.pipeline import match_stored_pages
 
-        match_stored_pages(session, keywords, notifier, summary, since_days=None)
+        match_stored_pages(
+            session,
+            keywords,
+            notifier,
+            summary,
+            since_days=settings.keyword_result_retention_days,
+            cap_new=True,
+            deferred_alerts=deferred_alerts,
+        )
+        result_policy.enforce_limits(session)
+
+        # Alert only for associations that survived the global newest-25 policy.
+        for mention_id, candidate_kws in deferred_alerts:
+            mention = session.get(Mention, mention_id)
+            if mention is None:
+                continue
+            retained = {
+                (label or "").casefold(): label
+                for label in (mention.matched_keywords or [])
+            }
+            kws = [
+                retained[k.casefold()]
+                for k in candidate_kws
+                if k.casefold() in retained
+            ]
+            if not kws:
+                continue
+            media = mention.keyword_media or {}
+            image_path = next(
+                (
+                    path for label, path in media.items()
+                    if label.casefold() == kws[0].casefold()
+                ),
+                mention.screenshot_path,
+            )
+            _send_alert(notifier, session, mention, image_path, summary, kws)
         return summary
     finally:
         session.close()
@@ -340,6 +391,8 @@ def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, sum
         if not new_kw:
             return False
         mention.matched_keywords = sorted(set(mention.matched_keywords or []) | set(matched_kw))
+        if mention.published_at is None:
+            mention.published_at = ca.fetched_at
         # Drop old screenshot so backfill re-captures with highlights for current keywords only.
         mention.screenshot_path = None
         mention.full_screenshot_path = None
@@ -380,6 +433,7 @@ def _match_and_store(session, scraper, ca: ArticleCache, keywords, notifier, sum
         sentiment=sentiment,
         screenshot_path=str(crop_path) if crop_path else None,
         full_screenshot_path=str(full_path) if full_path else None,
+        published_at=ca.fetched_at,
     )
     session.add(mention)
     try:

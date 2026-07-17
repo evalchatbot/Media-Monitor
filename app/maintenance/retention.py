@@ -7,8 +7,9 @@ Windows (configurable in .env):
   logs         24 months — delete ScrapeRun audit rows past the window
 
 alerts.log is append-only; rotate it with an OS log-rotation tool if it grows.
-Deleting old files/rows never touches Mention records, so detection history and
-the digest stay intact; only the heavy artifacts/caches are pruned.
+Keyword results are retained for their configured rolling window (90 days by
+default), then their Mention rows expire. Each keyword also keeps only its
+newest configured number of results (25 by default).
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 
 from config import settings
+from app.core import result_policy
 from app.db.base import SessionLocal
 from app.db.models import ArticleCache, EPaperPage, Mention, ScrapeRun
 
@@ -27,10 +29,15 @@ logger = logging.getLogger(__name__)
 def run_retention() -> dict:
     now = datetime.now(timezone.utc)
     summary = {"screenshots_deleted": 0, "cache_rows_deleted": 0,
-               "epaper_rows_deleted": 0, "scrape_rows_deleted": 0}
+               "epaper_rows_deleted": 0, "scrape_rows_deleted": 0,
+               "mentions_expired": 0, "keyword_links_trimmed": 0}
 
     # --- Screenshots + e-paper page scans ---
-    cutoff_shots = now - timedelta(days=settings.retention_screenshots_days)
+    # Never prune a visual before its keyword result expires.
+    cutoff_shots = now - timedelta(days=max(
+        settings.retention_screenshots_days,
+        settings.keyword_result_retention_days,
+    ))
     storage = settings.storage_dir
     if storage.exists():
         for pattern in ("*.png", "*.jpg", "*.jpeg"):
@@ -45,6 +52,11 @@ def run_retention() -> dict:
 
     session = SessionLocal()
     try:
+        policy = result_policy.enforce_limits(session)
+        summary["mentions_expired"] = policy["expired"]
+        summary["keyword_links_trimmed"] = policy["trimmed"]
+        summary["screenshots_deleted"] += policy["files_deleted"]
+
         # Clear DB references to screenshots that no longer exist on disk.
         for m in session.execute(select(Mention)).scalars():
             changed = False
@@ -53,6 +65,11 @@ def run_retention() -> dict:
                 if p and not _exists(p):
                     setattr(m, attr, None)
                     changed = True
+            media = dict(m.keyword_media or {})
+            live_media = {label: path for label, path in media.items() if _exists(path)}
+            if len(live_media) != len(media):
+                m.keyword_media = live_media
+                changed = True
             if changed:
                 session.add(m)
         session.commit()

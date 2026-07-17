@@ -25,12 +25,13 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from config import settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import EPaperPage, Keyword, Mention
+from app.core import result_policy
 from app.epaper import scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
@@ -568,7 +569,35 @@ def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
 
 
 def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> str:
-    thumb = _media_url(m.screenshot_path) or _media_url(m.full_screenshot_path)
+    hl = list(highlight_keywords or [])
+    keyword_path = None
+    if len(hl) == 1:
+        needle = hl[0].casefold()
+        keyword_path = next(
+            (
+                path for label, path in (m.keyword_media or {}).items()
+                if (label or "").casefold() == needle
+            ),
+            None,
+        )
+        if keyword_path and not _storage_file(keyword_path):
+            keyword_path = None
+    # Legacy multi-keyword e-paper rows may predate keyword_media. Their one
+    # shared clipping could belong to a different article on the same page, so
+    # prefer the full page until a rescan creates a verified per-keyword clip.
+    safe_fallback = m.screenshot_path
+    if (
+        m.module == "epaper"
+        and len(m.matched_keywords or []) > 1
+        and len(hl) == 1
+        and not keyword_path
+    ):
+        safe_fallback = m.full_screenshot_path
+    thumb = (
+        _media_url(keyword_path)
+        or _media_url(safe_fallback)
+        or _media_url(m.full_screenshot_path)
+    )
     full = _media_url(m.full_screenshot_path) or thumb
     badge = ""
     if m.module == "epaper" and m.section:
@@ -587,10 +616,10 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> 
     else:
         img = ('<div class="shot missing"><span class="noprev">No preview</span></div>')
     # Only highlight / tag watchlist keywords that are still active (or the filter).
-    hl = list(highlight_keywords or [])
     show_tags = hl
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in show_tags)
-    when = m.detected_at.astimezone(_PKT).strftime("%d %b %Y, %H:%M") if m.detected_at else ""
+    occurred = m.published_at or m.detected_at
+    when = _utc(occurred).astimezone(_PKT).strftime("%d %b %Y, %H:%M") if occurred else ""
     kind = "E-Paper" if m.module == "epaper" else "Web"
     meta = " · ".join(x for x in [kind, m.source, m.sentiment, when] if x)
     excerpt = _highlight_excerpt(m.snippet, hl)
@@ -636,6 +665,7 @@ def _refresh_mention_visuals(db: Session, m: Mention) -> bool:
     if not kws:
         return False
     old_shot, old_full = m.screenshot_path, m.full_screenshot_path
+    old_keyword_paths = set((m.keyword_media or {}).values())
 
     if m.module == "epaper":
         parts = (m.external_id or "").split(":")
@@ -663,24 +693,37 @@ def _refresh_mention_visuals(db: Session, m: Mention) -> bool:
             if k.text
         }
         kw_lang = {k: langs.get(k, "en") for k in kws}
-        snippet = m.snippet or _snippet(row.ocr_text or "", kws)
-        clip = _make_clip(row, kws, kw_lang, snippet)
+        media = {}
+        for keyword in kws:
+            snippet = _snippet(row.ocr_text or "", [keyword])
+            clip = _make_clip(
+                row, [keyword], {keyword: kw_lang.get(keyword, "en")}, snippet
+            )
+            if clip:
+                media[keyword] = clip
         shot = _detection_shot(row)
-        m.screenshot_path = clip or shot
+        m.keyword_media = media
+        m.screenshot_path = next(iter(media.values()), None) or shot
         m.full_screenshot_path = shot or m.full_screenshot_path
         db.flush()
         if old_shot and old_shot != m.screenshot_path:
             _unlink_orphan_media(db, old_shot, m.id)
         if old_full and old_full != m.full_screenshot_path:
             _unlink_orphan_media(db, old_full, m.id)
+        current = set(media.values())
+        for old in old_keyword_paths - current:
+            _unlink_orphan_media(db, old, m.id)
         return True
 
     # Website: drop old baked highlights; backfill re-captures with current keywords.
     m.screenshot_path = None
     m.full_screenshot_path = None
+    m.keyword_media = {}
     db.flush()
     _unlink_orphan_media(db, old_shot, m.id)
     _unlink_orphan_media(db, old_full, m.id)
+    for old in old_keyword_paths:
+        _unlink_orphan_media(db, old, m.id)
     return True
 
 
@@ -695,8 +738,12 @@ def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
         kws = list(m.matched_keywords or [])
         if not any((k or "").casefold() == needle for k in kws):
             continue
-        for attr in ("screenshot_path", "full_screenshot_path"):
-            if _unlink_orphan_media(db, getattr(m, attr), m.id):
+        paths = {
+            m.screenshot_path, m.full_screenshot_path,
+            *(m.keyword_media or {}).values(),
+        }
+        for path in paths:
+            if _unlink_orphan_media(db, path, m.id):
                 files += 1
         db.delete(m)
         deleted += 1
@@ -726,8 +773,12 @@ def _scrub_deleted_keywords(db: Session) -> dict:
                 if m.module == "newspaper":
                     need_web_backfill = True
             continue
-        for attr in ("screenshot_path", "full_screenshot_path"):
-            if _unlink_orphan_media(db, getattr(m, attr), m.id):
+        paths = {
+            m.screenshot_path, m.full_screenshot_path,
+            *(m.keyword_media or {}).values(),
+        }
+        for path in paths:
+            if _unlink_orphan_media(db, path, m.id):
                 files += 1
         db.delete(m)
         deleted += 1
@@ -780,6 +831,13 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
     ).first()
     if still:
         return False
+    # JSON keyword-specific clips are references too; SQL JSON containment is
+    # not portable across SQLite/Postgres, so check the small retained set here.
+    for mention in db.execute(select(Mention)).scalars():
+        if mention.id == except_id:
+            continue
+        if path in (mention.keyword_media or {}).values():
+            return False
     f = _storage_file(path)
     if not f:
         return False
@@ -848,10 +906,9 @@ def home(request: Request, db: Session = Depends(get_db)):
     scanning_now = bool(news_st.get("running") or ep_st.get("running"))
     if qp.get("removed"):
         banner = (
-            f'<div class="banner ok">Removed <b>{html.escape(qp.get("removed"))}</b> and '
-            f'deleted <b>{html.escape(qp.get("purged") or "0")}</b> related result(s)'
-            f'{(" · " + html.escape(qp["files"]) + " file(s) freed") if qp.get("files") else ""}.'
-            f"</div>"
+            f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
+            "watchlist. Its results remain safely retained for 90 days and return if you add it again."
+            "</div>"
         )
     elif qp.get("scanning") or (scanning_now and keyword):
         who = html.escape(keyword or news_st.get("keyword") or ep_st.get("label") or "keyword")
@@ -883,16 +940,32 @@ def home(request: Request, db: Session = Depends(get_db)):
     active_fold = _active_keyword_fold(db)
 
     if searched:
-        day_start = datetime(show_date.year, show_date.month, show_date.day, tzinfo=_PKT)
-        day_end = day_start + timedelta(days=1)
+        first_date = (
+            show_date - timedelta(days=settings.keyword_result_retention_days - 1)
+            if keyword else show_date
+        )
+        day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
+        day_end = datetime(
+            show_date.year, show_date.month, show_date.day, tzinfo=_PKT
+        ) + timedelta(days=1)
         start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
         end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
 
         mentions = db.execute(
             select(Mention).where(
-                Mention.detected_at >= start_utc,
-                Mention.detected_at < end_utc,
-            ).order_by(Mention.detected_at.desc()).limit(800)
+                or_(
+                    and_(
+                        Mention.published_at.is_not(None),
+                        Mention.published_at >= start_utc,
+                        Mention.published_at < end_utc,
+                    ),
+                    and_(
+                        Mention.published_at.is_(None),
+                        Mention.detected_at >= start_utc,
+                        Mention.detected_at < end_utc,
+                    ),
+                )
+            ).order_by(Mention.detected_at.desc())
         ).scalars().all()
 
         if selected_set:
@@ -914,7 +987,8 @@ def home(request: Request, db: Session = Depends(get_db)):
         else:
             mentions = [m for m in mentions if _live_matched(m, active_fold)]
 
-        shown = mentions[:80]
+        mentions.sort(key=result_policy.effective_time, reverse=True)
+        shown = mentions[:settings.keyword_result_limit if keyword else 80]
         if shown:
             cards = []
             for m in shown:
@@ -928,8 +1002,9 @@ def home(request: Request, db: Session = Depends(get_db)):
             more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
                     f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
         else:
-            grid = ('<div class="empty">No matches for this date, keyword, and paper selection.'
-                    "<br>Try another day or clear the keyword.</div>")
+            scope = "the 90 days through this date" if keyword else "this date"
+            grid = (f'<div class="empty">No matches for {scope}, keyword, and paper selection.'
+                    "<br>Try another date or clear the keyword.</div>")
             more = ""
         results_html = f"""
         <section class="results" id="results">
@@ -960,7 +1035,7 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'<button type="submit" class="kw-play" title="Scan this keyword now" '
             f'aria-label="Scan">▶</button></form>'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Remove “{html.escape(k.text, quote=True)}” and DELETE all its results? Other keywords will need ▶ to rebuild shared cards.')\">"
+            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 90 days.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
             for k in active_kws
@@ -987,7 +1062,7 @@ def home(request: Request, db: Session = Depends(get_db)):
           <button type="submit">+ Add</button>
         </form>
         <div class="kw-bar">
-          <div class="cap">Watchlist · click to filter · ▶ scan · × delete</div>
+          <div class="cap">Watchlist · click to filter · ▶ scan · × hide</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one above.</span>'}</div>
         </div>
       </div>
@@ -1054,12 +1129,31 @@ def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
         return RedirectResponse("/", status_code=303)
     language = language if language in ("en", "ur") else "en"
     existing = db.execute(
-        select(Keyword).where(Keyword.text == text, Keyword.language == language)
+        select(Keyword).where(
+            func.lower(Keyword.text) == text.lower(),
+            Keyword.language == language,
+            Keyword.module == "newspaper",
+        )
     ).scalar_one_or_none()
     today = datetime.now(_PKT).date().isoformat()
     if existing:
-        # Already on the watchlist — just open its results, don't re-fire a scan.
-        return _home_redirect({"q": text, "go": "1", "date": today})
+        if existing.active:
+            return _home_redirect({"q": existing.text, "go": "1", "date": today})
+        # Soft-deleted keywords retain their associations. Reactivation restores
+        # them immediately, then searches current-to-oldest for any missing hits.
+        existing.active = True
+        db.commit()
+        res = _start_keyword_scan(existing)
+        return _home_redirect({
+            "q": existing.text,
+            "go": "1",
+            "date": today,
+            "scanning": "1",
+            "busy": "1" if not res.get("live_started") else None,
+            "checked": res.get("articles_checked", 0),
+            "pages": res.get("pages_checked", 0),
+            "found": res.get("mentions", 0),
+        })
 
     kw = Keyword(text=text, language=language, module="newspaper", active=True)
     db.add(kw)
@@ -1105,20 +1199,10 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
     if not kw:
         return RedirectResponse("/", status_code=303)
     text = kw.text
-    purged = _purge_keyword_results(db, text)
-    # Catch any other deleted labels left on older rows.
-    extra = _scrub_deleted_keywords(db)
-    purged["mentions_deleted"] += extra["mentions_deleted"]
-    purged["files_deleted"] += extra["files_deleted"]
-    # Re-load in case the earlier commit expired the instance.
-    kw = db.get(Keyword, kid)
-    if kw:
-        db.delete(kw)
-        db.commit()
+    kw.active = False
+    db.commit()
     return _home_redirect({
         "removed": text,
-        "purged": purged["mentions_deleted"],
-        "files": purged["files_deleted"] or None,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
     })
@@ -1226,13 +1310,32 @@ def list_keywords(db: Session = Depends(get_db)):
 
 @app.get("/api/mentions")
 def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
-    rows = db.execute(select(Mention).order_by(Mention.detected_at.desc()).limit(limit)).scalars().all()
+    limit = max(1, min(limit, 500))
+    rows = db.execute(
+        select(Mention).where(
+            func.coalesce(Mention.published_at, Mention.detected_at)
+            >= result_policy.cutoff()
+        ).order_by(Mention.detected_at.desc())
+    ).scalars().all()
+    active = _active_keyword_fold(db)
     if keyword:
-        rows = [m for m in rows if keyword in (m.matched_keywords or [])]
+        folded = keyword.casefold()
+        if folded not in active:
+            rows = []
+        else:
+            rows = [
+                m for m in rows
+                if any((label or "").casefold() == folded for label in (m.matched_keywords or []))
+            ]
+    else:
+        rows = [m for m in rows if _live_matched(m, active)]
+    rows.sort(key=result_policy.effective_time, reverse=True)
+    rows = rows[:limit]
     return [
         {
             "id": m.id, "module": m.module, "source": m.source, "title": m.title,
-            "url": m.url, "matched_keywords": m.matched_keywords, "sentiment": m.sentiment,
+            "url": m.url, "matched_keywords": _live_matched(m, active),
+            "sentiment": m.sentiment,
             "detected_at": m.detected_at.isoformat() if m.detected_at else None,
         }
         for m in rows

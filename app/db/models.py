@@ -66,6 +66,10 @@ class Mention(Base):
     url: Mapped[str] = mapped_column(Text, nullable=False)
 
     matched_keywords: Mapped[list] = mapped_column(JSON, default=list)
+    # Per-keyword visual artifacts. E-paper pages can contain several matched
+    # articles, so one shared clipping is not sufficient. Keys are canonical
+    # keyword text; values are clipping paths.
+    keyword_media: Mapped[dict] = mapped_column(JSON, default=dict)
     snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
