@@ -1050,9 +1050,10 @@ def home(request: Request, db: Session = Depends(get_db)):
     active_fold = _active_keyword_fold(db)
 
     if searched:
-        first_date = (
-            show_date - timedelta(days=settings.keyword_result_retention_days - 1)
-            if keyword else show_date
+        # Single keyword and All both use the rolling retention window so All
+        # shows every active keyword's retained hits together.
+        first_date = show_date - timedelta(
+            days=settings.keyword_result_retention_days - 1
         )
         day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
         day_end = datetime(
@@ -1094,11 +1095,17 @@ def home(request: Request, db: Session = Depends(get_db)):
                     m for m in mentions
                     if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
                 ]
+            show_limit = settings.keyword_result_limit
         else:
+            # All: every mention that still matches at least one present keyword.
             mentions = [m for m in mentions if _live_matched(m, active_fold)]
+            show_limit = min(
+                200,
+                settings.keyword_result_limit * max(len(active_fold), 1),
+            )
 
         mentions.sort(key=result_policy.effective_time, reverse=True)
-        shown = mentions[:settings.keyword_result_limit if keyword else 80]
+        shown = mentions[:show_limit]
         spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
         if shown:
             cards = []
@@ -1116,10 +1123,14 @@ def home(request: Request, db: Session = Depends(get_db)):
         elif results_scanning:
             grid = ('<div class="empty loading"><span class="spin"></span></div>')
             more = ""
+        elif not active_fold:
+            grid = ('<div class="empty">No active keywords on the watchlist yet.'
+                    "<br>Add keywords above, then Confirm &amp; scan.</div>")
+            more = ""
         else:
-            scope = "the 90 days through this date" if keyword else "this date"
-            grid = (f'<div class="empty">No matches for {scope}, keyword, and paper selection.'
-                    "<br>Try another date or clear the keyword.</div>")
+            grid = ('<div class="empty">No matches for the 90 days through this date '
+                    "and paper selection."
+                    "<br>Try another date or run ▶ on a keyword.</div>")
             more = ""
         results_html = f"""
         <section class="results" id="results">
