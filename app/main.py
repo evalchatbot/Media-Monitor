@@ -861,17 +861,33 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
 
 
 def _start_keyword_scan(kw: Keyword) -> dict:
-    """Instant corpus match + background fresh scan for ONE keyword only.
+    """Kick off matching without blocking the HTTP response.
 
-    Dedup is enforced by Mention(module, external_id) uniqueness — re-scans
-    update the same row (merge keywords / refresh shot) instead of duplicating.
+    Instant corpus match runs in a background thread; live newspaper + e-paper
+    scans run as subprocesses. The UI redirects immediately and polls until
+    those jobs finish — keeping ▶ / Add from timing out on Railway.
     """
-    res = run_quick_match(keyword_ids=[kw.id])
+    import threading
+
     news_ok = scan_manager.start_scan(
         keyword_ids=[kw.id], keyword_label=kw.text, capped=True)
     ep_ok = scan_runner.start_scan(keyword_ids=[kw.id], label=kw.text)
-    res["live_started"] = bool(news_ok or ep_ok)
-    return res
+
+    kid = kw.id
+
+    def _bg_quick() -> None:
+        try:
+            run_quick_match(keyword_ids=[kid])
+        except Exception as exc:  # pragma: no cover
+            logger.exception("background quick match failed for keyword %s: %s", kid, exc)
+
+    threading.Thread(target=_bg_quick, daemon=True, name=f"quick-match-{kid}").start()
+    return {
+        "live_started": bool(news_ok or ep_ok),
+        "articles_checked": 0,
+        "pages_checked": 0,
+        "mentions": 0,
+    }
 
 
 # ==========================================================================
