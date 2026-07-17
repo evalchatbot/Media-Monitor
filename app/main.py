@@ -609,7 +609,8 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> 
         else:
             badge = f'<span class="pagebadge">p.{html.escape(pg)}</span>'
     if thumb:
-        zoom = html.escape(full or thumb)
+        # Zoom the preview itself (cutout). Full page stays on the "p.N · full" badge.
+        zoom = html.escape(thumb)
         img = (f'<div class="shot">{badge}'
                f'<img loading="lazy" class="zoom" src="{html.escape(thumb)}" '
                f'data-full="{zoom}" alt=""></div>')
