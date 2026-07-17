@@ -1,14 +1,15 @@
 """Data-retention cleanup (runs daily via the scheduler).
 
 Windows (configurable in .env):
-  screenshots  30 days   — delete screenshots + e-paper page scans under
+  screenshots  90 days   — delete screenshots + e-paper page scans under
                            data/storage; clear dead DB paths
   cached text  12 months — delete ArticleCache + EPaperPage rows past the window
   logs         24 months — delete ScrapeRun audit rows past the window
 
 alerts.log is append-only; rotate it with an OS log-rotation tool if it grows.
-Keyword results are retained for their configured rolling window (30 days by
-default), then their Mention rows expire. Each keyword also keeps only its
+Keyword results are retained for their configured rolling window (90 days by
+default), then their Mention rows expire. Live search only looks back the
+configured search window (30 days by default). Each keyword also keeps only its
 newest configured number of results (25 by default).
 """
 from __future__ import annotations

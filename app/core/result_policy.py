@@ -11,7 +11,13 @@ from app.db.models import EPaperPage, Mention
 
 
 def cutoff() -> datetime:
+    """Retention floor — results older than this may be deleted."""
     return datetime.now(timezone.utc) - timedelta(days=settings.keyword_result_retention_days)
+
+
+def search_cutoff() -> datetime:
+    """Search floor — Confirm / Results / API only look this far back."""
+    return datetime.now(timezone.utc) - timedelta(days=settings.keyword_search_days)
 
 
 def effective_time(mention: Mention) -> datetime:

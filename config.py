@@ -128,11 +128,14 @@ class Settings(BaseSettings):
     # ANTHROPIC_API_KEY. Model defaults to LLM_MODEL when empty.
     epaper_ocr_model: str = ""
 
-    # --- Data retention (days) ---
-    # A keyword owns at most this many unique results from the rolling window.
+    # --- Keyword results ---
+    # A keyword owns at most this many unique results inside the retention window.
     keyword_result_limit: int = 25
-    keyword_result_retention_days: int = 30
-    retention_screenshots_days: int = 30
+    # How long results (and soft-hidden keywords' hits) are kept on disk/DB.
+    keyword_result_retention_days: int = 90
+    # Live search / Confirm / Results UI look back this many days from "today".
+    keyword_search_days: int = 30
+    retention_screenshots_days: int = 90
     retention_transcripts_days: int = 365
     retention_logs_days: int = 730
 

@@ -921,7 +921,7 @@ def _results_section_html(
     """Build the Results panel HTML and a cheap change-detection signature."""
     active_fold = _active_keyword_fold(db)
     first_date = show_date - timedelta(
-        days=settings.keyword_result_retention_days - 1
+        days=settings.keyword_search_days - 1
     )
     day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
     day_end = datetime(
@@ -1152,7 +1152,7 @@ def home(request: Request, db: Session = Depends(get_db)):
     if qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
-            "watchlist. Its results remain safely retained for 30 days and return if you add it again."
+            "watchlist. Its results remain safely retained for 90 days and return if you add it again."
             "</div>"
         )
 
@@ -1201,7 +1201,7 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 30 days.')\">"
+            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 90 days.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
         )
@@ -1519,7 +1519,7 @@ def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = De
     rows = db.execute(
         select(Mention).where(
             func.coalesce(Mention.published_at, Mention.detected_at)
-            >= result_policy.cutoff()
+            >= result_policy.search_cutoff()
         ).order_by(Mention.detected_at.desc())
     ).scalars().all()
     active = _active_keyword_fold(db)

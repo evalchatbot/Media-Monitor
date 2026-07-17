@@ -132,7 +132,7 @@ def _load_corpus(session) -> list:
     stamp = tuple(session.execute(
         select(_f.count(ArticleCache.id), _f.coalesce(_f.max(ArticleCache.id), 0))
         .where(ArticleCache.module == "newspaper")
-    ).one()) + (result_policy.cutoff().date().isoformat(),)
+    ).one()) + (result_policy.search_cutoff().date().isoformat(),)
     if _CORPUS["stamp"] == stamp:
         return _CORPUS["rows"]
     rows = session.execute(
@@ -141,7 +141,7 @@ def _load_corpus(session) -> list:
                ArticleCache.fetched_at)
         .where(
             ArticleCache.module == "newspaper",
-            ArticleCache.fetched_at >= result_policy.cutoff(),
+            ArticleCache.fetched_at >= result_policy.search_cutoff(),
         )
         .order_by(ArticleCache.fetched_at.desc())
     ).all()
@@ -279,7 +279,7 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
             keywords,
             notifier,
             summary,
-            since_days=settings.keyword_result_retention_days,
+            since_days=settings.keyword_search_days,
             cap_new=True,
             deferred_alerts=deferred_alerts,
             # Keyword Confirm must stay fast: clickable cutouts only, no vision OCR.
