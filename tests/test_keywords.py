@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Keyword-matching precision suite.
+"""Keyword-matching precision suite (exact whole-word / phrase only).
 
-Run:  python -m tests.test_keywords          (no test framework needed)
-
-These cases encode the matcher's contract — including regressions that shipped
-once and must never return:
-- "rape" matched rate/rare/race/rope/grape/scrape and polluted every scan
-  (fuzzy budget now scales with keyword length; matching is word-boundary).
-- Urdu code-point variants (Arabic kaf/yeh vs Urdu keheh/yeh) and harakat must
-  unify so Whisper/vision output matches user-typed keywords.
+Run:  python -m tests.test_keywords
 """
 from __future__ import annotations
 
@@ -29,7 +22,7 @@ def has(text: str, kw: str, lang: str = "en") -> bool:
     return bool(find_matches(text, [(kw, lang)]))
 
 
-# --- Short keywords must not fuzzy-drift or substring-match -----------------
+# --- Must not substring-match ------------------------------------------------
 for word, body in {
     "grape": "the grape harvest was good",
     "scrape": "he got a scrape on his knee",
@@ -46,38 +39,40 @@ for word, body in {
 }.items():
     check(f"rape !~ {word}", has(body, "rape"), False)
 
-# --- Genuine mentions + light inflection still match ------------------------
+# --- Exact whole word only (no inflection, no fuzzy) -------------------------
 check("rape == rape", has("a rape case was reported", "rape"), True)
-check("rape ~ raped", has("the victim was raped", "rape"), True)
-check("rape ~ rapes", has("reports of rapes rose", "rape"), True)
+check("rape !~ raped", has("the victim was raped", "rape"), False)
+check("rape !~ rapes", has("reports of rapes rose", "rape"), False)
 check("rape + punct", has("the charge was rape.", "rape"), True)
 
-# --- <=3-char keywords: whole word only --------------------------------------
 check("war !~ ward", has("the ward was full", "war"), False)
 check("war !~ toward", has("moving toward peace", "war"), False)
 check("war !~ warning", has("a stern warning", "war"), False)
 check("war == war", has("the war continues", "war"), True)
 
-# --- Word boundaries beat substrings -----------------------------------------
 check("Modi !~ modify", has("we must modify the plan", "Modi"), False)
 check("Modi == Modi", has("PM Modi spoke", "Modi"), True)
 check("coal !~ coalition", has("the coalition government", "coal"), False)
 check("protest !~ protestant", has("a protestant church", "protest"), False)
-check("protest ~ protesting", has("crowds protesting downtown", "protest"), True)
+check("protest !~ protesting", has("crowds protesting downtown", "protest"), False)
+check("protest == protest", has("a protest downtown", "protest"), True)
 
-# --- Longer keywords keep useful fuzz ----------------------------------------
-check("Pakistan ~ Pakistani", has("a Pakistani official said", "Pakistan"), True)
+check("Pakistan !~ Pakistani", has("a Pakistani official said", "Pakistan"), False)
 check("Pakistan == Pakistan", has("Pakistan today", "Pakistan"), True)
+check("BLA == BLA", has("BLA claimed responsibility", "BLA"), True)
+check("BLA !~ black", has("a black car", "BLA"), False)
+check("aleema khan ==", has("Senator Aleema Khan spoke today", "aleema khan"), True)
+check("aleema khan !~ partial", has("Aleema spoke today", "aleema khan"), False)
 check("budget scaling", [fuzzy_budget(k) for k in ("war", "rape", "biden", "pakistan")],
-      [0, 0, 1, 2])
+      [0, 0, 0, 0])
 
 # --- Multi-word ---------------------------------------------------------------
 check("phrase match", has("the foreign affairs ministry", "foreign affairs"), True)
 check("phrase !~ prefix", has("foreigners arrived", "foreign affairs"), False)
 
-# --- Urdu: code-point + harakat unification ----------------------------------
-check("ur codepoint kaf", has("حکومت پاكستان نے کہا", "پاکستان", "ur"), True)   # Arabic kaf in text
-check("ur harakat", has("پاکِسْتان کا اعلان", "پاکستان", "ur"), True)             # diacritics in text
+# --- Urdu: code-point + harakat unification (still exact after normalize) ----
+check("ur codepoint kaf", has("حکومت پاكستان نے کہا", "پاکستان", "ur"), True)
+check("ur harakat", has("پاکِسْتان کا اعلان", "پاکستان", "ur"), True)
 check("ur multiword", has("ایران کے رہنما آیت اللہ خامنہ ای نے", "خامنہ ای", "ur"), True)
 check("ur absent", has("یہ ایک عام جملہ ہے", "خامنہ ای", "ur"), False)
 check("ur normalize", normalize("پاكستان", "ur"), normalize("پاکستان", "ur"))
