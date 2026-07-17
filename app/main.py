@@ -403,6 +403,27 @@ _JS = """
   });
 
   var wasScanning=__SCANNING__;
+  var lastResultsSig=(document.getElementById('results')||{}).getAttribute
+    ? (document.getElementById('results').getAttribute('data-sig')||'')
+    : '';
+  async function refreshResults(){
+    var el=document.getElementById('results');
+    if(!el)return;
+    var params=new URLSearchParams(location.search);
+    if(!params.has('go')&&!(params.get('q')||'').trim())return;
+    try{
+      var r=await fetch('/ui/results?'+params.toString(),{headers:{'Accept':'text/html'}});
+      if(!r.ok)return;
+      var sig=r.headers.get('X-Results-Sig')||'';
+      var html=await r.text();
+      if(sig && sig===lastResultsSig)return;
+      lastResultsSig=sig||lastResultsSig;
+      var wrap=document.createElement('div');
+      wrap.innerHTML=html.trim();
+      var next=wrap.firstElementChild;
+      if(next)el.replaceWith(next);
+    }catch(err){}
+  }
   async function poll(){
     try{
       var n=await fetch('/api/scan/status').then(function(r){return r.json()});
@@ -411,6 +432,8 @@ _JS = """
       var running=n.running||e.running||q.running;
       var side=document.getElementById('live-state');
       var b=document.getElementById('scanbtn');
+      // Stream new matches into the results grid while work is ongoing.
+      await refreshResults();
       if(running){
         if(side)side.innerHTML='<span class="dot busy"></span>Working…';
         if(b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
@@ -418,7 +441,8 @@ _JS = """
       wasScanning=running;
     }catch(err){}
   }
-  setInterval(poll,3000);
+  setInterval(poll,1500);
+  if(document.getElementById('results'))setTimeout(refreshResults,400);
 
   /* Draft multiple keywords, then Confirm & scan (FIFO) */
   (function(){
@@ -879,6 +903,109 @@ def _home_redirect(extra: dict | None = None) -> RedirectResponse:
     return RedirectResponse("/" + (f"?{q}" if q else ""), status_code=303)
 
 
+def _results_section_html(
+    db: Session,
+    *,
+    show_date,
+    keyword: str,
+    selected_set: set[str],
+    results_scanning: bool,
+) -> tuple[str, str]:
+    """Build the Results panel HTML and a cheap change-detection signature."""
+    active_fold = _active_keyword_fold(db)
+    first_date = show_date - timedelta(
+        days=settings.keyword_result_retention_days - 1
+    )
+    day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
+    day_end = datetime(
+        show_date.year, show_date.month, show_date.day, tzinfo=_PKT
+    ) + timedelta(days=1)
+    start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
+
+    mentions = db.execute(
+        select(Mention).where(
+            or_(
+                and_(
+                    Mention.published_at.is_not(None),
+                    Mention.published_at >= start_utc,
+                    Mention.published_at < end_utc,
+                ),
+                and_(
+                    Mention.published_at.is_(None),
+                    Mention.detected_at >= start_utc,
+                    Mention.detected_at < end_utc,
+                ),
+            )
+        ).order_by(Mention.detected_at.desc())
+    ).scalars().all()
+
+    if selected_set:
+        mentions = [m for m in mentions if (m.source or "") in selected_set]
+    else:
+        mentions = []
+
+    if keyword:
+        kw_l = keyword.casefold()
+        if kw_l not in active_fold:
+            mentions = []
+        else:
+            mentions = [
+                m for m in mentions
+                if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
+            ]
+        show_limit = settings.keyword_result_limit
+    else:
+        mentions = [m for m in mentions if _live_matched(m, active_fold)]
+        show_limit = min(
+            200,
+            settings.keyword_result_limit * max(len(active_fold), 1),
+        )
+
+    mentions.sort(key=result_policy.effective_time, reverse=True)
+    shown = mentions[:show_limit]
+    spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
+    if shown:
+        cards = []
+        for m in shown:
+            live = _live_matched(m, active_fold)
+            if keyword:
+                hl = [active_fold[keyword.casefold()]]
+            else:
+                hl = live
+            cards.append(_detection_card(
+                m, highlight_keywords=hl, scanning=results_scanning))
+        grid = f'<div class="grid">{"".join(cards)}</div>'
+        more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
+                f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
+    elif results_scanning:
+        grid = '<div class="empty loading"><span class="spin"></span></div>'
+        more = ""
+    elif not active_fold:
+        grid = ('<div class="empty">No active keywords on the watchlist yet.'
+                "<br>Add keywords above, then Confirm &amp; scan.</div>")
+        more = ""
+    else:
+        grid = ('<div class="empty">No matches for the 90 days through this date '
+                "and paper selection."
+                "<br>Try another date or run ▶ on a keyword.</div>")
+        more = ""
+
+    max_id = max((m.id for m in shown), default=0)
+    shots = sum(1 for m in shown if m.screenshot_path)
+    sig = f"{len(mentions)}:{max_id}:{shots}:{int(results_scanning)}"
+    html_out = f"""
+        <section class="results" id="results" data-sig="{html.escape(sig)}">
+          <div class="results-head">
+            <h2>Results{spin}</h2>
+            <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
+          </div>
+          {grid}{more}
+        </section>
+        """
+    return html_out, sig
+
+
 def _storage_file(path: str | None) -> Path | None:
     """Resolve a DB media path to a local Path if the file exists."""
     if not path:
@@ -1049,97 +1176,13 @@ def home(request: Request, db: Session = Depends(get_db)):
     active_fold = _active_keyword_fold(db)
 
     if searched:
-        # Single keyword and All both use the rolling retention window so All
-        # shows every active keyword's retained hits together.
-        first_date = show_date - timedelta(
-            days=settings.keyword_result_retention_days - 1
+        results_html, _ = _results_section_html(
+            db,
+            show_date=show_date,
+            keyword=keyword,
+            selected_set=selected_set,
+            results_scanning=results_scanning,
         )
-        day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
-        day_end = datetime(
-            show_date.year, show_date.month, show_date.day, tzinfo=_PKT
-        ) + timedelta(days=1)
-        start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
-        end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
-
-        mentions = db.execute(
-            select(Mention).where(
-                or_(
-                    and_(
-                        Mention.published_at.is_not(None),
-                        Mention.published_at >= start_utc,
-                        Mention.published_at < end_utc,
-                    ),
-                    and_(
-                        Mention.published_at.is_(None),
-                        Mention.detected_at >= start_utc,
-                        Mention.detected_at < end_utc,
-                    ),
-                )
-            ).order_by(Mention.detected_at.desc())
-        ).scalars().all()
-
-        if selected_set:
-            mentions = [m for m in mentions if (m.source or "") in selected_set]
-        else:
-            mentions = []
-
-        # Only watchlist-active keywords count — never resurface a removed label
-        # via title/snippet text alone.
-        if keyword:
-            kw_l = keyword.casefold()
-            if kw_l not in active_fold:
-                mentions = []
-            else:
-                mentions = [
-                    m for m in mentions
-                    if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
-                ]
-            show_limit = settings.keyword_result_limit
-        else:
-            # All: every mention that still matches at least one present keyword.
-            mentions = [m for m in mentions if _live_matched(m, active_fold)]
-            show_limit = min(
-                200,
-                settings.keyword_result_limit * max(len(active_fold), 1),
-            )
-
-        mentions.sort(key=result_policy.effective_time, reverse=True)
-        shown = mentions[:show_limit]
-        spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
-        if shown:
-            cards = []
-            for m in shown:
-                live = _live_matched(m, active_fold)
-                if keyword:
-                    hl = [active_fold[keyword.casefold()]]
-                else:
-                    hl = live
-                cards.append(_detection_card(
-                    m, highlight_keywords=hl, scanning=results_scanning))
-            grid = f'<div class="grid">{"".join(cards)}</div>'
-            more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
-                    f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
-        elif results_scanning:
-            grid = ('<div class="empty loading"><span class="spin"></span></div>')
-            more = ""
-        elif not active_fold:
-            grid = ('<div class="empty">No active keywords on the watchlist yet.'
-                    "<br>Add keywords above, then Confirm &amp; scan.</div>")
-            more = ""
-        else:
-            grid = ('<div class="empty">No matches for the 90 days through this date '
-                    "and paper selection."
-                    "<br>Try another date or run ▶ on a keyword.</div>")
-            more = ""
-        results_html = f"""
-        <section class="results" id="results">
-          <div class="results-head">
-            <h2>Results{spin}</h2>
-            <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
-          </div>
-          {grid}{more}
-        </section>
-        """
     else:
         results_html = (
             '<div class="empty">Pick a date, type a keyword if you like, choose newspapers, '
@@ -1268,6 +1311,45 @@ def home(request: Request, db: Session = Depends(get_db)):
 @app.get("/mentions")
 def _gone_pages():
     return RedirectResponse("/", status_code=303)
+
+
+@app.get("/ui/results", response_class=HTMLResponse)
+def ui_results_partial(request: Request, db: Session = Depends(get_db)):
+    """Live Results panel fragment — polled while a scan fills in matches."""
+    today = datetime.now(_PKT).date()
+    qp = request.query_params
+    date_s = (qp.get("date") or today.isoformat()).strip()
+    try:
+        show_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+    except ValueError:
+        show_date = today
+    keyword = (qp.get("q") or qp.get("kw") or "").strip()
+    papers_all = _paper_names()
+    selected = qp.getlist("paper")
+    if not selected and "paper" not in qp:
+        selected = list(papers_all)
+    selected_set = set(selected)
+
+    news_st = scan_manager.status()
+    ep_st = scan_runner.status()
+    q_st = keyword_scan_queue.status()
+    scanning_now = bool(
+        news_st.get("running") or ep_st.get("running") or q_st.get("running")
+    )
+    results_scanning = scanning_now and (
+        bool(qp.get("scanning"))
+        or bool(keyword)
+        or bool((q_st.get("current") or {}).get("text"))
+        or bool(q_st.get("queued"))
+    )
+    html_out, sig = _results_section_html(
+        db,
+        show_date=show_date,
+        keyword=keyword,
+        selected_set=selected_set,
+        results_scanning=results_scanning,
+    )
+    return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
 
 
 # ==========================================================================

@@ -193,6 +193,7 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
         }
 
         to_alert: list[tuple[Mention, list[str]]] = []
+        pending_commit = 0
         for ca in articles:
             if result_policy.all_full(counts):
                 summary["limit_reached"] = True
@@ -224,27 +225,42 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
                     set(mention.matched_keywords or []) | set(new_kw)
                 )
                 to_alert.append((mention, new_kw))
-                continue
-            snippet = _make_snippet(haystack, admitted)
-            mention = Mention(
-                module="newspaper",
-                external_id=ca.external_id,
-                source=ca.source,
-                section=ca.section,
-                title=ca.title,
-                url=ca.url,
-                matched_keywords=admitted,
-                snippet=snippet,
-                summary=snippet,
-                published_at=ca.fetched_at,
-            )
-            session.add(mention)
-            existing[ca.external_id] = mention
-            summary["mentions"] += 1
-            to_alert.append((mention, admitted))
+                pending_commit += 1
+            else:
+                snippet = _make_snippet(haystack, admitted)
+                mention = Mention(
+                    module="newspaper",
+                    external_id=ca.external_id,
+                    source=ca.source,
+                    section=ca.section,
+                    title=ca.title,
+                    url=ca.url,
+                    matched_keywords=admitted,
+                    snippet=snippet,
+                    summary=snippet,
+                    published_at=ca.fetched_at,
+                )
+                session.add(mention)
+                existing[ca.external_id] = mention
+                summary["mentions"] += 1
+                to_alert.append((mention, admitted))
+                pending_commit += 1
+
+            # Flush early so the UI can stream cards while matching continues.
+            if pending_commit >= 5:
+                try:
+                    session.commit()
+                    pending_commit = 0
+                except IntegrityError:
+                    session.rollback()
+                    session.close()
+                    if _retry:
+                        return run_quick_match(keyword_ids, _retry=False)
+                    raise
 
         try:
-            session.commit()  # ONE round-trip for every hit
+            if pending_commit:
+                session.commit()
         except IntegrityError:
             # A concurrent scan inserted one of the same articles between our
             # read and this commit. Start over on fresh state (once).
