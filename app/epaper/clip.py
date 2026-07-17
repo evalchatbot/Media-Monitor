@@ -423,51 +423,41 @@ def _crop(src: Path, box: dict, out: Path, pad_pct: float = 2.0) -> bool:
         b = min(H, int((box["b"] + pad_pct) / 100 * H))
         if r - l < 40 or b - t < 40:
             return False
-        img.crop((l, t, r, b)).save(out, quality=95, subsampling=0)
+        img.crop((l, t, r, b)).save(out, quality=96, subsampling=0)
         return True
     except Exception as exc:
         logger.warning("clip crop failed for %s: %s", src, exc)
         return False
 
 
-# Gentle contrast only — aggressive upscaling turns newsprint crops into mush.
-_MIN_W = 500       # only upscale crops narrower than this
-_MAX_SCALE = 1.15  # at most 15% larger; keeps letter shapes intact
-
-
 def _enhance(path: Path) -> None:
-    """Light contrast pass for scanned newsprint — no heavy upscaling.
+    """Native-resolution contrast + light sharpen — never upscale.
 
-    A subtle CLAHE on luminance darkens ink and whitens paper without the
-    interpolation blur that comes from stretching a small crop to 1700px."""
+    Stretching newsprint creates mushy letters. Keep the scan's own pixels,
+    gently separate ink from paper, then a small-radius unsharp so body text
+    reads clearly without halos or plastic look."""
     try:
         import cv2
+        from PIL import Image
 
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
             return
-        h, w = img.shape[:2]
-
-        if w < _MIN_W:
-            scale = min(_MIN_W / w, _MAX_SCALE)
-            if scale > 1.0:
-                img = cv2.resize(
-                    img,
-                    (round(w * scale), round(h * scale)),
-                    interpolation=cv2.INTER_CUBIC,
-                )
 
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+        # Mild CLAHE — readable ink without blowing paper white.
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         l = clahe.apply(l)
         img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-        # Very light unsharp mask — crisp edges without halos.
-        blurred = cv2.GaussianBlur(img, (0, 0), 0.8)
-        img = cv2.addWeighted(img, 1.12, blurred, -0.12, 0)
+        # Small-radius unsharp: sharper glyphs, not heavy "AI" crispness.
+        blurred = cv2.GaussianBlur(img, (0, 0), 0.55)
+        img = cv2.addWeighted(img, 1.28, blurred, -0.28, 0)
 
-        cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        # PIL saves 4:4:4 (subsampling=0) — OpenCV JPEG often softens chroma.
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        Image.fromarray(rgb).save(path, quality=96, subsampling=0, optimize=True)
     except Exception as exc:
         logger.warning("clip enhance failed for %s: %s", path, exc)
 
