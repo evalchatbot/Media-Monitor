@@ -22,7 +22,7 @@ from sqlalchemy import delete, select
 from config import settings
 from app.core import result_policy
 from app.db.base import SessionLocal
-from app.db.models import ArticleCache, EPaperPage, Mention, ScrapeRun
+from app.db.models import ArticleCache, EPaperPage, Mention, ScrapeRun, Transcript, YouTubeBulletin
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ def run_retention() -> dict:
     now = datetime.now(timezone.utc)
     summary = {"screenshots_deleted": 0, "cache_rows_deleted": 0,
                "epaper_rows_deleted": 0, "scrape_rows_deleted": 0,
+               "transcripts_deleted": 0, "bulletins_deleted": 0,
                "mentions_expired": 0, "keyword_links_trimmed": 0}
 
     # --- Screenshots + e-paper page scans ---
@@ -81,6 +82,15 @@ def run_retention() -> dict:
         summary["cache_rows_deleted"] = res.rowcount or 0
         res = session.execute(delete(EPaperPage).where(EPaperPage.fetched_at < cutoff_tx))
         summary["epaper_rows_deleted"] = res.rowcount or 0
+
+        # --- YouTube transcripts + old bulletin rows ---
+        cutoff_yt = now - timedelta(days=settings.keyword_result_retention_days)
+        res = session.execute(delete(Transcript).where(Transcript.created_at < cutoff_yt))
+        summary["transcripts_deleted"] = res.rowcount or 0
+        res = session.execute(
+            delete(YouTubeBulletin).where(YouTubeBulletin.created_at < cutoff_yt)
+        )
+        summary["bulletins_deleted"] = res.rowcount or 0
 
         # --- Logs (scrape audit rows) ---
         cutoff_log = now - timedelta(days=settings.retention_logs_days)

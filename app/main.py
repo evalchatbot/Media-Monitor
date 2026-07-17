@@ -30,11 +30,12 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from app.db.base import SessionLocal, init_db
-from app.db.models import EPaperPage, Keyword, Mention
+from app.db.models import EPaperPage, Keyword, Mention, YouTubeChannel
 from app.core import keyword_scan_queue, result_policy
 from app.epaper import scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
+from app.youtube import scan_runner as yt_scan_runner
 from app.scrapers.sites import SITE_CONFIGS
 from app.scheduler import shutdown_scheduler, start_scheduler
 from app import sources_probe
@@ -122,6 +123,22 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
   padding:.45rem .55rem .45rem .7rem;box-shadow:var(--shadow-sm);
   backdrop-filter:blur(14px)}
 .brand{display:inline-flex;align-items:center;gap:.65rem;text-decoration:none;color:var(--ink)}
+.mod-nav{display:inline-flex;gap:.3rem;margin-left:.15rem}
+.mod-nav a{padding:.32rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700;
+  text-decoration:none;color:var(--muted);border:1px solid transparent}
+.mod-nav a:hover{color:var(--blue-deep);background:var(--blue-soft)}
+.mod-nav a.on{color:#fff;background:var(--blue-deep);border-color:var(--blue-deep)}
+.yt-status{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.5rem;margin:0 0 1rem}
+.yt-status .cell{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);
+  padding:.65rem .75rem;font-size:.8rem}
+.yt-status .cell b{display:block;font-size:.88rem;color:var(--ink);margin-bottom:.2rem}
+.yt-status .st{font-weight:700;color:var(--blue-deep);text-transform:capitalize}
+.yt-status .st.missing,.yt-status .st.failed{color:var(--warn)}
+.yt-status .st.ready{color:var(--ok)}
+.jump{display:inline-flex;margin-top:.25rem;padding:.2rem .55rem;border-radius:999px;
+  background:var(--blue-soft);color:var(--blue-deep);font-size:.72rem;font-weight:700;
+  text-decoration:none;border:1px solid var(--blue-mist);margin-right:.35rem}
+.jump:hover{background:var(--blue-mist)}
 .brand .mark{width:34px;height:34px;border-radius:11px;
   background:linear-gradient(145deg,var(--blue) 0%,var(--blue-deep) 100%);color:#fff;
   display:inline-flex;align-items:center;justify-content:center;font-size:.95rem;
@@ -388,7 +405,8 @@ _JS = """
   });
 
   /* Watchlist tags → fill keyword + run search (× is a separate delete form) */
-  var q=document.getElementById('q'), form=document.getElementById('search');
+  var q=document.getElementById('q');
+  var form=document.getElementById('search')||document.getElementById('yt-search');
   document.querySelectorAll('.kw-pick').forEach(function(btn){
     btn.addEventListener('click',function(){
       if(!q||!form)return;
@@ -407,11 +425,13 @@ _JS = """
   var lastResultsSig=(document.getElementById('results')||{}).getAttribute
     ? (document.getElementById('results').getAttribute('data-sig')||'')
     : '';
+  var pageModule=(location.pathname||'').indexOf('/youtube')===0?'youtube':'newspaper';
   async function refreshResults(){
     var el=document.getElementById('results');
     if(!el)return;
     var params=new URLSearchParams(location.search);
     if(!params.has('go')&&!(params.get('q')||'').trim())return;
+    params.set('module', pageModule);
     try{
       var r=await fetch('/ui/results?'+params.toString(),{headers:{'Accept':'text/html'}});
       if(!r.ok)return;
@@ -429,9 +449,19 @@ _JS = """
     try{
       var n=await fetch('/api/scan/status').then(function(r){return r.json()});
       var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
+      var y=await fetch('/api/scan/youtube/status').then(function(r){return r.json()}).catch(function(){return {}});
       var q=await fetch('/api/scan/queue').then(function(r){return r.json()});
-      var running=n.running||e.running||q.running;
-      var queueOn=!!q.running;
+      var queueItems=[].concat(q.batch||[], q.pending||[]);
+      var queueForPage=queueItems.some(function(x){
+        var m=(x&&x.module)||'newspaper';
+        return pageModule==='youtube'?m==='youtube':m!=='youtube';
+      });
+      // Keep modules isolated: YouTube page only tracks YT work; Newspaper
+      // ignores the YouTube scanner.
+      var running=pageModule==='youtube'
+        ? !!(y.running||queueForPage)
+        : !!(n.running||e.running||queueForPage);
+      var queueOn=!!queueForPage;
       var side=document.getElementById('live-state');
       var b=document.getElementById('scanbtn');
       // Stream new matches into the results grid while work is ongoing.
@@ -581,18 +611,41 @@ def _paper_names() -> list[str]:
     return out
 
 
-def _shell(title: str, body: str) -> str:
+def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
     news = scan_manager.status()
     ep = scan_runner.status()
+    yt = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
     q = keyword_scan_queue.status()
-    scanning = bool(news["running"] or ep["running"] or q.get("running"))
+    queue_items = list(q.get("batch") or []) + list(q.get("pending") or [])
+    yt_queue_on = any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
+    news_queue_on = any((x.get("module") or "newspaper") != "youtube" for x in queue_items)
+    if module == "youtube":
+        scanning = bool(yt.get("running") or yt_queue_on)
+        queue_on = yt_queue_on
+    else:
+        scanning = bool(news["running"] or ep["running"] or news_queue_on)
+        queue_on = news_queue_on
     state = ('<span class="dot busy"></span>Working…' if scanning
              else '<span class="dot live"></span>Live')
-    scan_btn = (
-        '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
-        if scanning
-        else '<form method="post" action="/ui/scan" style="margin:0">'
-             '<button class="ghost" id="scanbtn" type="submit">Scan now</button></form>'
+    if module == "youtube":
+        scan_btn = (
+            '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
+            if scanning
+            else '<form method="post" action="/ui/scan/youtube" style="margin:0">'
+                 '<button class="ghost" id="scanbtn" type="submit">Scan now</button></form>'
+        )
+    else:
+        scan_btn = (
+            '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
+            if scanning
+            else '<form method="post" action="/ui/scan" style="margin:0">'
+                 '<button class="ghost" id="scanbtn" type="submit">Scan now</button></form>'
+        )
+    nav = (
+        '<nav class="mod-nav">'
+        f'<a href="/" class="{"on" if module == "newspaper" else ""}">Newspaper</a>'
+        f'<a href="/youtube" class="{"on" if module == "youtube" else ""}">YouTube</a>'
+        '</nav>'
     )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -600,12 +653,13 @@ def _shell(title: str, body: str) -> str:
 <div class="top"><div class="top-inner">
   <a class="brand" href="/"><span class="mark">◎</span>
     <span><b>Media Monitor</b><small>Press desk</small></span></a>
+  {nav}
   <span class="spacer"></span>
   <span class="live" id="live-state">{state}</span>
   {scan_btn}
 </div></div>
 <main class="page"><div class="wrap">{body}</div></main>
-<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false').replace('__QUEUE__', 'true' if q.get('running') else 'false')}</script>
+<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false').replace('__QUEUE__', 'true' if queue_on else 'false')}</script>
 </body></html>"""
 
 
@@ -726,14 +780,41 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
     tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in show_tags)
     occurred = m.published_at or m.detected_at
     when = _utc(occurred).astimezone(_PKT).strftime("%d %b %Y, %H:%M") if occurred else ""
-    kind = "E-Paper" if m.module == "epaper" else "Web"
-    meta = " · ".join(x for x in [kind, m.source, m.sentiment, when] if x)
+    if m.module == "epaper":
+        kind = "E-Paper"
+    elif m.module == "youtube":
+        kind = "YouTube"
+    else:
+        kind = "Web"
+    meta = " · ".join(x for x in [kind, m.source, m.section if m.module == "youtube" else None,
+                                    m.sentiment, when] if x)
     excerpt = _highlight_excerpt(m.snippet, hl)
     excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
+    jump = ""
+    if m.module == "youtube":
+        sec = m.deeplink_seconds
+        if sec is None and hl:
+            hits = (m.keyword_hits or {}).get(hl[0]) or []
+            if hits:
+                sec = hits[0].get("start")
+        if sec is not None:
+            mm, ss = divmod(int(sec), 60)
+            jump = (f'<a class="jump" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
+                    f'Watch at {mm}:{ss:02d}</a>')
+            # Prefer deep-linked URL even if stored url lacks t=
+            if "t=" not in (m.url or ""):
+                jump = (f'<a class="jump" href="https://www.youtube.com/watch?v='
+                        f'{html.escape(m.external_id)}&t={int(sec)}s" target="_blank" rel="noopener">'
+                        f'Watch at {mm}:{ss:02d}</a>')
+        occ = 0
+        for label in hl or (m.matched_keywords or []):
+            occ += len((m.keyword_hits or {}).get(label) or [])
+        if occ > 1:
+            jump += f'<span class="tag">{occ} hits</span>'
     busy = " scanning" if scanning else ""
     return (f'<div class="det{busy}">{img}<div class="body">'
             f'<a class="ttl" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
-            f'{html.escape(m.title)}</a>{excerpt_html}'
+            f'{html.escape(m.title)}</a>{excerpt_html}{jump}'
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
 
 
@@ -746,10 +827,13 @@ def _known_keyword_fold(db: Session) -> set[str]:
     }
 
 
-def _active_keyword_fold(db: Session) -> dict[str, str]:
+def _active_keyword_fold(db: Session, module: str | None = "newspaper") -> dict[str, str]:
     """casefold -> canonical text for active watchlist keywords."""
     out: dict[str, str] = {}
-    for k in db.execute(select(Keyword).where(Keyword.active.is_(True))).scalars().all():
+    q = select(Keyword).where(Keyword.active.is_(True))
+    if module:
+        q = q.where(Keyword.module == module)
+    for k in db.execute(q).scalars().all():
         if k.text:
             out[(k.text or "").casefold()] = k.text
     return out
@@ -919,7 +1003,7 @@ def _results_section_html(
     results_scanning: bool,
 ) -> tuple[str, str]:
     """Build the Results panel HTML and a cheap change-detection signature."""
-    active_fold = _active_keyword_fold(db)
+    active_fold = _active_keyword_fold(db, module="newspaper")
     first_date = show_date - timedelta(
         days=settings.keyword_search_days - 1
     )
@@ -932,6 +1016,7 @@ def _results_section_html(
 
     mentions = db.execute(
         select(Mention).where(
+            Mention.module.in_(("newspaper", "epaper")),
             or_(
                 and_(
                     Mention.published_at.is_not(None),
@@ -1060,7 +1145,7 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
 
 def _start_keyword_scan(kw: Keyword) -> dict:
     """Queue this keyword for a FIFO one-at-a-time scan (safe with multiple adds)."""
-    st = keyword_scan_queue.enqueue(kw.id, kw.text)
+    st = keyword_scan_queue.enqueue(kw.id, kw.text, module=kw.module or "newspaper")
     return {
         "live_started": True,
         "queued": st.get("queued", 1),
@@ -1070,17 +1155,19 @@ def _start_keyword_scan(kw: Keyword) -> dict:
     }
 
 
-def _upsert_watch_keyword(db: Session, text: str, language: str) -> Keyword | None:
+def _upsert_watch_keyword(db: Session, text: str, language: str,
+                          module: str = "newspaper") -> Keyword | None:
     """Create or reactivate a watchlist keyword. Does not start a scan."""
     text = (text or "").strip()
     if not text:
         return None
     language = language if language in ("en", "ur") else "en"
+    module = module if module in ("newspaper", "youtube") else "newspaper"
     existing = db.execute(
         select(Keyword).where(
             func.lower(Keyword.text) == text.lower(),
             Keyword.language == language,
-            Keyword.module == "newspaper",
+            Keyword.module == module,
         )
     ).scalar_one_or_none()
     if existing:
@@ -1089,7 +1176,7 @@ def _upsert_watch_keyword(db: Session, text: str, language: str) -> Keyword | No
             db.commit()
             db.refresh(existing)
         return existing
-    kw = Keyword(text=text, language=language, module="newspaper", active=True)
+    kw = Keyword(text=text, language=language, module=module, active=True)
     db.add(kw)
     db.commit()
     db.refresh(kw)
@@ -1159,7 +1246,7 @@ def home(request: Request, db: Session = Depends(get_db)):
     results_html = ""
     # Drop labels for keywords that were deleted earlier (before purge existed).
     _scrub_deleted_keywords(db)
-    active_fold = _active_keyword_fold(db)
+    active_fold = _active_keyword_fold(db, module="newspaper")
 
     if searched:
         results_html, _ = _results_section_html(
@@ -1176,7 +1263,9 @@ def home(request: Request, db: Session = Depends(get_db)):
         )
 
     active_kws = db.execute(
-        select(Keyword).where(Keyword.active.is_(True)).order_by(Keyword.text)
+        select(Keyword).where(
+            Keyword.active.is_(True), Keyword.module == "newspaper"
+        ).order_by(Keyword.text)
     ).scalars().all()
     kw_l = keyword.casefold()
 
@@ -1285,7 +1374,231 @@ def home(request: Request, db: Session = Depends(get_db)):
     </div>
     {results_html}
     """
-    return _shell("Media Monitor", body)
+    return _shell("Media Monitor", body, module="newspaper")
+
+
+@app.get("/youtube", response_class=HTMLResponse)
+def youtube_home(request: Request, db: Session = Depends(get_db)):
+    """YouTube bulletin monitoring workspace (separate keyword watchlist)."""
+    if not settings.youtube_enabled:
+        return RedirectResponse("/", status_code=303)
+    from app.youtube.pipeline import bulletin_status_for_date, ensure_due_bulletins
+
+    today = datetime.now(_PKT).date()
+    qp = request.query_params
+    date_s = (qp.get("date") or today.isoformat()).strip()
+    try:
+        show_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+    except ValueError:
+        show_date = today
+        date_s = show_date.isoformat()
+    keyword = (qp.get("q") or "").strip()
+    ensure_due_bulletins(db, for_date=show_date.isoformat())
+
+    status_rows = bulletin_status_for_date(db, show_date)
+    status_html = '<div class="yt-status">' + "".join(
+        f'<div class="cell"><b>{html.escape(r["channel"])}</b>'
+        f'<span class="st {html.escape((r["status"] or "").split("/")[0].split()[0])}">{html.escape(r["status"] or "waiting")}</span>'
+        f'<div class="hint" style="margin:0">{html.escape(r.get("slot") or "—")}'
+        + (f' · {html.escape((r.get("title") or "")[:48])}' if r.get("title") else "")
+        + "</div></div>"
+        for r in status_rows
+    ) + "</div>"
+
+    q_st = keyword_scan_queue.status()
+    yt_st = yt_scan_runner.status()
+    queue_items = list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
+    yt_queue = [x for x in queue_items if (x.get("module") or "newspaper") == "youtube"]
+    results_scanning = bool(yt_st.get("running") or yt_queue)
+    results_html, _ = _youtube_results_html(
+        db, show_date=show_date, keyword=keyword, results_scanning=results_scanning,
+    )
+
+    queued_ids = {
+        int(x["id"])
+        for x in yt_queue
+        if x.get("id") is not None
+    }
+    queued_folds = {
+        (x.get("text") or "").casefold()
+        for x in yt_queue
+        if x and x.get("text")
+    }
+    active_kws = db.execute(
+        select(Keyword).where(
+            Keyword.active.is_(True), Keyword.module == "youtube"
+        ).order_by(Keyword.text)
+    ).scalars().all()
+    kw_l = keyword.casefold()
+
+    def _kw_chip(k: Keyword) -> str:
+        on = " on" if kw_l == k.text.casefold() else ""
+        this_busy = k.id in queued_ids or k.text.casefold() in queued_folds
+        busy = " busy" if this_busy else ""
+        play = (
+            '<span class="kw-play" title="Scanning" aria-label="Scanning">'
+            '<span class="spin"></span></span>'
+            if this_busy else
+            f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
+            f'<button type="submit" class="kw-play" title="Scan this keyword now" '
+            f'aria-label="Scan">▶</button></form>'
+        )
+        return (
+            f'<span class="kw-chip{on}{busy}">'
+            f'<button type="button" class="kw-pick" '
+            f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+            f'{play}'
+            f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
+            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the YouTube watchlist? Results stay retained for 90 days.')\">"
+            f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
+            f'×</button></form></span>'
+        )
+
+    kw_tags = (
+        f'<button type="button" class="kw-pick kw-all{" on" if not keyword else ""}" data-kw="">All</button>'
+        + "".join(_kw_chip(k) for k in active_kws)
+    )
+
+    banner = ""
+    if qp.get("removed"):
+        banner = (
+            f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
+            "YouTube watchlist. Results remain retained for 90 days.</div>"
+        )
+
+    channels = db.execute(
+        select(YouTubeChannel).where(YouTubeChannel.active.is_(True)).order_by(YouTubeChannel.name)
+    ).scalars().all()
+    ch_list = ", ".join(html.escape(c.name) for c in channels) or "—"
+
+    body = f"""
+    {banner}
+    <div class="hero">
+      <h1>YouTube bulletins</h1>
+      <p>Monitor Geo, ARY, Express, SAMAA, and City42 headline bulletins.
+      Processing starts one hour after each slot. Keywords here are separate from Newspaper.</p>
+    </div>
+    <div class="panel">
+      <h2>Search</h2>
+      <div class="field">
+        <label for="date">Date</label>
+        <input form="yt-search" type="date" id="date" name="date" value="{html.escape(date_s)}" required>
+      </div>
+      <div class="field">
+        <label>Add to YouTube watchlist</label>
+        <div class="kw-add" id="kw-draft-row">
+          <input id="kw-draft-text" type="text" placeholder="Type a keyword, then Add" maxlength="120">
+          <select id="kw-draft-lang"><option value="en">EN</option><option value="ur">UR</option></select>
+          <button type="button" id="kw-draft-add">+ Add</button>
+        </div>
+        <div class="kw-pending" id="kw-pending" aria-live="polite"></div>
+        <form class="kw-confirm" id="kw-confirm" method="post" action="/ui/keywords/batch">
+          <input type="hidden" name="texts" id="kw-pending-texts" value="">
+          <input type="hidden" name="language" id="kw-pending-lang" value="en">
+          <input type="hidden" name="module" value="youtube">
+          <button type="submit">Confirm &amp; scan</button>
+          <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
+        </form>
+        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Confirm matches cached transcripts instantly; scheduled jobs fill new bulletins.</p>
+        <div class="kw-bar">
+          <div class="cap">YouTube watchlist · click to filter · ▶ rematch · × hide</div>
+          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
+        </div>
+      </div>
+      <p class="hint">Latest bulletin status for the selected date:</p>
+      {status_html}
+      <form method="get" action="/youtube" id="yt-search">
+        <input type="hidden" name="q" id="q" value="{html.escape(keyword)}">
+        <input type="hidden" name="go" value="1">
+        <div class="actions">
+          <button type="submit">Show results</button>
+          <a class="btn ghost" href="/youtube">Reset</a>
+        </div>
+      </form>
+    </div>
+    {results_html}
+    """
+    return _shell("YouTube · Media Monitor", body, module="youtube")
+
+
+def _youtube_results_html(db: Session, *, show_date, keyword: str,
+                          results_scanning: bool) -> tuple[str, str]:
+    active_fold = _active_keyword_fold(db, module="youtube")
+    first_date = show_date - timedelta(days=settings.keyword_search_days - 1)
+    day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
+    day_end = datetime(show_date.year, show_date.month, show_date.day, tzinfo=_PKT) + timedelta(days=1)
+    start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
+
+    mentions = db.execute(
+        select(Mention).where(
+            Mention.module == "youtube",
+            or_(
+                and_(
+                    Mention.published_at.is_not(None),
+                    Mention.published_at >= start_utc,
+                    Mention.published_at < end_utc,
+                ),
+                and_(
+                    Mention.published_at.is_(None),
+                    Mention.detected_at >= start_utc,
+                    Mention.detected_at < end_utc,
+                ),
+            ),
+        ).order_by(Mention.detected_at.desc())
+    ).scalars().all()
+
+    if keyword:
+        kw_l = keyword.casefold()
+        if kw_l not in active_fold:
+            mentions = []
+        else:
+            mentions = [
+                m for m in mentions
+                if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
+            ]
+        show_limit = settings.keyword_result_limit
+    else:
+        mentions = [m for m in mentions if _live_matched(m, active_fold)]
+        show_limit = min(200, settings.keyword_result_limit * max(len(active_fold), 1))
+
+    mentions.sort(key=result_policy.effective_time, reverse=True)
+    shown = mentions[:show_limit]
+    spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
+    if shown:
+        cards = []
+        for m in shown:
+            live = _live_matched(m, active_fold)
+            hl = [active_fold[keyword.casefold()]] if keyword else live
+            cards.append(_detection_card(m, highlight_keywords=hl, scanning=results_scanning))
+        grid = f'<div class="grid">{"".join(cards)}</div>'
+        more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
+                f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
+    elif results_scanning:
+        grid = '<div class="empty loading"><span class="spin"></span></div>'
+        more = ""
+    elif not active_fold:
+        grid = ('<div class="empty">No YouTube keywords yet.'
+                "<br>Add keywords above, then Confirm &amp; scan.</div>")
+        more = ""
+    else:
+        grid = ('<div class="empty">No YouTube matches for the 30 days through this date.'
+                "<br>Bulletins are processed one hour after each slot.</div>")
+        more = ""
+
+    max_id = max((m.id for m in shown), default=0)
+    shots = sum(1 for m in shown if m.screenshot_path)
+    sig = f"yt:{len(mentions)}:{max_id}:{shots}:{int(results_scanning)}"
+    html_out = f"""
+        <section class="results" id="results" data-sig="{html.escape(sig)}">
+          <div class="results-head">
+            <h2>Results{spin}</h2>
+            <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
+          </div>
+          {grid}{more}
+        </section>
+        """
+    return html_out, sig
 
 
 @app.get("/newspapers")
@@ -1297,23 +1610,46 @@ def _gone_pages():
 
 @app.get("/ui/results", response_class=HTMLResponse)
 def ui_results_partial(request: Request, db: Session = Depends(get_db)):
-    """Live Results panel fragment — polled while a scan fills in matches."""
+    """Live Results panel fragment — polled while a scan fills in matches.
+
+    Pass ``module=youtube`` (or be on the YouTube page) so newspaper cards never
+    replace the YouTube results grid.
+    """
     today = datetime.now(_PKT).date()
     qp = request.query_params
+    module = (qp.get("module") or "newspaper").strip().lower()
+    if module not in ("newspaper", "youtube"):
+        module = "newspaper"
     date_s = (qp.get("date") or today.isoformat()).strip()
     try:
         show_date = datetime.strptime(date_s, "%Y-%m-%d").date()
     except ValueError:
         show_date = today
     keyword = (qp.get("q") or qp.get("kw") or "").strip()
+
+    q_st = keyword_scan_queue.status()
+    queue_items = list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
+
+    if module == "youtube":
+        yt_st = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
+        results_scanning = bool(
+            yt_st.get("running")
+            or any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
+        )
+        html_out, sig = _youtube_results_html(
+            db, show_date=show_date, keyword=keyword, results_scanning=results_scanning,
+        )
+        return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
+
     papers_all = _paper_names()
     selected = qp.getlist("paper")
     if not selected and "paper" not in qp:
         selected = list(papers_all)
     selected_set = set(selected)
 
-    q_st = keyword_scan_queue.status()
-    results_scanning = bool(q_st.get("running"))
+    results_scanning = bool(
+        any((x.get("module") or "newspaper") != "youtube" for x in queue_items)
+    )
     html_out, sig = _results_section_html(
         db,
         show_date=show_date,
@@ -1346,8 +1682,11 @@ def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
 
 @app.post("/ui/keywords/batch")
 def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
+                      module: str = Form("newspaper"),
                       db: Session = Depends(get_db)):
     """Create/reactivate many keywords, then scan them FIFO (earliest first)."""
+    module = module if module in ("newspaper", "youtube") else "newspaper"
+    home = "/youtube" if module == "youtube" else "/"
     raw = (texts or "").replace(",", "\n")
     seen: set[str] = set()
     ordered: list[str] = []
@@ -1361,25 +1700,26 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
         seen.add(fold)
         ordered.append(t)
     if not ordered:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(home, status_code=303)
 
     created: list[Keyword] = []
     for text in ordered:
-        kw = _upsert_watch_keyword(db, text, language)
+        kw = _upsert_watch_keyword(db, text, language, module=module)
         if kw:
             created.append(kw)
 
     if not created:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(home, status_code=303)
 
-    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created])
+    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
     first = created[0]
-    return _home_redirect({
+    q = urlencode({
         "q": first.text,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
         "scanning": "1",
     })
+    return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/edit")
@@ -1408,13 +1748,16 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
     if not kw:
         return RedirectResponse("/", status_code=303)
     text = kw.text
+    module = kw.module or "newspaper"
     kw.active = False
     db.commit()
-    return _home_redirect({
+    home = "/youtube" if module == "youtube" else "/"
+    q = urlencode({
         "removed": text,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
     })
+    return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
 @app.post("/ui/keywords/{kid}/scan")
@@ -1423,12 +1766,14 @@ def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
     if not kw:
         raise HTTPException(404, "keyword not found")
     _start_keyword_scan(kw)
-    return _home_redirect({
+    home = "/youtube" if (kw.module or "newspaper") == "youtube" else "/"
+    q = urlencode({
         "q": kw.text,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
         "scanning": "1",
     })
+    return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
 @app.post("/ui/scan")
@@ -1442,6 +1787,12 @@ def ui_scan_all():
 def ui_scan_newspapers():
     scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/ui/scan/youtube")
+def ui_scan_youtube():
+    yt_scan_runner.start_scan(label="manual", force=True)
+    return RedirectResponse("/youtube", status_code=303)
 
 
 @app.post("/ui/epaper/fetch")
@@ -1507,9 +1858,13 @@ def api_save_custom_source(body: _CustomSourceIn):
 
 
 @app.get("/api/keywords")
-def list_keywords(db: Session = Depends(get_db)):
-    rows = db.execute(select(Keyword).order_by(Keyword.created_at.desc())).scalars().all()
-    return [{"id": k.id, "text": k.text, "language": k.language, "active": k.active}
+def list_keywords(module: str | None = None, db: Session = Depends(get_db)):
+    q = select(Keyword).order_by(Keyword.created_at.desc())
+    if module in ("newspaper", "youtube"):
+        q = q.where(Keyword.module == module)
+    rows = db.execute(q).scalars().all()
+    return [{"id": k.id, "text": k.text, "language": k.language,
+             "module": k.module, "active": k.active}
             for k in rows]
 
 
@@ -1574,6 +1929,31 @@ def epaper_scan_status():
 @app.get("/api/scan/queue")
 def keyword_queue_status():
     return keyword_scan_queue.status()
+
+
+@app.get("/api/scan/youtube/status")
+def youtube_scan_status():
+    return yt_scan_runner.status()
+
+
+@app.post("/api/scan/youtube")
+def trigger_youtube_scan():
+    return {"started": yt_scan_runner.start_scan(label="api", force=True)}
+
+
+@app.get("/api/youtube/channels")
+def list_youtube_channels(db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(YouTubeChannel).order_by(YouTubeChannel.name)
+    ).scalars().all()
+    return [
+        {
+            "id": c.id, "channel_id": c.channel_id, "name": c.name,
+            "handle": c.handle, "url": c.url, "active": c.active,
+            "media_source": c.media_source,
+        }
+        for c in rows
+    ]
 
 
 @app.post("/api/scan/epaper")

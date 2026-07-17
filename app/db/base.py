@@ -54,6 +54,9 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite(models)
     _ensure_columns()
+    from app.youtube.seed import ensure_seed_channels
+
+    ensure_seed_channels()
 
 
 def _ensure_columns() -> None:
@@ -78,6 +81,56 @@ def _ensure_columns() -> None:
             with engine.begin() as conn:
                 conn.exec_driver_sql(
                     f"ALTER TABLE mentions ADD COLUMN keyword_media {json_t} DEFAULT {default}"
+                )
+        if "keyword_hits" not in cols:
+            default = "'{}'::jsonb" if engine.dialect.name == "postgresql" else "'{}'"
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE mentions ADD COLUMN keyword_hits {json_t} DEFAULT {default}"
+                )
+    if "transcripts" in tables:
+        cols = {c["name"] for c in insp.get_columns("transcripts")}
+        additions = []
+        if "bulletin_id" not in cols:
+            additions.append("bulletin_id INTEGER")
+        if "model" not in cols:
+            additions.append("model VARCHAR(64) DEFAULT ''")
+        if "confidence" not in cols:
+            default = "'{}'::jsonb" if engine.dialect.name == "postgresql" else "'{}'"
+            additions.append(f"confidence {json_t} DEFAULT {default}")
+        if "version" not in cols:
+            additions.append("version INTEGER DEFAULT 1")
+        if additions:
+            with engine.begin() as conn:
+                for clause in additions:
+                    conn.exec_driver_sql(f"ALTER TABLE transcripts ADD COLUMN {clause}")
+    if "youtube_channels" in tables:
+        cols = {c["name"] for c in insp.get_columns("youtube_channels")}
+        with engine.begin() as conn:
+            if "handle" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE youtube_channels ADD COLUMN handle VARCHAR(128) DEFAULT ''"
+                )
+            if "uploads_playlist_id" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE youtube_channels ADD COLUMN uploads_playlist_id "
+                    "VARCHAR(64) DEFAULT ''"
+                )
+            if "timezone" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE youtube_channels ADD COLUMN timezone VARCHAR(64) "
+                    "DEFAULT 'Asia/Karachi'"
+                )
+            if "media_source" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE youtube_channels ADD COLUMN media_source VARCHAR(32) "
+                    "DEFAULT 'authorized'"
+                )
+            if "media_source_config" not in cols:
+                default = "'{}'::jsonb" if engine.dialect.name == "postgresql" else "'{}'"
+                conn.exec_driver_sql(
+                    f"ALTER TABLE youtube_channels ADD COLUMN media_source_config "
+                    f"{json_t} DEFAULT {default}"
                 )
 
 

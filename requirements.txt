@@ -29,6 +29,15 @@ rapidfuzz==3.11.0
 # --- LLM: relevance/sentiment scoring + e-paper page reading (Claude vision) ---
 anthropic==0.42.0
 
+# --- Groq: e-paper vision + YouTube Whisper transcription ---
+groq==0.13.1
+
+# --- Timezones (ZoneInfo on Windows) ---
+tzdata==2024.2
+
+# --- YouTube bulletin audio (watch URL → local file for Groq Whisper) ---
+yt-dlp>=2024.12.23
+
 # --- Screenshot footer overlay + e-paper image handling ---
 pillow==11.1.0
 opencv-python-headless==4.10.0.84

@@ -139,6 +139,29 @@ class Settings(BaseSettings):
     retention_transcripts_days: int = 365
     retention_logs_days: int = 730
 
+    # --- YouTube bulletin module ---
+    youtube_enabled: bool = True
+    youtube_api_key: str = ""
+    # Default Whisper model on Groq ($0.04/audio-hour). Large V3 is accuracy fallback.
+    groq_whisper_model: str = "whisper-large-v3-turbo"
+    groq_whisper_fallback_model: str = "whisper-large-v3"
+    youtube_timezone: str = "Asia/Karachi"
+    # Process each bulletin this many minutes after its scheduled airtime.
+    youtube_process_delay_minutes: int = 60
+    # Extra retries after the first attempt (minutes after airtime).
+    youtube_retry_offsets_minutes: str = "90,120"
+    # Mark the slot missing this many minutes after airtime with no video.
+    youtube_missing_after_minutes: int = 180
+    # Discovery window around the expected slot (± minutes).
+    youtube_discovery_window_minutes: int = 90
+    youtube_max_duration_seconds: int = 3600
+    youtube_transcribe_concurrency: int = 1
+    # ytdlp (bulletin watch URL → audio → Groq) | authorized | stub
+    youtube_media_source: str = "ytdlp"
+    # Monthly Groq spend alert threshold (USD). Soft limit used for logging.
+    youtube_monthly_cost_alert_usd: float = 40.0
+    youtube_metadata_only: bool = False  # True = discover/classify without Groq spend
+
 
 @lru_cache
 def get_settings() -> Settings:

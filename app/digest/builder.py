@@ -64,18 +64,25 @@ def build_digest(hours: int = 24) -> tuple[str, int]:
             .all()
         )
         active = {
-            k.text.casefold(): k.text
+            (k.module, k.text.casefold()): k.text
             for k in session.execute(
                 select(Keyword).where(Keyword.active.is_(True))
             ).scalars()
+            if k.text
         }
         visible = []
         for mention in mentions:
-            labels = [
-                active[label.casefold()]
-                for label in (mention.matched_keywords or [])
-                if label and label.casefold() in active
-            ]
+            labels = []
+            for label in mention.matched_keywords or []:
+                if not label:
+                    continue
+                if mention.module == "youtube":
+                    key = ("youtube", label.casefold())
+                else:
+                    # newspaper + epaper share newspaper keywords
+                    key = ("newspaper", label.casefold())
+                if key in active:
+                    labels.append(active[key])
             if labels:
                 mention.matched_keywords = labels
                 visible.append(mention)
@@ -145,13 +152,21 @@ def _mention_row(m: Mention) -> str:
     if occurred and occurred.tzinfo is None:
         occurred = occurred.replace(tzinfo=timezone.utc)
     when = occurred.astimezone(PKT).strftime("%d %b %H:%M PKT") if occurred else ""
-    tag = "🗞 e-paper" if m.module == "epaper" else "📰 article"
+    tag = (
+        "▶ youtube"
+        if m.module == "youtube"
+        else ("🗞 e-paper" if m.module == "epaper" else "📰 article")
+    )
+    jump = ""
+    if m.module == "youtube" and m.deeplink_seconds is not None:
+        mm, ss = divmod(int(m.deeplink_seconds), 60)
+        jump = f' · <a href="{html.escape(m.url)}">watch at {mm}:{ss:02d}</a>'
     return f"""
     <table style="margin:10px 0;border-collapse:collapse"><tr>
       <td style="vertical-align:top;padding-right:12px">{img}</td>
       <td style="vertical-align:top">
         <a href="{html.escape(m.url)}" style="font-weight:600;color:#111;text-decoration:none;font-size:15px">{html.escape(m.title)}</a>
-        <div style="color:#666;font-size:12px;margin:3px 0">{tag} · {when} · {html.escape(m.sentiment or 'unscored')}</div>
+        <div style="color:#666;font-size:12px;margin:3px 0">{tag} · {when} · {html.escape(m.sentiment or 'unscored')}{jump}</div>
         <div style="color:#c62828;font-size:12px">keywords: {html.escape(kws)}</div>
         <div style="color:#444;font-size:13px;margin-top:4px">{html.escape(m.summary or '')}</div>
       </td>

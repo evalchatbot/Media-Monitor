@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_FILE = BASE_DIR / "data" / "keyword_scan_queue.json"
 _lock = threading.Lock()
-_queue: list[dict] = []  # {id, text, enqueued_at}
+_queue: list[dict] = []  # {id, text, module, enqueued_at}
 _current_batch: list[dict] = []
 _worker: threading.Thread | None = None
 _BACKFILL_WAIT_S = 8 * 60  # never leave the UI spinning forever
@@ -74,7 +74,7 @@ def _heal_stuck() -> None:
         _save()
 
 
-def enqueue(keyword_id: int, text: str) -> dict:
+def enqueue(keyword_id: int, text: str, module: str = "newspaper") -> dict:
     """Append a keyword if not already queued/in-flight. Starts the worker."""
     global _worker
     with _lock:
@@ -88,6 +88,7 @@ def enqueue(keyword_id: int, text: str) -> dict:
         _queue.append({
             "id": kid,
             "text": text,
+            "module": module or "newspaper",
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         })
         _save()
@@ -100,9 +101,9 @@ def enqueue(keyword_id: int, text: str) -> dict:
     return status()
 
 
-def enqueue_many(items: list[tuple[int, str]]) -> dict:
+def enqueue_many(items: list[tuple[int, str]], module: str = "newspaper") -> dict:
     for kid, text in items:
-        enqueue(kid, text)
+        enqueue(kid, text, module=module)
     return status()
 
 
@@ -119,8 +120,22 @@ def status() -> dict:
 
 
 def status_unlocked() -> dict:
-    batch = [{"id": x["id"], "text": x.get("text") or ""} for x in _current_batch]
-    pending = [{"id": x["id"], "text": x.get("text") or ""} for x in _queue]
+    batch = [
+        {
+            "id": x["id"],
+            "text": x.get("text") or "",
+            "module": x.get("module") or "newspaper",
+        }
+        for x in _current_batch
+    ]
+    pending = [
+        {
+            "id": x["id"],
+            "text": x.get("text") or "",
+            "module": x.get("module") or "newspaper",
+        }
+        for x in _queue
+    ]
     current = batch[0] if batch else None
     label = ", ".join(x["text"] for x in batch[:3] if x.get("text"))
     if len(batch) > 3:
@@ -167,19 +182,36 @@ def _run_batch(batch: list[dict]) -> None:
     ids = [int(x["id"]) for x in batch]
     texts = [x.get("text") or f"keyword-{x['id']}" for x in batch]
     label = ", ".join(texts[:3]) + (f" +{len(texts) - 3}" if len(texts) > 3 else "")
-    logger.info("keyword queue: fast batch of %d — %s", len(ids), label)
+    modules = {(x.get("module") or "newspaper") for x in batch}
+    logger.info("keyword queue: fast batch of %d — %s (%s)", len(ids), label, ",".join(sorted(modules)))
+
+    yt_ids = [int(x["id"]) for x in batch if (x.get("module") or "newspaper") == "youtube"]
+    news_ids = [int(x["id"]) for x in batch if (x.get("module") or "newspaper") != "youtube"]
+
+    if yt_ids:
+        try:
+            from app.youtube.pipeline import run_quick_youtube_match
+
+            summary = run_quick_youtube_match(keyword_ids=yt_ids)
+            logger.info("keyword queue: youtube quick match done %s", summary)
+        except Exception:
+            logger.exception("keyword queue: youtube quick match failed for %s", yt_ids)
+
+    if not news_ids:
+        logger.info("keyword queue: fast batch finished (%s)", label)
+        return
 
     # 1) Exact match on stored articles + e-paper pages (clips created here).
     try:
-        summary = run_quick_match(keyword_ids=ids)
+        summary = run_quick_match(keyword_ids=news_ids)
         logger.info("keyword queue: quick match done %s", summary)
     except Exception:
-        logger.exception("keyword queue: quick match failed for %s", ids)
+        logger.exception("keyword queue: quick match failed for %s", news_ids)
         return
 
     # 2) Screenshot ONLY the web hits that still need one (no full crawl).
     started = scan_manager.start_scan(
-        keyword_ids=ids, keyword_label=label, capped=True, backfill_only=True,
+        keyword_ids=news_ids, keyword_label=label, capped=True, backfill_only=True,
     )
     if started:
         _wait_backfill_idle()
@@ -187,7 +219,7 @@ def _run_batch(batch: list[dict]) -> None:
         # Another scan owns the browser — try once more after a short wait.
         time.sleep(3)
         if scan_manager.start_scan(
-            keyword_ids=ids, keyword_label=label, capped=True, backfill_only=True,
+            keyword_ids=news_ids, keyword_label=label, capped=True, backfill_only=True,
         ):
             _wait_backfill_idle()
 

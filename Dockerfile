@@ -3,6 +3,7 @@
 # Notes:
 # - `playwright install --with-deps chromium` pulls the browser AND its system
 #   libraries — required for the website scrapers and screenshots.
+# - ffmpeg is required for YouTube audio normalization before Groq Whisper.
 # - fonts-dejavu-core guarantees the screenshot footer has a real font.
 # - Run exactly ONE uvicorn worker: APScheduler and the scan locks live in the
 #   process; multiple workers would double-schedule every job.
@@ -21,7 +22,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fonts-dejavu-core ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

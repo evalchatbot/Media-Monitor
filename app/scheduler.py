@@ -55,6 +55,33 @@ def _job_retention_cleanup():
     logger.info("Retention cleanup: %s", run_retention())
 
 
+def _job_youtube_scan():
+    """Process due bulletin slots (discover + optionally transcribe)."""
+    if not settings.youtube_enabled:
+        return
+    from app.youtube import scan_runner
+
+    started = scan_runner.start_scan(label="scheduled")
+    logger.info("YouTube scan trigger: %s", "started" if started else "skipped (already running)")
+
+
+def _job_youtube_recovery():
+    """After restart/deploy, ensure waiting bulletin rows exist and catch up."""
+    if not settings.youtube_enabled:
+        return
+    from app.db.base import SessionLocal
+    from app.youtube.pipeline import ensure_due_bulletins
+    from app.youtube import scan_runner
+
+    session = SessionLocal()
+    try:
+        n = ensure_due_bulletins(session)
+        logger.info("YouTube recovery: ensured %d bulletin rows", n)
+    finally:
+        session.close()
+    scan_runner.start_scan(label="recovery", force=False)
+
+
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
     if _scheduler and _scheduler.running:
@@ -88,6 +115,28 @@ def start_scheduler() -> BackgroundScheduler:
             misfire_grace_time=3600,
         )
 
+    # YouTube bulletin processing — every 15 minutes, coalesce missed runs.
+    if settings.youtube_enabled:
+        from datetime import datetime, timedelta
+
+        scheduler.add_job(
+            _job_youtube_scan,
+            trigger="interval",
+            minutes=15,
+            id="youtube_scan",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=600,
+        )
+        scheduler.add_job(
+            _job_youtube_recovery,
+            trigger="date",
+            run_date=datetime.now() + timedelta(seconds=45),
+            id="youtube_recovery",
+            replace_existing=True,
+        )
+
     # Daily digest at DIGEST_HOUR_PKT:00 Pakistan time.
     scheduler.add_job(
         _job_daily_digest,
@@ -113,15 +162,16 @@ def start_scheduler() -> BackgroundScheduler:
     )
 
     scheduler.start()
-    # Drop jobs from removed modules that may persist in the job store.
-    for stale in ("youtube_scan", "youtube_live"):
-        try:
-            scheduler.remove_job(stale)
-        except Exception:
-            pass
+    # Drop obsolete live-tap job if present from older builds.
+    try:
+        scheduler.remove_job("youtube_live")
+    except Exception:
+        pass
+
     _scheduler = scheduler
     logger.info(
-        "Scheduler started: newspaper/%smin, e-paper @%02d:15 PKT, digest @%02d:00 PKT, retention @04:00 PKT",
+        "Scheduler started: newspaper/%smin, e-paper @%02d:15 PKT, youtube/15min, "
+        "digest @%02d:00 PKT, retention @04:00 PKT",
         settings.newspaper_scrape_interval_minutes,
         settings.epaper_fetch_hour_pkt,
         settings.digest_hour_pkt,
