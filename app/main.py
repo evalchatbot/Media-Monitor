@@ -1027,14 +1027,13 @@ def home(request: Request, db: Session = Depends(get_db)):
         or bool(q_st.get("queued"))
     )
     queued_ids = {
-        int(x["id"]) for x in (q_st.get("pending") or []) if x.get("id") is not None
+        int(x["id"])
+        for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
+        if x.get("id") is not None
     }
-    if q_st.get("current") and q_st["current"].get("id") is not None:
-        queued_ids.add(int(q_st["current"]["id"]))
     queued_folds = {
         (x.get("text") or "").casefold()
-        for x in ([q_st.get("current")] if q_st.get("current") else [])
-        + list(q_st.get("pending") or [])
+        for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
         if x and x.get("text")
     }
     if qp.get("removed"):
