@@ -229,7 +229,16 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-play:hover{background:rgba(74,138,176,.15);color:var(--blue-deep);transform:none;box-shadow:none;opacity:1}
 .kw-chip.on .kw-play{border-left-color:rgba(255,255,255,.28);color:#fff}
 .kw-chip.on .kw-play:hover{background:rgba(0,0,0,.18);color:#fff}
+.kw-play .spin,.kw-busy .spin{width:11px;height:11px;border-width:2px}
+.kw-chip.busy .kw-play{cursor:default;pointer-events:none}
+.kw-chip.on.busy .kw-play{color:#fff}
 .kw-del,.kw-play-form{margin:0;display:inline-flex}
+.results-head .spin{margin-left:.35rem;vertical-align:-1px;color:var(--blue-deep)}
+.det.scanning{position:relative}
+.det.scanning::after{content:"";position:absolute;top:.55rem;right:.55rem;width:12px;height:12px;
+  border:2px solid var(--blue-deep);border-top-color:transparent;border-radius:50%;
+  animation:s .7s linear infinite;background:rgba(255,253,249,.85);box-shadow:0 0 0 3px rgba(255,253,249,.85)}
+.empty.loading{display:flex;align-items:center;justify-content:center;gap:.55rem;min-height:7rem}
 .kw-pick.kw-all{border:1px solid var(--line);border-radius:999px;padding:.28rem .7rem;background:#fffdf9}
 .kw-pick.kw-all.on{background:var(--blue-deep);border-color:transparent;color:#fff;
   box-shadow:0 4px 12px -6px rgba(74,138,176,.55)}
@@ -568,7 +577,8 @@ def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
     return "".join(out)
 
 
-def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> str:
+def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
+                    scanning: bool = False) -> str:
     hl = list(highlight_keywords or [])
     keyword_path = None
     if len(hl) == 1:
@@ -625,7 +635,8 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None) -> 
     meta = " · ".join(x for x in [kind, m.source, m.sentiment, when] if x)
     excerpt = _highlight_excerpt(m.snippet, hl)
     excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
-    return (f'<div class="det">{img}<div class="body">'
+    busy = " scanning" if scanning else ""
+    return (f'<div class="det{busy}">{img}<div class="body">'
             f'<a class="ttl" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
             f'{html.escape(m.title)}</a>{excerpt_html}'
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
@@ -905,34 +916,25 @@ def home(request: Request, db: Session = Depends(get_db)):
     news_st = scan_manager.status()
     ep_st = scan_runner.status()
     scanning_now = bool(news_st.get("running") or ep_st.get("running"))
+    scan_label = (
+        news_st.get("keyword") or ep_st.get("label") or keyword or ""
+    ).strip()
+    # Spinner targets: the keyword chip being scanned, plus the results panel.
+    kw_scanning = scanning_now and (
+        bool(qp.get("scanning"))
+        or (bool(keyword) and keyword.casefold() == scan_label.casefold())
+        or (not keyword and bool(scan_label))
+    )
+    results_scanning = scanning_now and (
+        bool(qp.get("scanning"))
+        or bool(keyword)
+        or bool(scan_label)
+    )
     if qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
             "watchlist. Its results remain safely retained for 90 days and return if you add it again."
             "</div>"
-        )
-    elif qp.get("scanning") or (scanning_now and keyword):
-        who = html.escape(keyword or news_st.get("keyword") or ep_st.get("label") or "keyword")
-        if qp.get("busy"):
-            banner = (
-                f'<div class="banner ok"><span class="spin"></span> Instant match for '
-                f'<b>“{who}”</b> done'
-                + (f' · <b>{html.escape(qp.get("found") or "0")}</b> hit(s) from storage' if qp.get("found") is not None else "")
-                + ". A live scan is already running — new hits merge into the same records "
-                f"(no duplicates) when it finishes.</div>"
-            )
-        else:
-            banner = (
-                f'<div class="banner ok"><span class="spin"></span> Scanning for <b>“{who}”</b>… '
-                f"Matching stored articles &amp; e-paper pages now; a fresh live scan is running. "
-                f"New hits merge with existing ones (deduped by article/page) — no duplicates.</div>"
-            )
-    elif qp.get("checked") is not None:
-        banner = (
-            f'<div class="banner ok">Quick check finished — {html.escape(qp.get("checked") or "0")} stored '
-            f'article(s) and {html.escape(qp.get("pages") or "0")} e-paper page(s)'
-            + (f' · <b>{html.escape(qp.get("found") or "0")}</b> new hit(s)' if qp.get("found") is not None else "")
-            + ". Fresh scans keep filling in.</div>"
         )
 
     results_html = ""
@@ -990,6 +992,7 @@ def home(request: Request, db: Session = Depends(get_db)):
 
         mentions.sort(key=result_policy.effective_time, reverse=True)
         shown = mentions[:settings.keyword_result_limit if keyword else 80]
+        spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
         if shown:
             cards = []
             for m in shown:
@@ -998,10 +1001,14 @@ def home(request: Request, db: Session = Depends(get_db)):
                     hl = [active_fold[keyword.casefold()]]
                 else:
                     hl = live
-                cards.append(_detection_card(m, highlight_keywords=hl))
+                cards.append(_detection_card(
+                    m, highlight_keywords=hl, scanning=results_scanning))
             grid = f'<div class="grid">{"".join(cards)}</div>'
             more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
                     f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
+        elif results_scanning:
+            grid = ('<div class="empty loading"><span class="spin"></span></div>')
+            more = ""
         else:
             scope = "the 90 days through this date" if keyword else "this date"
             grid = (f'<div class="empty">No matches for {scope}, keyword, and paper selection.'
@@ -1010,7 +1017,7 @@ def home(request: Request, db: Session = Depends(get_db)):
         results_html = f"""
         <section class="results" id="results">
           <div class="results-head">
-            <h2>Results</h2>
+            <h2>Results{spin}</h2>
             <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
           </div>
           {grid}{more}
@@ -1026,21 +1033,38 @@ def home(request: Request, db: Session = Depends(get_db)):
         select(Keyword).where(Keyword.active.is_(True)).order_by(Keyword.text)
     ).scalars().all()
     kw_l = keyword.casefold()
-    kw_tags = (
-        f'<button type="button" class="kw-pick kw-all{" on" if not keyword else ""}" data-kw="">All</button>'
-        + "".join(
-            f'<span class="kw-chip{" on" if kw_l == k.text.casefold() else ""}">'
-            f'<button type="button" class="kw-pick" '
-            f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+    scan_fold = scan_label.casefold() if scan_label else ""
+
+    def _kw_chip(k: Keyword) -> str:
+        on = " on" if kw_l == k.text.casefold() else ""
+        this_busy = scanning_now and (
+            (scan_fold and k.text.casefold() == scan_fold)
+            or (kw_scanning and keyword and k.text.casefold() == keyword.casefold())
+            or (bool(qp.get("scanning")) and keyword and k.text.casefold() == keyword.casefold())
+        )
+        busy = " busy" if this_busy else ""
+        play = (
+            '<span class="kw-play" title="Scanning" aria-label="Scanning">'
+            '<span class="spin"></span></span>'
+            if this_busy else
             f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
             f'<button type="submit" class="kw-play" title="Scan this keyword now" '
             f'aria-label="Scan">▶</button></form>'
+        )
+        return (
+            f'<span class="kw-chip{on}{busy}">'
+            f'<button type="button" class="kw-pick" '
+            f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
+            f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
             f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 90 days.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
-            for k in active_kws
         )
+
+    kw_tags = (
+        f'<button type="button" class="kw-pick kw-all{" on" if not keyword else ""}" data-kw="">All</button>'
+        + "".join(_kw_chip(k) for k in active_kws)
     )
 
     body = f"""
