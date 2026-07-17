@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 from config import settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import EPaperPage, Keyword, Mention
-from app.core import result_policy
+from app.core import keyword_scan_queue, result_policy
 from app.epaper import scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
@@ -245,6 +245,16 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-pick.kw-all:hover{background:var(--blue-soft);border-color:var(--blue);color:var(--blue-deep)}
 .kw-pick.kw-all.on:hover{background:var(--blue);color:#fff}
 .kw-add{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;margin:0}
+.kw-pending{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:.55rem 0 .35rem;min-height:0}
+.kw-pending:empty{display:none}
+.kw-draft{display:inline-flex;align-items:center;gap:.25rem;border:1px dashed var(--blue);
+  background:var(--blue-soft);color:var(--blue-deep);border-radius:999px;padding:.22rem .35rem .22rem .7rem;
+  font-size:.8rem;font-weight:600}
+.kw-draft button{border:0;background:transparent;color:var(--blue-deep);cursor:pointer;font:inherit;
+  width:1.35rem;padding:0;box-shadow:none;border-radius:999px}
+.kw-draft button:hover{background:rgba(74,138,176,.18);transform:none;opacity:1}
+.kw-confirm{margin-top:.35rem;display:none}
+.kw-confirm.show{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
 .cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
 .kw-add input{flex:1;min-width:160px;max-width:100%;padding:.65rem .9rem;border:1px solid var(--line-strong);
   border-radius:999px;font:inherit;background:#fffdf9;color:var(--ink)}
@@ -397,7 +407,8 @@ _JS = """
     try{
       var n=await fetch('/api/scan/status').then(function(r){return r.json()});
       var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
-      var running=n.running||e.running;
+      var q=await fetch('/api/scan/queue').then(function(r){return r.json()});
+      var running=n.running||e.running||q.running;
       var side=document.getElementById('live-state');
       var b=document.getElementById('scanbtn');
       if(running){
@@ -408,6 +419,58 @@ _JS = """
     }catch(err){}
   }
   setInterval(poll,3000);
+
+  /* Draft multiple keywords, then Confirm & scan (FIFO) */
+  (function(){
+    var pending=[], box=document.getElementById('kw-pending'),
+        texts=document.getElementById('kw-pending-texts'),
+        langH=document.getElementById('kw-pending-lang'),
+        confirm=document.getElementById('kw-confirm'),
+        input=document.getElementById('kw-draft-text'),
+        lang=document.getElementById('kw-draft-lang'),
+        addBtn=document.getElementById('kw-draft-add'),
+        clearBtn=document.getElementById('kw-draft-clear');
+    function sync(){
+      if(!box||!texts||!confirm)return;
+      box.innerHTML=pending.map(function(t,i){
+        return '<span class="kw-draft">'+t.replace(/[<>&]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;'}[c];})
+          +'<button type="button" data-i="'+i+'" title="Remove" aria-label="Remove">×</button></span>';
+      }).join('');
+      texts.value=pending.join('\\n');
+      if(langH&&lang)langH.value=lang.value||'en';
+      confirm.classList.toggle('show', pending.length>0);
+    }
+    function addOne(){
+      if(!input)return;
+      var raw=(input.value||'').trim();
+      if(!raw)return;
+      raw.split(/[,\\n]+/).forEach(function(part){
+        var t=part.trim();
+        if(!t)return;
+        var fold=t.toLowerCase();
+        if(pending.some(function(p){return p.toLowerCase()===fold}))return;
+        pending.push(t);
+      });
+      input.value='';
+      sync();
+      input.focus();
+    }
+    if(addBtn)addBtn.addEventListener('click',addOne);
+    if(input)input.addEventListener('keydown',function(e){
+      if(e.key==='Enter'){e.preventDefault();addOne()}
+    });
+    if(box)box.addEventListener('click',function(e){
+      var btn=e.target.closest('button[data-i]');
+      if(!btn)return;
+      pending.splice(parseInt(btn.getAttribute('data-i'),10),1);
+      sync();
+    });
+    if(clearBtn)clearBtn.addEventListener('click',function(){pending=[];sync()});
+    if(confirm)confirm.addEventListener('submit',function(){
+      if(langH&&lang)langH.value=lang.value||'en';
+      texts.value=pending.join('\\n');
+    });
+  })();
 
   /* Add newspaper / e-paper modal */
   var modal=document.getElementById('src-modal');
@@ -490,7 +553,8 @@ def _paper_names() -> list[str]:
 def _shell(title: str, body: str) -> str:
     news = scan_manager.status()
     ep = scan_runner.status()
-    scanning = bool(news["running"] or ep["running"])
+    q = keyword_scan_queue.status()
+    scanning = bool(news["running"] or ep["running"] or q.get("running"))
     state = ('<span class="dot busy"></span>Working…' if scanning
              else '<span class="dot live"></span>Live')
     scan_btn = (
@@ -861,33 +925,41 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
 
 
 def _start_keyword_scan(kw: Keyword) -> dict:
-    """Kick off matching without blocking the HTTP response.
-
-    Instant corpus match runs in a background thread; live newspaper + e-paper
-    scans run as subprocesses. The UI redirects immediately and polls until
-    those jobs finish — keeping ▶ / Add from timing out on Railway.
-    """
-    import threading
-
-    news_ok = scan_manager.start_scan(
-        keyword_ids=[kw.id], keyword_label=kw.text, capped=True)
-    ep_ok = scan_runner.start_scan(keyword_ids=[kw.id], label=kw.text)
-
-    kid = kw.id
-
-    def _bg_quick() -> None:
-        try:
-            run_quick_match(keyword_ids=[kid])
-        except Exception as exc:  # pragma: no cover
-            logger.exception("background quick match failed for keyword %s: %s", kid, exc)
-
-    threading.Thread(target=_bg_quick, daemon=True, name=f"quick-match-{kid}").start()
+    """Queue this keyword for a FIFO one-at-a-time scan (safe with multiple adds)."""
+    st = keyword_scan_queue.enqueue(kw.id, kw.text)
     return {
-        "live_started": bool(news_ok or ep_ok),
+        "live_started": True,
+        "queued": st.get("queued", 1),
         "articles_checked": 0,
         "pages_checked": 0,
         "mentions": 0,
     }
+
+
+def _upsert_watch_keyword(db: Session, text: str, language: str) -> Keyword | None:
+    """Create or reactivate a watchlist keyword. Does not start a scan."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    language = language if language in ("en", "ur") else "en"
+    existing = db.execute(
+        select(Keyword).where(
+            func.lower(Keyword.text) == text.lower(),
+            Keyword.language == language,
+            Keyword.module == "newspaper",
+        )
+    ).scalar_one_or_none()
+    if existing:
+        if not existing.active:
+            existing.active = True
+            db.commit()
+            db.refresh(existing)
+        return existing
+    kw = Keyword(text=text, language=language, module="newspaper", active=True)
+    db.add(kw)
+    db.commit()
+    db.refresh(kw)
+    return kw
 
 
 # ==========================================================================
@@ -931,9 +1003,16 @@ def home(request: Request, db: Session = Depends(get_db)):
     banner = ""
     news_st = scan_manager.status()
     ep_st = scan_runner.status()
-    scanning_now = bool(news_st.get("running") or ep_st.get("running"))
+    q_st = keyword_scan_queue.status()
+    scanning_now = bool(
+        news_st.get("running") or ep_st.get("running") or q_st.get("running")
+    )
     scan_label = (
-        news_st.get("keyword") or ep_st.get("label") or keyword or ""
+        (q_st.get("current") or {}).get("text")
+        or news_st.get("keyword")
+        or ep_st.get("label")
+        or keyword
+        or ""
     ).strip()
     # Spinner targets: the keyword chip being scanned, plus the results panel.
     kw_scanning = scanning_now and (
@@ -945,7 +1024,19 @@ def home(request: Request, db: Session = Depends(get_db)):
         bool(qp.get("scanning"))
         or bool(keyword)
         or bool(scan_label)
+        or bool(q_st.get("queued"))
     )
+    queued_ids = {
+        int(x["id"]) for x in (q_st.get("pending") or []) if x.get("id") is not None
+    }
+    if q_st.get("current") and q_st["current"].get("id") is not None:
+        queued_ids.add(int(q_st["current"]["id"]))
+    queued_folds = {
+        (x.get("text") or "").casefold()
+        for x in ([q_st.get("current")] if q_st.get("current") else [])
+        + list(q_st.get("pending") or [])
+        if x and x.get("text")
+    }
     if qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
@@ -1053,8 +1144,10 @@ def home(request: Request, db: Session = Depends(get_db)):
 
     def _kw_chip(k: Keyword) -> str:
         on = " on" if kw_l == k.text.casefold() else ""
-        this_busy = scanning_now and (
-            (scan_fold and k.text.casefold() == scan_fold)
+        this_busy = (
+            k.id in queued_ids
+            or k.text.casefold() in queued_folds
+            or (scanning_now and scan_fold and k.text.casefold() == scan_fold)
             or (kw_scanning and keyword and k.text.casefold() == keyword.casefold())
             or (bool(qp.get("scanning")) and keyword and k.text.casefold() == keyword.casefold())
         )
@@ -1097,14 +1190,22 @@ def home(request: Request, db: Session = Depends(get_db)):
       </div>
       <div class="field">
         <label>Add to watchlist</label>
-        <form class="kw-add" method="post" action="/ui/keywords">
-          <input name="text" placeholder="New keyword — scan starts immediately" required maxlength="120">
-          <select name="language"><option value="en">EN</option><option value="ur">UR</option></select>
-          <button type="submit">+ Add</button>
+        <div class="kw-add" id="kw-draft-row">
+          <input id="kw-draft-text" type="text" placeholder="Type a keyword, then Add" maxlength="120">
+          <select id="kw-draft-lang"><option value="en">EN</option><option value="ur">UR</option></select>
+          <button type="button" id="kw-draft-add">+ Add</button>
+        </div>
+        <div class="kw-pending" id="kw-pending" aria-live="polite"></div>
+        <form class="kw-confirm" id="kw-confirm" method="post" action="/ui/keywords/batch">
+          <input type="hidden" name="texts" id="kw-pending-texts" value="">
+          <input type="hidden" name="language" id="kw-pending-lang" value="en">
+          <button type="submit">Confirm &amp; scan</button>
+          <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
+        <p class="hint" style="margin-top:.45rem">Add several keywords first, then Confirm — they scan one by one in the order you added them.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to filter · ▶ scan · × hide</div>
-          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add one above.</span>'}</div>
+          <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
       <form method="get" action="/" id="search">
@@ -1165,52 +1266,55 @@ def _gone_pages():
 @app.post("/ui/keywords")
 def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
                    db: Session = Depends(get_db)):
-    text = text.strip()
-    if not text:
+    """Legacy single-add: create/reactivate and enqueue one keyword."""
+    kw = _upsert_watch_keyword(db, text, language)
+    if not kw:
         return RedirectResponse("/", status_code=303)
-    language = language if language in ("en", "ur") else "en"
-    existing = db.execute(
-        select(Keyword).where(
-            func.lower(Keyword.text) == text.lower(),
-            Keyword.language == language,
-            Keyword.module == "newspaper",
-        )
-    ).scalar_one_or_none()
     today = datetime.now(_PKT).date().isoformat()
-    if existing:
-        if existing.active:
-            return _home_redirect({"q": existing.text, "go": "1", "date": today})
-        # Soft-deleted keywords retain their associations. Reactivation restores
-        # them immediately, then searches current-to-oldest for any missing hits.
-        existing.active = True
-        db.commit()
-        res = _start_keyword_scan(existing)
-        return _home_redirect({
-            "q": existing.text,
-            "go": "1",
-            "date": today,
-            "scanning": "1",
-            "busy": "1" if not res.get("live_started") else None,
-            "checked": res.get("articles_checked", 0),
-            "pages": res.get("pages_checked", 0),
-            "found": res.get("mentions", 0),
-        })
-
-    kw = Keyword(text=text, language=language, module="newspaper", active=True)
-    db.add(kw)
-    db.commit()
-    db.refresh(kw)
-
-    res = _start_keyword_scan(kw)
+    _start_keyword_scan(kw)
     return _home_redirect({
         "q": kw.text,
         "go": "1",
         "date": today,
         "scanning": "1",
-        "busy": "1" if not res.get("live_started") else None,
-        "checked": res.get("articles_checked", 0),
-        "pages": res.get("pages_checked", 0),
-        "found": res.get("mentions", 0),
+    })
+
+
+@app.post("/ui/keywords/batch")
+def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
+                      db: Session = Depends(get_db)):
+    """Create/reactivate many keywords, then scan them FIFO (earliest first)."""
+    raw = (texts or "").replace(",", "\n")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for part in raw.splitlines():
+        t = part.strip()
+        if not t:
+            continue
+        fold = t.casefold()
+        if fold in seen:
+            continue
+        seen.add(fold)
+        ordered.append(t)
+    if not ordered:
+        return RedirectResponse("/", status_code=303)
+
+    created: list[Keyword] = []
+    for text in ordered:
+        kw = _upsert_watch_keyword(db, text, language)
+        if kw:
+            created.append(kw)
+
+    if not created:
+        return RedirectResponse("/", status_code=303)
+
+    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created])
+    first = created[0]
+    return _home_redirect({
+        "q": first.text,
+        "go": "1",
+        "date": datetime.now(_PKT).date().isoformat(),
+        "scanning": "1",
     })
 
 
@@ -1254,16 +1358,12 @@ def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
-    res = _start_keyword_scan(kw)
+    _start_keyword_scan(kw)
     return _home_redirect({
         "q": kw.text,
         "go": "1",
         "date": datetime.now(_PKT).date().isoformat(),
         "scanning": "1",
-        "busy": "1" if not res.get("live_started") else None,
-        "checked": res.get("articles_checked", 0),
-        "pages": res.get("pages_checked", 0),
-        "found": res.get("mentions", 0),
     })
 
 
@@ -1405,6 +1505,11 @@ def scan_status():
 @app.get("/api/scan/epaper/status")
 def epaper_scan_status():
     return scan_runner.status()
+
+
+@app.get("/api/scan/queue")
+def keyword_queue_status():
+    return keyword_scan_queue.status()
 
 
 @app.post("/api/scan/epaper")
