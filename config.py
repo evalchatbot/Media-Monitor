@@ -131,8 +131,8 @@ class Settings(BaseSettings):
     # --- Data retention (days) ---
     # A keyword owns at most this many unique results from the rolling window.
     keyword_result_limit: int = 25
-    keyword_result_retention_days: int = 90
-    retention_screenshots_days: int = 90
+    keyword_result_retention_days: int = 30
+    retention_screenshots_days: int = 30
     retention_transcripts_days: int = 365
     retention_logs_days: int = 730
 

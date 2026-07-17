@@ -282,6 +282,8 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
             since_days=settings.keyword_result_retention_days,
             cap_new=True,
             deferred_alerts=deferred_alerts,
+            # Keyword Confirm must stay fast: clickable cutouts only, no vision OCR.
+            vision_clips=False,
         )
         result_policy.enforce_limits(session)
 

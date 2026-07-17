@@ -1,9 +1,13 @@
-"""FIFO keyword scan queue — batch when possible, one live crawl for the set.
+"""Fast keyword scan queue — match stored content, then screenshot hits only.
 
-Confirm / ▶ enqueue keywords. The worker drains everything currently queued,
-runs ONE stored-corpus match + ONE newspaper scan + ONE e-paper cycle for the
-whole batch, then picks up anything added while that ran. That stops
-"Aleema Khan then BLA then …" from each re-scraping every site.
+Confirm / ▶ enqueue keywords. The worker drains the queue and for the whole
+batch:
+  1) exact-match against stored articles + e-paper text (creates mentions/clips)
+  2) screenshot ONLY those new web hits (no full site crawl)
+
+Full live newspaper/e-paper crawls stay on the scheduler — they were why
+keyword searches felt endless. The queue also self-heals stuck "running" state
+so spinners always stop.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ _lock = threading.Lock()
 _queue: list[dict] = []  # {id, text, enqueued_at}
 _current_batch: list[dict] = []
 _worker: threading.Thread | None = None
+_BACKFILL_WAIT_S = 8 * 60  # never leave the UI spinning forever
 
 
 def _load() -> None:
@@ -37,11 +42,12 @@ def _load() -> None:
 
 
 def _save() -> None:
+    """Persist only WAITING items. Never re-queue an in-flight batch after crash
+    (that left spinners running forever)."""
     _QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Persist waiting + in-flight so a restart can resume.
     seen: set[int] = set()
     payload: list[dict] = []
-    for item in list(_current_batch) + list(_queue):
+    for item in _queue:
         kid = int(item.get("id", -1))
         if kid < 0 or kid in seen:
             continue
@@ -55,11 +61,25 @@ def _ensure_loaded() -> None:
         _load()
 
 
+def _worker_alive() -> bool:
+    return _worker is not None and _worker.is_alive()
+
+
+def _heal_stuck() -> None:
+    """If the worker died mid-job, drop the ghost batch so the UI stops spinning."""
+    global _current_batch
+    if _current_batch and not _worker_alive():
+        logger.warning("keyword queue: clearing stuck batch after worker exit")
+        _current_batch = []
+        _save()
+
+
 def enqueue(keyword_id: int, text: str) -> dict:
     """Append a keyword if not already queued/in-flight. Starts the worker."""
     global _worker
     with _lock:
         _ensure_loaded()
+        _heal_stuck()
         kid = int(keyword_id)
         if any(int(x.get("id", -1)) == kid for x in _current_batch):
             return status_unlocked()
@@ -71,7 +91,7 @@ def enqueue(keyword_id: int, text: str) -> dict:
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         })
         _save()
-        need_worker = _worker is None or not _worker.is_alive()
+        need_worker = not _worker_alive()
     if need_worker:
         t = threading.Thread(target=_worker_loop, daemon=True, name="keyword-scan-queue")
         with _lock:
@@ -81,7 +101,6 @@ def enqueue(keyword_id: int, text: str) -> dict:
 
 
 def enqueue_many(items: list[tuple[int, str]]) -> dict:
-    """Enqueue several keywords in given order (earliest first)."""
     for kid, text in items:
         enqueue(kid, text)
     return status()
@@ -89,6 +108,13 @@ def enqueue_many(items: list[tuple[int, str]]) -> dict:
 
 def status() -> dict:
     with _lock:
+        _heal_stuck()
+        # If work is waiting but the worker died, restart it.
+        global _worker
+        if _queue and not _worker_alive() and not _current_batch:
+            t = threading.Thread(target=_worker_loop, daemon=True, name="keyword-scan-queue")
+            _worker = t
+            t.start()
         return status_unlocked()
 
 
@@ -121,51 +147,51 @@ def is_keyword_busy(keyword_id: int | None = None, text: str | None = None) -> b
     return False
 
 
-def _wait_scans_idle(settle_s: float = 1.0) -> None:
-    from app.epaper import scan_runner
+def _wait_backfill_idle(timeout_s: float = _BACKFILL_WAIT_S) -> None:
     from app.newspaper import scan_manager
 
-    time.sleep(settle_s)
-    while scan_manager.is_running() or scan_runner.is_running():
-        time.sleep(2)
+    deadline = time.time() + timeout_s
+    time.sleep(0.8)
+    while scan_manager.is_running():
+        if time.time() >= deadline:
+            logger.warning("keyword queue: screenshot backfill still running after %ss — releasing UI",
+                           int(timeout_s))
+            return
+        time.sleep(1.5)
 
 
 def _run_batch(batch: list[dict]) -> None:
-    from app.epaper import scan_runner
     from app.newspaper import scan_manager
     from app.newspaper.pipeline import run_quick_match
 
     ids = [int(x["id"]) for x in batch]
     texts = [x.get("text") or f"keyword-{x['id']}" for x in batch]
     label = ", ".join(texts[:3]) + (f" +{len(texts) - 3}" if len(texts) > 3 else "")
-    logger.info("keyword queue: batch of %d — %s", len(ids), label)
+    logger.info("keyword queue: fast batch of %d — %s", len(ids), label)
 
-    # Wait out any unrelated scan before claiming the slots.
-    _wait_scans_idle(settle_s=0.3)
-
-    # 1) Instant: match ALL queued keywords against stored articles + e-paper text.
+    # 1) Exact match on stored articles + e-paper pages (clips created here).
     try:
         summary = run_quick_match(keyword_ids=ids)
         logger.info("keyword queue: quick match done %s", summary)
     except Exception:
         logger.exception("keyword queue: quick match failed for %s", ids)
+        return
 
-    # 2) ONE live newspaper crawl matching every keyword in the batch.
-    news_ok = scan_manager.start_scan(
-        keyword_ids=ids, keyword_label=label, capped=True)
+    # 2) Screenshot ONLY the web hits that still need one (no full crawl).
+    started = scan_manager.start_scan(
+        keyword_ids=ids, keyword_label=label, capped=True, backfill_only=True,
+    )
+    if started:
+        _wait_backfill_idle()
+    else:
+        # Another scan owns the browser — try once more after a short wait.
+        time.sleep(3)
+        if scan_manager.start_scan(
+            keyword_ids=ids, keyword_label=label, capped=True, backfill_only=True,
+        ):
+            _wait_backfill_idle()
 
-    # 3) ONE e-paper cycle (fetch today once, match all batch keywords).
-    ep_ok = scan_runner.start_scan(keyword_ids=ids, label=label, fetch=True)
-
-    if not (news_ok or ep_ok):
-        _wait_scans_idle()
-        news_ok = scan_manager.start_scan(
-            keyword_ids=ids, keyword_label=label, capped=True)
-        ep_ok = scan_runner.start_scan(keyword_ids=ids, label=label, fetch=True)
-
-    if news_ok or ep_ok:
-        _wait_scans_idle()
-    logger.info("keyword queue: batch finished (%s)", label)
+    logger.info("keyword queue: fast batch finished (%s)", label)
 
 
 def _worker_loop() -> None:
@@ -176,7 +202,6 @@ def _worker_loop() -> None:
                 _current_batch = []
                 _save()
                 return
-            # Drain everything waiting so N keywords share one crawl.
             _current_batch = list(_queue)
             _queue.clear()
             _save()
@@ -190,7 +215,6 @@ def _worker_loop() -> None:
             _save()
 
 
-# Warm from disk on import so a redeploy can resume pending IDs.
 with _lock:
     _load()
     if _queue:

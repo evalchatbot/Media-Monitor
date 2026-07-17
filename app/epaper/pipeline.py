@@ -197,11 +197,16 @@ def _read_via_map(session, row, summary) -> bool:
 def match_stored_pages(session, keywords, notifier, summary,
                        since_days: int | None = _MATCH_DAYS,
                        cap_new: bool = False,
-                       deferred_alerts: list[tuple[int, list[str]]] | None = None) -> None:
+                       deferred_alerts: list[tuple[int, list[str]]] | None = None,
+                       vision_clips: bool = True) -> None:
     """Match keywords against already-read pages. `since_days=None` = every
     stored page (used by the instant per-keyword Quick Scan); scans use a small
     window since older pages were already matched when they arrived. Content is
-    never matched from before the monitoring window (MONITOR_SINCE)."""
+    never matched from before the monitoring window (MONITOR_SINCE).
+
+    vision_clips=False: only crop clickable imagemap regions (fast path for
+    keyword Confirm). Falls back to the stamped full page when no region fits.
+    """
     floor = settings.monitor_since_date.isoformat()
     since = floor if since_days is None else max(
         floor, (datetime.now(_PKT).date() - timedelta(days=since_days)).isoformat()
@@ -276,7 +281,8 @@ def match_stored_pages(session, keywords, notifier, summary,
             for keyword in relevant:
                 snippet = _snippet(row.ocr_text, [keyword])
                 clip = _make_clip(
-                    row, [keyword], {keyword: kw_lang.get(keyword, "en")}, snippet
+                    row, [keyword], {keyword: kw_lang.get(keyword, "en")}, snippet,
+                    vision=vision_clips,
                 )
                 if clip:
                     media[keyword] = clip
@@ -306,6 +312,7 @@ def match_stored_pages(session, keywords, notifier, summary,
             clip = _make_clip(
                 row, [keyword], {keyword: kw_lang.get(keyword, "en")},
                 keyword_snippet,
+                vision=vision_clips,
             )
             if clip:
                 media[keyword] = clip
@@ -341,11 +348,12 @@ def match_stored_pages(session, keywords, notifier, summary,
 
 
 def _make_clip(row: EPaperPage, matched_kw: list[str], kw_lang: dict,
-               snippet: str) -> str | None:
+               snippet: str, *, vision: bool = True) -> str | None:
     """A press-clipping for this detection, best method first:
     1. EXACT — if the page has publisher image-map regions, find the region
        whose text matches the keyword and crop it precisely (no AI).
-    2. VISION — otherwise ask the vision model to locate + verify a crop.
+    2. VISION — otherwise ask the vision model to locate + verify a crop
+       (skipped when vision=False — keyword Confirm uses clickable regions only).
     Returns a clip path, or None (caller falls back to the full page)."""
     if not row.image_path:
         return None
@@ -361,6 +369,8 @@ def _make_clip(row: EPaperPage, matched_kw: list[str], kw_lang: dict,
                 clip = _clip.clip_from_box(row.image_path, box, row.source, row.page_no, link)
                 if clip:
                     return clip
+    if not vision:
+        return None
     # 2) vision fallback
     return _clip.make_clipping(row.image_path, matched_kw[0], snippet, row.source,
                                row.page_no, link, language=kw_lang.get(matched_kw[0], "en"))

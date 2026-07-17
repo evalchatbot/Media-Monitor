@@ -38,16 +38,17 @@ def main() -> None:
     from app.newspaper.screenshots import backfill_screenshots
 
     if args.backfill_only:
-        summary = backfill_screenshots(limit=40)
+        # Keyword queue path: screenshot exact matches only — no full crawl.
+        summary = backfill_screenshots(limit=40, keyword_ids=keyword_ids)
     else:
         shots = 0
         if keyword_ids:
             # A per-keyword scan follows an instant Quick Scan — capture those
             # fresh hits' screenshots FIRST so the results the user is already
             # looking at get their images within a couple of minutes.
-            shots += backfill_screenshots(limit=15).get("captured", 0)
+            shots += backfill_screenshots(limit=15, keyword_ids=keyword_ids).get("captured", 0)
         summary = run_newspaper_scan(keyword_ids=keyword_ids, uncapped=not args.capped)
-        shots += backfill_screenshots(limit=25).get("captured", 0)
+        shots += backfill_screenshots(limit=25, keyword_ids=keyword_ids).get("captured", 0)
         summary["screenshots_backfilled"] = shots
 
     _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)

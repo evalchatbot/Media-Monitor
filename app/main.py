@@ -403,6 +403,7 @@ _JS = """
   });
 
   var wasScanning=__SCANNING__;
+  var wasQueue=__QUEUE__;
   var lastResultsSig=(document.getElementById('results')||{}).getAttribute
     ? (document.getElementById('results').getAttribute('data-sig')||'')
     : '';
@@ -430,6 +431,7 @@ _JS = """
       var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
       var q=await fetch('/api/scan/queue').then(function(r){return r.json()});
       var running=n.running||e.running||q.running;
+      var queueOn=!!q.running;
       var side=document.getElementById('live-state');
       var b=document.getElementById('scanbtn');
       // Stream new matches into the results grid while work is ongoing.
@@ -437,8 +439,13 @@ _JS = """
       if(running){
         if(side)side.innerHTML='<span class="dot busy"></span>Working…';
         if(b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
-      }else if(wasScanning){location.reload()}
+      }
+      // Keyword Confirm finished — reload so chip spinners clear even if a
+      // scheduled crawl is still going in the background.
+      if(wasQueue && !queueOn){location.reload();return}
+      if(!running && wasScanning){location.reload();return}
       wasScanning=running;
+      wasQueue=queueOn;
     }catch(err){}
   }
   setInterval(poll,1500);
@@ -598,7 +605,7 @@ def _shell(title: str, body: str) -> str:
   {scan_btn}
 </div></div>
 <main class="page"><div class="wrap">{body}</div></main>
-<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false')}</script>
+<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false').replace('__QUEUE__', 'true' if q.get('running') else 'false')}</script>
 </body></html>"""
 
 
@@ -986,7 +993,7 @@ def _results_section_html(
                 "<br>Add keywords above, then Confirm &amp; scan.</div>")
         more = ""
     else:
-        grid = ('<div class="empty">No matches for the 90 days through this date '
+        grid = ('<div class="empty">No matches for the 30 days through this date '
                 "and paper selection."
                 "<br>Try another date or run ▶ on a keyword.</div>")
         more = ""
@@ -1128,31 +1135,7 @@ def home(request: Request, db: Session = Depends(get_db)):
         )
 
     banner = ""
-    news_st = scan_manager.status()
-    ep_st = scan_runner.status()
     q_st = keyword_scan_queue.status()
-    scanning_now = bool(
-        news_st.get("running") or ep_st.get("running") or q_st.get("running")
-    )
-    scan_label = (
-        (q_st.get("current") or {}).get("text")
-        or news_st.get("keyword")
-        or ep_st.get("label")
-        or keyword
-        or ""
-    ).strip()
-    # Spinner targets: the keyword chip being scanned, plus the results panel.
-    kw_scanning = scanning_now and (
-        bool(qp.get("scanning"))
-        or (bool(keyword) and keyword.casefold() == scan_label.casefold())
-        or (not keyword and bool(scan_label))
-    )
-    results_scanning = scanning_now and (
-        bool(qp.get("scanning"))
-        or bool(keyword)
-        or bool(scan_label)
-        or bool(q_st.get("queued"))
-    )
     queued_ids = {
         int(x["id"])
         for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
@@ -1163,10 +1146,13 @@ def home(request: Request, db: Session = Depends(get_db)):
         for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
         if x and x.get("text")
     }
+    # Only the keyword queue drives chip/results spinners — scheduled crawls
+    # must not leave the UI spinning forever.
+    results_scanning = bool(q_st.get("running"))
     if qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
-            "watchlist. Its results remain safely retained for 90 days and return if you add it again."
+            "watchlist. Its results remain safely retained for 30 days and return if you add it again."
             "</div>"
         )
 
@@ -1193,16 +1179,12 @@ def home(request: Request, db: Session = Depends(get_db)):
         select(Keyword).where(Keyword.active.is_(True)).order_by(Keyword.text)
     ).scalars().all()
     kw_l = keyword.casefold()
-    scan_fold = scan_label.casefold() if scan_label else ""
 
     def _kw_chip(k: Keyword) -> str:
         on = " on" if kw_l == k.text.casefold() else ""
         this_busy = (
             k.id in queued_ids
             or k.text.casefold() in queued_folds
-            or (scanning_now and scan_fold and k.text.casefold() == scan_fold)
-            or (kw_scanning and keyword and k.text.casefold() == keyword.casefold())
-            or (bool(qp.get("scanning")) and keyword and k.text.casefold() == keyword.casefold())
         )
         busy = " busy" if this_busy else ""
         play = (
@@ -1219,7 +1201,7 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 90 days.')\">"
+            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 30 days.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
         )
@@ -1330,18 +1312,8 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
         selected = list(papers_all)
     selected_set = set(selected)
 
-    news_st = scan_manager.status()
-    ep_st = scan_runner.status()
     q_st = keyword_scan_queue.status()
-    scanning_now = bool(
-        news_st.get("running") or ep_st.get("running") or q_st.get("running")
-    )
-    results_scanning = scanning_now and (
-        bool(qp.get("scanning"))
-        or bool(keyword)
-        or bool((q_st.get("current") or {}).get("text"))
-        or bool(q_st.get("queued"))
-    )
+    results_scanning = bool(q_st.get("running"))
     html_out, sig = _results_section_html(
         db,
         show_date=show_date,
