@@ -249,9 +249,17 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-play .spin,.kw-busy .spin{width:11px;height:11px;border-width:2px}
 .kw-chip.busy .kw-play{cursor:default;pointer-events:none}
 .kw-chip.on.busy .kw-play{color:#fff}
-.kw-sel{display:inline-flex;align-items:center;padding:0 .35rem 0 .5rem;border-right:1px solid var(--line)}
-.kw-chip.on .kw-sel{border-right-color:rgba(255,255,255,.28)}
-.kw-sel input{margin:0;cursor:pointer}
+.kw-select-panel{margin:.65rem 0 .85rem;padding:.65rem .75rem;border:1px solid var(--line);
+  border-radius:12px;background:#fffdf9}
+.kw-select-panel .cap-row{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem}
+.kw-select-panel .cap{margin:0;flex:1}
+.kw-check-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.35rem .65rem}
+.kw-check-item{display:flex;align-items:center;justify-content:flex-start;gap:.55rem;
+  padding:.35rem .45rem;border-radius:8px;cursor:pointer;font-size:.82rem;font-weight:600;color:var(--ink)}
+.kw-check-item:hover{background:var(--blue-soft)}
+.kw-check-item input{margin:0;width:1rem;height:1rem;flex:0 0 1rem;cursor:pointer}
+.kw-check-item span{line-height:1.25}
+.kw-confirm .ghost{margin-right:.35rem}
 .kw-del,.kw-play-form{margin:0;display:inline-flex}
 .results-head .spin{margin-left:.35rem;vertical-align:-1px;color:var(--blue-deep)}
 .det.scanning{position:relative}
@@ -419,8 +427,11 @@ _JS = """
       });
       var chip=btn.closest('.kw-chip');
       if(chip)chip.classList.add('on');else btn.classList.add('on');
-      var cb=chip?chip.querySelector('input[name=kw_id]'):null;
-      if(cb&&btn.getAttribute('data-kw'))cb.checked=true;
+      var kid=btn.getAttribute('data-kw-id');
+      if(kid){
+        var cb=document.querySelector('input[name=kw_id][value="'+kid+'"]');
+        if(cb)cb.checked=true;
+      }
       form.requestSubmit?form.requestSubmit():form.submit();
     });
   });
@@ -536,6 +547,15 @@ _JS = """
       if(langH&&lang)langH.value=lang.value||'en';
       texts.value=pending.join('\\n');
     });
+  })();
+
+  /* YouTube: centralized keyword tick boxes + select all/none */
+  (function(){
+    var allBtn=document.getElementById('kw-check-all');
+    var noneBtn=document.getElementById('kw-check-none');
+    function boxes(){return Array.prototype.slice.call(document.querySelectorAll('input[name=kw_id]'));}
+    if(allBtn)allBtn.addEventListener('click',function(){boxes().forEach(function(c){c.checked=true})});
+    if(noneBtn)noneBtn.addEventListener('click',function(){boxes().forEach(function(c){c.checked=false})});
   })();
 
   /* Add newspaper / e-paper modal */
@@ -1287,6 +1307,11 @@ def home(request: Request, db: Session = Depends(get_db)):
             "watchlist. Its results remain safely retained for 90 days and return if you add it again."
             "</div>"
         )
+    elif qp.get("added"):
+        banner = (
+            f'<div class="banner ok">Added <b>{html.escape(qp.get("added"))}</b> to the watchlist '
+            "(no scan yet).</div>"
+        )
 
     results_html = ""
     # Drop labels for keywords that were deleted earlier (before purge existed).
@@ -1368,10 +1393,11 @@ def home(request: Request, db: Session = Depends(get_db)):
         <form class="kw-confirm" id="kw-confirm" method="post" action="/ui/keywords/batch">
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
-          <button type="submit">Confirm &amp; scan</button>
+          <button type="submit" name="scan" value="0" class="ghost">Add only</button>
+          <button type="submit" name="scan" value="1">Add &amp; scan</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Add several keywords first, then Confirm — they scan one by one in the order you added them.</p>
+        <p class="hint" style="margin-top:.45rem">Add several keywords first — Add only saves to the watchlist; Add &amp; scan runs them one by one.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to filter · ▶ scan · × hide</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
@@ -1497,7 +1523,6 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
 
     def _kw_chip(k: Keyword) -> str:
         on = " on" if kw_l == k.text.casefold() else ""
-        sel = " checked" if k.id in selected_kw_set else ""
         this_busy = k.id in queued_ids or k.text.casefold() in queued_folds
         busy = " busy" if this_busy else ""
         play = (
@@ -1511,9 +1536,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         )
         return (
             f'<span class="kw-chip{on}{busy}">'
-            f'<label class="kw-sel" title="Search this keyword on the selected date">'
-            f'<input type="checkbox" form="yt-search" name="kw_id" value="{k.id}"{sel}></label>'
-            f'<button type="button" class="kw-pick" '
+            f'<button type="button" class="kw-pick" data-kw-id="{k.id}" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
@@ -1521,6 +1544,27 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
             f'×</button></form></span>'
         )
+
+    kw_checks = "".join(
+        f'<label class="kw-check-item">'
+        f'<input type="checkbox" form="yt-search" name="kw_id" value="{k.id}"'
+        f'{" checked" if k.id in selected_kw_set else ""}>'
+        f'<span>{html.escape(k.text)}</span></label>'
+        for k in active_kws
+    )
+    if active_kws:
+        kw_select_panel = (
+            '<div class="kw-select-panel">'
+            '<div class="cap-row">'
+            '<span class="cap">Keywords for this date search</span>'
+            '<button type="button" class="ghost" id="kw-check-all">Select all</button>'
+            '<button type="button" class="ghost" id="kw-check-none">Clear</button>'
+            '</div>'
+            f'<div class="kw-check-grid">{kw_checks}</div>'
+            '</div>'
+        )
+    else:
+        kw_select_panel = ""
 
     kw_tags = (
         f'<button type="button" class="kw-pick kw-all{" on" if not keyword else ""}" data-kw="">All</button>'
@@ -1532,6 +1576,11 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
             "YouTube watchlist. Results remain retained for 90 days.</div>"
+        )
+    elif qp.get("added"):
+        banner = (
+            f'<div class="banner ok">Added <b>{html.escape(qp.get("added"))}</b> to the YouTube '
+            "watchlist (no scan yet).</div>"
         )
 
     channels = db.execute(
@@ -1565,12 +1614,14 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="module" value="youtube">
           <input type="hidden" name="date" value="{html.escape(date_s)}">
-          <button type="submit">Confirm &amp; scan</button>
+          <button type="submit" name="scan" value="0" class="ghost">Add only</button>
+          <button type="submit" name="scan" value="1">Add &amp; scan</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Pick a date, tick keyword(s), then Show results — all bulletin slots for that day are checked; past dates run Groq immediately on any missing transcripts.</p>
+        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Tick keywords below, pick a date, then Search — past dates transcribe immediately.</p>
+        {kw_select_panel}
         <div class="kw-bar">
-          <div class="cap">YouTube watchlist · tick to search · click name to filter · ▶ scan date</div>
+          <div class="cap">Watchlist · click name to filter · ▶ scan date · × hide</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
@@ -1803,11 +1854,13 @@ def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
 def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
                       module: str = Form("newspaper"),
                       date: str = Form(""),
+                      scan: str = Form("1"),
                       db: Session = Depends(get_db)):
-    """Create/reactivate many keywords, then scan them FIFO (earliest first)."""
+    """Create/reactivate many keywords; optionally scan them."""
     module = module if module in ("newspaper", "youtube") else "newspaper"
     home = "/youtube" if module == "youtube" else "/"
     slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
+    do_scan = scan.strip().lower() in ("1", "true", "yes", "on")
     raw = (texts or "").replace(",", "\n")
     seen: set[str] = set()
     ordered: list[str] = []
@@ -1834,6 +1887,14 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
 
     first = created[0]
     ids = [k.id for k in created]
+    label = ", ".join(k.text for k in created[:3])
+    if len(created) > 3:
+        label += f" +{len(created) - 3}"
+
+    if not do_scan:
+        q = urlencode({"added": label, "date": slot_date})
+        return RedirectResponse(f"{home}?{q}", status_code=303)
+
     if module == "youtube":
         _start_youtube_date_scan(slot_date, ids, label=first.text)
         params: list[tuple[str, str]] = [
