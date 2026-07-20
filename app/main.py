@@ -798,7 +798,8 @@ def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
 
 
 def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
-                    scanning: bool = False) -> str:
+                    scanning: bool = False,
+                    keyword_langs: dict[str, str] | None = None) -> str:
     hl = list(highlight_keywords or [])
     keyword_path = None
     if len(hl) == 1:
@@ -859,13 +860,20 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
         kind = "Web"
     meta = " · ".join(x for x in [kind, m.source, m.section if m.module == "youtube" else None,
                                     m.sentiment, when] if x)
-    excerpt = _highlight_excerpt(m.snippet, hl)
+    snippet_src = (
+        _youtube_snippet_for(m, hl, keyword_langs)
+        if m.module == "youtube" else (m.snippet or "")
+    )
+    excerpt = _highlight_excerpt(snippet_src, hl)
     excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
     jump = ""
     if m.module == "youtube":
+        from app.youtube.matcher import verified_json_hits
+
         sec = m.deeplink_seconds
         if sec is None and hl:
-            hits = (m.keyword_hits or {}).get(hl[0]) or []
+            lang = (keyword_langs or {}).get(hl[0], "ur")
+            hits = verified_json_hits(hl[0], lang, (m.keyword_hits or {}).get(hl[0]) or [])
             if hits:
                 sec = hits[0].get("start")
         if sec is not None:
@@ -879,7 +887,8 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
                         f'Watch at {mm}:{ss:02d}</a>')
         occ = 0
         for label in hl or (m.matched_keywords or []):
-            occ += len((m.keyword_hits or {}).get(label) or [])
+            lang = (keyword_langs or {}).get(label, "ur")
+            occ += len(verified_json_hits(label, lang, (m.keyword_hits or {}).get(label) or []))
         if occ > 1:
             jump += f'<span class="tag">{occ} hits</span>'
     busy = " scanning" if scanning else ""
@@ -1260,19 +1269,63 @@ def _youtube_bulletin_periods(db: Session) -> list[dict]:
     return out
 
 
-def _strict_youtube_match(m: Mention, allowed_fold: set[str]) -> bool:
-    """True only when the mention has an exact watchlist keyword with timed transcript hits."""
-    hits = m.keyword_hits or {}
-    for k in (m.matched_keywords or []):
-        fold = (k or "").casefold()
-        if fold not in allowed_fold:
-            continue
-        kh = hits.get(k)
-        if not kh:
-            continue
-        if any(isinstance(h, dict) and int(h.get("start") or 0) > 0 for h in kh):
-            return True
-    return False
+def _youtube_keyword_langs(
+    db: Session,
+    keyword_ids: list[int] | None = None,
+) -> dict[str, str]:
+    q = select(Keyword.text, Keyword.language).where(Keyword.module == "youtube")
+    if keyword_ids:
+        q = q.where(Keyword.id.in_(keyword_ids))
+    return {t: lang or "ur" for t, lang in db.execute(q).all() if t}
+
+
+def _youtube_verified_labels(
+    m: Mention,
+    keyword_langs: dict[str, str],
+    active_fold: dict[str, str],
+    allowed_fold: set[str] | None = None,
+) -> list[str]:
+    from app.youtube.matcher import mention_verified_keywords
+
+    labels = mention_verified_keywords(
+        m.matched_keywords,
+        m.keyword_hits,
+        keyword_langs,
+        active_fold=active_fold,
+    )
+    if allowed_fold is None:
+        return labels
+    return [k for k in labels if (k or "").casefold() in allowed_fold]
+
+
+def _filter_youtube_mentions(
+    mentions: list[Mention],
+    keyword_langs: dict[str, str],
+    active_fold: dict[str, str],
+    allowed_fold: set[str] | None = None,
+) -> list[Mention]:
+    return [
+        m for m in mentions
+        if _youtube_verified_labels(m, keyword_langs, active_fold, allowed_fold)
+    ]
+
+
+def _youtube_snippet_for(
+    m: Mention,
+    highlight_keywords: list[str],
+    keyword_langs: dict[str, str] | None = None,
+) -> str:
+    """Excerpt for the filtered keyword, not another keyword on the same video."""
+    from app.youtube.matcher import verified_json_hits
+
+    langs = keyword_langs or {}
+    for label in highlight_keywords or []:
+        lang = langs.get(label, "ur")
+        for hit in verified_json_hits(label, lang, (m.keyword_hits or {}).get(label) or []):
+            excerpt = (hit.get("excerpt") or "").strip()
+            if excerpt:
+                return excerpt
+    return m.snippet or ""
 
 
 def _dedupe_youtube_mentions(mentions: list[Mention]) -> list[Mention]:
@@ -1790,37 +1843,41 @@ def _youtube_results_html(
         ]
 
     allowed_labels: set[str] | None = None
+    keyword_langs: dict[str, str] = {}
+    allowed_fold: set[str] | None = None
     if strict and not keyword_ids:
         mentions = []
         allowed_labels = set()
     elif keyword_ids:
         rows = db.execute(
-            select(Keyword.text).where(
+            select(Keyword.text, Keyword.language).where(
                 Keyword.id.in_(keyword_ids),
                 Keyword.module == "youtube",
             )
-        ).scalars().all()
-        allowed_labels = {t for t in rows if t}
-
-    if allowed_labels:
+        ).all()
+        allowed_labels = {t for t, _ in rows if t}
+        keyword_langs = {t: lang or "ur" for t, lang in rows if t}
         allowed_fold = {t.casefold() for t in allowed_labels}
-        mentions = [
-            m for m in mentions
-            if _strict_youtube_match(m, allowed_fold)
-        ]
-        show_limit = settings.keyword_result_limit * max(len(allowed_labels), 1)
     elif keyword:
         kw_l = keyword.casefold()
         if kw_l not in active_fold:
             mentions = []
         else:
-            mentions = [
-                m for m in mentions
-                if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
-            ]
+            allowed_fold = {kw_l}
+
+    if not keyword_langs:
+        keyword_langs = _youtube_keyword_langs(db)
+
+    if mentions:
+        mentions = _filter_youtube_mentions(
+            mentions, keyword_langs, active_fold, allowed_fold,
+        )
+
+    if allowed_labels:
+        show_limit = settings.keyword_result_limit * max(len(allowed_labels), 1)
+    elif keyword:
         show_limit = settings.keyword_result_limit
     else:
-        mentions = [m for m in mentions if _live_matched(m, active_fold)]
         show_limit = min(200, settings.keyword_result_limit * max(len(active_fold), 1))
 
     mentions.sort(key=result_policy.effective_time, reverse=True)
@@ -1850,15 +1907,19 @@ def _youtube_results_html(
     if shown:
         cards = []
         for m in shown:
-            live = _live_matched(m, active_fold)
             if allowed_labels:
-                allowed_fold = {(t or "").casefold() for t in allowed_labels}
-                hl = [k for k in live if (k or "").casefold() in allowed_fold]
+                fold_filter = {(t or "").casefold() for t in allowed_labels}
+                hl = _youtube_verified_labels(m, keyword_langs, active_fold, fold_filter)
             elif keyword:
-                hl = [active_fold[keyword.casefold()]]
+                hl = _youtube_verified_labels(
+                    m, keyword_langs, active_fold, {keyword.casefold()},
+                )
             else:
-                hl = live
-            cards.append(_detection_card(m, highlight_keywords=hl, scanning=results_scanning))
+                hl = _youtube_verified_labels(m, keyword_langs, active_fold)
+            cards.append(_detection_card(
+                m, highlight_keywords=hl, scanning=results_scanning,
+                keyword_langs=keyword_langs,
+            ))
         grid = f'<div class="grid">{"".join(cards)}</div>'
         more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
                 f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
@@ -2235,6 +2296,8 @@ def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = De
         ).order_by(Mention.detected_at.desc())
     ).scalars().all()
     active = _active_keyword_fold(db)
+    yt_langs = _youtube_keyword_langs(db)
+    yt_active = _active_keyword_fold(db, module="youtube")
     if keyword:
         folded = keyword.casefold()
         if folded not in active:
@@ -2242,16 +2305,37 @@ def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = De
         else:
             rows = [
                 m for m in rows
-                if any((label or "").casefold() == folded for label in (m.matched_keywords or []))
+                if (
+                    m.module == "youtube"
+                    and folded in {
+                        (k or "").casefold()
+                        for k in _youtube_verified_labels(m, yt_langs, yt_active)
+                    }
+                )
+                or (
+                    m.module != "youtube"
+                    and any((label or "").casefold() == folded for label in (m.matched_keywords or []))
+                )
             ]
     else:
-        rows = [m for m in rows if _live_matched(m, active)]
+        rows = [
+            m for m in rows
+            if (
+                m.module == "youtube"
+                and _youtube_verified_labels(m, yt_langs, yt_active)
+            )
+            or (m.module != "youtube" and _live_matched(m, active))
+        ]
     rows.sort(key=result_policy.effective_time, reverse=True)
     rows = rows[:limit]
     return [
         {
             "id": m.id, "module": m.module, "source": m.source, "title": m.title,
-            "url": m.url, "matched_keywords": _live_matched(m, active),
+            "url": m.url,
+            "matched_keywords": (
+                _youtube_verified_labels(m, yt_langs, yt_active)
+                if m.module == "youtube" else _live_matched(m, active)
+            ),
             "sentiment": m.sentiment,
             "detected_at": m.detected_at.isoformat() if m.detected_at else None,
         }

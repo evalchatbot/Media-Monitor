@@ -58,6 +58,24 @@ def slot_date_is_past(slot_date: str) -> bool:
         return False
 
 
+def repair_youtube_mentions(session) -> dict:
+    """Drop unverified keyword tags from stored YouTube mentions."""
+    repaired = deleted = 0
+    rows = session.execute(
+        select(Mention).where(Mention.module == "youtube")
+    ).scalars().all()
+    for m in rows:
+        before = list(m.matched_keywords or [])
+        if _sanitize_youtube_mention(session, m):
+            if list(m.matched_keywords or []) != before:
+                repaired += 1
+        else:
+            session.delete(m)
+            deleted += 1
+    session.commit()
+    return {"repaired": repaired, "deleted": deleted}
+
+
 def run_youtube_scan(
     *,
     channel_ids: list[int] | None = None,
@@ -83,6 +101,7 @@ def run_youtube_scan(
     session = SessionLocal()
     notifier = get_notifier()
     try:
+        repair_youtube_mentions(session)
         if match_only:
             summary.update(
                 _match_cached(
@@ -510,9 +529,6 @@ def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, forc
         return
 
     hits_map = matcher.find_all_hits(tr.text or "", tr.segments or [], keywords)
-    # Also admit title matches without timestamps.
-    for m in find_matches(f"{v.title}\n{v.description}", keywords):
-        hits_map.setdefault(m.keyword, [])
 
     _emit_mention(session, notifier, b, ch, slot, v, hits_map, summary, transcript=tr)
     b.discovery_status = "ready" if hits_map else "no_match"
@@ -521,9 +537,45 @@ def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, forc
     session.commit()
 
 
+def _youtube_keyword_langs(session, labels: list[str] | set[str] | None = None) -> dict[str, str]:
+    q = select(Keyword.text, Keyword.language).where(Keyword.module == "youtube")
+    if labels:
+        q = q.where(Keyword.text.in_(list(labels)))
+    return {t: lang or "ur" for t, lang in session.execute(q).all() if t}
+
+
+def _sanitize_youtube_mention(session, mention: Mention) -> bool:
+    """Keep only verified transcript hits on a YouTube mention row."""
+    labels = list(mention.matched_keywords or [])
+    langs = _youtube_keyword_langs(session, labels)
+    verified, clean_hits = matcher.prune_stored_hits(mention.keyword_hits or {}, langs)
+    mention.matched_keywords = verified
+    mention.keyword_hits = clean_hits
+    if mention.keyword_media:
+        mention.keyword_media = {
+            k: v for k, v in mention.keyword_media.items() if k in verified
+        }
+    if not verified:
+        return False
+    first_hit = None
+    for kw in verified:
+        for hit in clean_hits.get(kw) or []:
+            if isinstance(hit, dict) and hit.get("excerpt"):
+                first_hit = hit
+                break
+        if first_hit:
+            break
+    if first_hit:
+        mention.snippet = (first_hit.get("excerpt") or mention.snippet or "")[:240]
+        if mention.deeplink_seconds is None and first_hit.get("start") is not None:
+            mention.deeplink_seconds = int(first_hit["start"])
+    return True
+
+
 def _emit_mention(
     session, notifier, b, ch, slot, v, hits_map, summary, transcript=None,
 ) -> None:
+    hits_map = {k: v for k, v in hits_map.items() if v}
     if not hits_map:
         return
     labels = sorted(hits_map.keys())
@@ -535,7 +587,7 @@ def _emit_mention(
     deeplink_s = first_hit.start if first_hit else None
     url = discovery.deep_link(v.video_id, deeplink_s)
     snippet = (first_hit.excerpt if first_hit else "") or (v.title or "")[:240]
-    hits_json = matcher.hits_to_json({k: v for k, v in hits_map.items() if v})
+    hits_json = matcher.hits_to_json(hits_map)
 
     # One frame per video (first timed hit) — avoid N×slow captures per keyword.
     media: dict[str, str] = {}
@@ -573,24 +625,26 @@ def _emit_mention(
     if existing:
         present = {(k or "").casefold() for k in (existing.matched_keywords or [])}
         new_kw = [k for k in labels if k.casefold() not in present]
-        existing.matched_keywords = sorted(set(existing.matched_keywords or []) | set(labels))
         merged_hits = dict(existing.keyword_hits or {})
         merged_hits.update(hits_json)
         existing.keyword_hits = merged_hits
         merged_media = dict(existing.keyword_media or {})
         merged_media.update(media)
         existing.keyword_media = merged_media
+        if not _sanitize_youtube_mention(session, existing):
+            session.delete(existing)
+            session.commit()
+            return
         if deeplink_s is not None and existing.deeplink_seconds is None:
             existing.deeplink_seconds = deeplink_s
             existing.url = url
         if media and not existing.screenshot_path:
             existing.screenshot_path = next(iter(media.values()))
-        if not existing.snippet:
-            existing.snippet = snippet
         existing.section = section
         session.commit()
-        if new_kw:
-            _alert(notifier, session, existing, new_kw, summary)
+        fresh_kw = [k for k in new_kw if k in (existing.matched_keywords or [])]
+        if fresh_kw:
+            _alert(notifier, session, existing, fresh_kw, summary)
         return
 
     mention = Mention(

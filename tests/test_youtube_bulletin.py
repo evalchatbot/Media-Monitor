@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from app.youtube.classifier import classify_candidates, pick_best, slot_airtime
 from app.youtube.discovery import Video, deep_link
-from app.youtube.matcher import find_all_hits, find_keyword_second
+from app.youtube.matcher import find_all_hits, find_keyword_second, hit_is_verified, verified_json_hits
 
 
 def _vid(vid, title, published, duration=600):
@@ -82,6 +82,26 @@ def test_exact_keyword_timestamp():
 def test_deep_link_format():
     assert deep_link("abc123", 95) == "https://www.youtube.com/watch?v=abc123&t=95s"
     assert deep_link("abc123", None) == "https://www.youtube.com/watch?v=abc123"
+
+
+def test_hit_verification_rejects_vague_stored_hit():
+    assert not hit_is_verified(
+        "Sarah Ahmed", "en", 120, "Heavy rainfall warning until July 24",
+    )
+    assert hit_is_verified(
+        "Sarah Ahmed", "en", 120,
+        "Minister Sarah Ahmed addressed the press conference today",
+    )
+
+
+def test_verified_json_hits_filters_stale_rows():
+    hits = [
+        {"start": 95, "excerpt": "Prime Minister Shehbaz Sharif spoke today"},
+        {"start": 200, "excerpt": "Weather update for Lahore only"},
+    ]
+    kept = verified_json_hits("Shehbaz Sharif", "en", hits)
+    assert len(kept) == 1
+    assert kept[0]["start"] == 95
 
 
 def test_cost_estimate_turbo():

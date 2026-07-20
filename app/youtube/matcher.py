@@ -19,6 +19,72 @@ class KeywordHit:
     confidence: float | None = None
 
 
+def hit_is_verified(keyword: str, language: str, start: int, excerpt: str) -> bool:
+    """Timed transcript hit must contain the exact keyword in its excerpt."""
+    if int(start or 0) <= 0:
+        return False
+    text = (excerpt or "").strip()
+    if not text:
+        return False
+    return bool(find_matches(text, [(keyword, language)]))
+
+
+def _keyword_hit_verified(h: KeywordHit) -> bool:
+    return hit_is_verified(h.keyword, h.language, h.start, h.excerpt)
+
+
+def verified_json_hits(keyword: str, language: str, hits: list) -> list[dict]:
+    """Keep only stored JSON hits that pass verification."""
+    out: list[dict] = []
+    for h in hits or []:
+        if not isinstance(h, dict):
+            continue
+        if not hit_is_verified(keyword, language, int(h.get("start") or 0), h.get("excerpt") or ""):
+            continue
+        out.append(h)
+    return out
+
+
+def prune_stored_hits(
+    keyword_hits: dict,
+    keyword_langs: dict[str, str],
+) -> tuple[list[str], dict]:
+    """Drop unverified keywords/hits from a stored mention row."""
+    clean: dict = {}
+    labels: list[str] = []
+    for kw, hits in (keyword_hits or {}).items():
+        lang = keyword_langs.get(kw, "ur")
+        verified = verified_json_hits(kw, lang, hits if isinstance(hits, list) else [])
+        if verified:
+            labels.append(kw)
+            clean[kw] = verified
+    return sorted(labels), clean
+
+
+def mention_verified_keywords(
+    matched_keywords: list | None,
+    keyword_hits: dict | None,
+    keyword_langs: dict[str, str],
+    *,
+    active_fold: dict[str, str] | None = None,
+) -> list[str]:
+    """Keywords on a mention that still have verified transcript hits."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in matched_keywords or []:
+        fold = (kw or "").casefold()
+        if not kw or fold in seen:
+            continue
+        if active_fold is not None and fold not in active_fold:
+            continue
+        lang = keyword_langs.get(kw, "ur")
+        if verified_json_hits(kw, lang, (keyword_hits or {}).get(kw) or []):
+            seen.add(fold)
+            canonical = (active_fold or {}).get(fold, kw)
+            out.append(canonical)
+    return out
+
+
 def find_all_hits(
     text: str,
     segments: list[dict],
@@ -36,6 +102,7 @@ def find_all_hits(
     out: dict[str, list[KeywordHit]] = {}
     for m in matched:
         hits = _locate_keyword(segments, m.keyword, m.language)
+        hits = [h for h in hits if _keyword_hit_verified(h)]
         if hits:
             out[m.keyword] = hits
     return out
@@ -72,15 +139,15 @@ def _locate_keyword(segments: list[dict], keyword: str, language: str) -> list[K
             end_s = stream[i + n - 1][2]
             end_i = int(end_s) if end_s is not None else start_s
             excerpt = _excerpt_around(segments, start_s, language)
-            hits.append(
-                KeywordHit(
-                    keyword=keyword,
-                    language=language,
-                    start=start_s,
-                    end=end_i,
-                    excerpt=excerpt,
-                )
+            hit = KeywordHit(
+                keyword=keyword,
+                language=language,
+                start=start_s,
+                end=end_i,
+                excerpt=excerpt,
             )
+            if _keyword_hit_verified(hit):
+                hits.append(hit)
 
     if hits:
         return hits
@@ -93,15 +160,15 @@ def _locate_keyword(segments: list[dict], keyword: str, language: str) -> list[K
             start_s = int(float(seg.get("start", 0) or 0))
             end_raw = seg.get("end")
             end_i = int(float(end_raw)) if end_raw is not None else start_s
-            hits.append(
-                KeywordHit(
-                    keyword=keyword,
-                    language=language,
-                    start=start_s,
-                    end=end_i,
-                    excerpt=(seg.get("text") or "").strip()[:240],
-                )
+            hit = KeywordHit(
+                keyword=keyword,
+                language=language,
+                start=start_s,
+                end=end_i,
+                excerpt=(seg.get("text") or "").strip()[:240],
             )
+            if _keyword_hit_verified(hit):
+                hits.append(hit)
     return hits
 
 
