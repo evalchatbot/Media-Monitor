@@ -84,6 +84,8 @@ def repair_youtube_mentions(session) -> dict:
                     if first:
                         m.snippet = (first.excerpt or m.snippet or "")[:240]
                         m.deeplink_seconds = first.start
+                        if m.external_id:
+                            m.url = discovery.deep_link(m.external_id, first.start)
                     rematched += 1
         if _sanitize_youtube_mention(session, m):
             if list(m.matched_keywords or []) != before:
@@ -586,8 +588,10 @@ def _sanitize_youtube_mention(session, mention: Mention) -> bool:
             break
     if first_hit:
         mention.snippet = (first_hit.get("excerpt") or mention.snippet or "")[:240]
-        if mention.deeplink_seconds is None and first_hit.get("start") is not None:
+        if first_hit.get("start") is not None:
             mention.deeplink_seconds = int(first_hit["start"])
+            if mention.external_id:
+                mention.url = discovery.deep_link(mention.external_id, mention.deeplink_seconds)
     return True
 
 

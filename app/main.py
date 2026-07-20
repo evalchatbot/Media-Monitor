@@ -797,6 +797,17 @@ def _highlight_excerpt(text: str | None, keywords: list[str]) -> str:
     return "".join(out)
 
 
+def _youtube_watch_url(m: Mention, seconds: int | None) -> str:
+    from app.youtube.discovery import deep_link
+
+    vid = (m.external_id or "").strip()
+    if not vid:
+        return m.url or "#"
+    if seconds is None:
+        return m.url or deep_link(vid, None)
+    return deep_link(vid, int(seconds))
+
+
 def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
                     scanning: bool = False,
                     keyword_langs: dict[str, str] | None = None) -> str:
@@ -877,6 +888,7 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
     excerpt = _highlight_excerpt(snippet_src, hl)
     excerpt_html = f'<div class="excerpt">…{excerpt}…</div>' if excerpt else ""
     jump = ""
+    yt_sec: int | None = None
     if m.module == "youtube":
         from app.youtube.matcher import verified_json_hits
 
@@ -889,14 +901,14 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
         if sec is None:
             sec = m.deeplink_seconds
         if sec is not None:
-            mm, ss = divmod(int(sec), 60)
-            jump = (f'<a class="jump" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
+            yt_sec = int(sec)
+        watch_url = m.url or "#"
+        if yt_sec is not None and (m.external_id or "").strip():
+            watch_url = _youtube_watch_url(m, yt_sec)
+        if yt_sec is not None:
+            mm, ss = divmod(yt_sec, 60)
+            jump = (f'<a class="jump" href="{html.escape(watch_url)}" target="_blank" rel="noopener">'
                     f'Watch at {mm}:{ss:02d}</a>')
-            # Prefer deep-linked URL even if stored url lacks t=
-            if "t=" not in (m.url or ""):
-                jump = (f'<a class="jump" href="https://www.youtube.com/watch?v='
-                        f'{html.escape(m.external_id)}&t={int(sec)}s" target="_blank" rel="noopener">'
-                        f'Watch at {mm}:{ss:02d}</a>')
         occ = 0
         for label in hl or (m.matched_keywords or []):
             lang = (keyword_langs or {}).get(label, "ur")
@@ -904,8 +916,11 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
         if occ > 1:
             jump += f'<span class="tag">{occ} hits</span>'
     busy = " scanning" if scanning else ""
+    title_href = m.url or "#"
+    if m.module == "youtube" and yt_sec is not None and (m.external_id or "").strip():
+        title_href = _youtube_watch_url(m, yt_sec)
     return (f'<div class="det{busy}">{img}<div class="body">'
-            f'<a class="ttl" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
+            f'<a class="ttl" href="{html.escape(title_href)}" target="_blank" rel="noopener">'
             f'{html.escape(m.title)}</a>{excerpt_html}{jump}'
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
 
