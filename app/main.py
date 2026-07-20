@@ -686,7 +686,6 @@ _JS = """
     }
     saveBtn.disabled=false;
   });
-})();
 
   /* Add YouTube channel modal */
   (function(){
