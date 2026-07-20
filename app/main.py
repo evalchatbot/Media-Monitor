@@ -194,9 +194,12 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .hint{color:var(--faint);font-size:.82rem;margin-top:.7rem}
 
 .results{margin-top:.2rem}
-.results-head{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;margin-bottom:.85rem}
-.results-head h2{margin:0;font-size:1.15rem;color:var(--blue-deep)}
-.results-head .count{color:var(--muted);font-size:.88rem;font-weight:600}
+.results-head{display:flex;align-items:center;justify-content:space-between;gap:.55rem;flex-wrap:wrap;margin-bottom:.85rem}
+.results-head h2{margin:0;font-size:1.15rem;color:var(--blue-deep);flex:0 1 auto}
+.results-head .count{color:var(--muted);font-size:.82rem;font-weight:600}
+.results-head .results-actions{margin-left:auto;display:flex;gap:.45rem;align-items:center}
+.results-filter-hint{width:100%;margin:-.25rem 0 .35rem;font-size:.78rem;color:var(--faint)}
+.results-head .spin{margin-left:.35rem;vertical-align:-1px;color:var(--blue-deep)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem}
 .det{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;
   display:flex;flex-direction:column;box-shadow:var(--shadow-sm);transition:box-shadow .2s,transform .2s,border-color .2s}
@@ -267,7 +270,6 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .slot-picks input{margin:0}
 .live-detail{font-size:.78rem;color:var(--faint);max-width:28rem;text-align:right;line-height:1.25}
 .kw-del,.kw-play-form{margin:0;display:inline-flex}
-.results-head .spin{margin-left:.35rem;vertical-align:-1px;color:var(--blue-deep)}
 .det.scanning{position:relative}
 .det.scanning::after{content:"";position:absolute;top:.55rem;right:.55rem;width:12px;height:12px;
   border:2px solid var(--blue-deep);border-top-color:transparent;border-radius:50%;
@@ -466,6 +468,13 @@ _JS = """
         inp.type='hidden';inp.name='kw_id';inp.value=id;
         box.appendChild(inp);
       });
+      var filterInp=document.getElementById('yt-filter');
+      var showBtn=document.getElementById('yt-show-results');
+      if(filterInp&&showBtn&&document.activeElement===showBtn){
+        filterInp.value='1';
+      }else if(filterInp){
+        filterInp.value='';
+      }
     });
   }
 
@@ -1252,11 +1261,31 @@ def _youtube_bulletin_periods(db: Session) -> list[dict]:
 
 
 def _strict_youtube_match(m: Mention, allowed_fold: set[str]) -> bool:
-    """True only when the mention has an exact watchlist keyword hit."""
+    """True only when the mention has an exact watchlist keyword with timed transcript hits."""
+    hits = m.keyword_hits or {}
     for k in (m.matched_keywords or []):
-        if (k or "").casefold() in allowed_fold:
+        fold = (k or "").casefold()
+        if fold not in allowed_fold:
+            continue
+        kh = hits.get(k)
+        if not kh:
+            continue
+        if any(isinstance(h, dict) and int(h.get("start") or 0) > 0 for h in kh):
             return True
     return False
+
+
+def _dedupe_youtube_mentions(mentions: list[Mention]) -> list[Mention]:
+    """One card per video — keep the newest row."""
+    best: dict[str, Mention] = {}
+    for m in mentions:
+        key = (m.external_id or "").strip() or f"id:{m.id}"
+        prev = best.get(key)
+        if prev is None or result_policy.effective_time(m) > result_policy.effective_time(prev):
+            best[key] = m
+    out = list(best.values())
+    out.sort(key=result_policy.effective_time, reverse=True)
+    return out
 
 
 def _youtube_keyword_ids_from_query(
@@ -1527,6 +1556,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         date_s = show_date.isoformat()
     keyword = (qp.get("q") or "").strip()
     search_requested = bool(qp.get("go"))
+    filter_only = bool(qp.get("filter"))
     selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
     selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
     ensure_due_bulletins(db, for_date=show_date.isoformat())
@@ -1538,7 +1568,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     ).scalars().all()
     periods = _youtube_bulletin_periods(db)
 
-    if search_requested and selected_kw_ids:
+    if search_requested and selected_kw_ids and not filter_only:
         _start_youtube_date_scan(
             show_date.isoformat(),
             selected_kw_ids,
@@ -1560,7 +1590,9 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     yt_st = yt_scan_runner.status()
     queue_items = list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
     yt_queue = [x for x in queue_items if (x.get("module") or "newspaper") == "youtube"]
-    results_scanning = bool(yt_st.get("running") or yt_queue)
+    results_scanning = bool(yt_st.get("running") or yt_queue) and not filter_only
+    selected_kw_set = set(selected_kw_ids)
+    selected_kw_labels = [k.text for k in active_kws if k.id in selected_kw_set]
     results_html, _ = _youtube_results_html(
         db,
         show_date=show_date,
@@ -1569,6 +1601,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         slot_times=selected_slot_times or None,
         date_only=search_requested,
         strict=search_requested,
+        filter_only=filter_only,
+        selected_kw_labels=selected_kw_labels,
         results_scanning=results_scanning,
     )
 
@@ -1582,7 +1616,6 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         for x in yt_queue
         if x and x.get("text")
     }
-    selected_kw_set = set(selected_kw_ids)
 
     def _kw_chip(k: Keyword) -> str:
         sel = " sel" if k.id in selected_kw_set else ""
@@ -1665,7 +1698,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <button type="submit" name="scan" value="1">Add &amp; scan</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Click keywords to select (✓), pick bulletin times, then Search.</p>
+        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Click keywords to select (✓), then <b>Show results</b> or Search &amp; transcribe.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to select for search · ▶ scan date · × hide
             <button type="button" class="ghost" id="kw-sel-all" style="margin-left:.5rem;font-size:.72rem">Select all</button>
@@ -1684,8 +1717,9 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <div id="yt-kw-hidden"></div>
         <input type="hidden" name="q" id="q" value="">
         <input type="hidden" name="go" value="1">
+        <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
         <div class="actions">
-          <button type="submit">Search this date</button>
+          <button type="submit">Search &amp; transcribe this date</button>
           <a class="btn ghost" href="/youtube">Reset</a>
         </div>
       </form>
@@ -1704,6 +1738,8 @@ def _youtube_results_html(
     slot_times: list[str] | None = None,
     date_only: bool = False,
     strict: bool = False,
+    filter_only: bool = False,
+    selected_kw_labels: list[str] | None = None,
     results_scanning: bool,
 ) -> tuple[str, str]:
     active_fold = _active_keyword_fold(db, module="youtube")
@@ -1788,14 +1824,36 @@ def _youtube_results_html(
         show_limit = min(200, settings.keyword_result_limit * max(len(active_fold), 1))
 
     mentions.sort(key=result_policy.effective_time, reverse=True)
+    mentions = _dedupe_youtube_mentions(mentions)
     shown = mentions[:show_limit]
     spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
+
+    filter_hint = ""
+    if selected_kw_labels:
+        kw_line = html.escape(", ".join(selected_kw_labels[:6]))
+        if len(selected_kw_labels) > 6:
+            kw_line += html.escape(f" +{len(selected_kw_labels) - 6}")
+        filter_hint = (
+            f'<p class="hint results-filter-hint">Exact transcript match only for: '
+            f"<b>{kw_line}</b> · one result per video</p>"
+        )
+    elif strict:
+        filter_hint = (
+            '<p class="hint results-filter-hint">Select keyword(s) on the watchlist, '
+            "then click <b>Show results</b>.</p>"
+        )
+
+    show_results_btn = (
+        '<button type="submit" form="yt-search" id="yt-show-results" '
+        'title="Show exact matches for selected keywords (no rescan)">Show results</button>'
+    )
     if shown:
         cards = []
         for m in shown:
             live = _live_matched(m, active_fold)
             if allowed_labels:
-                hl = [k for k in live if k in allowed_labels]
+                allowed_fold = {(t or "").casefold() for t in allowed_labels}
+                hl = [k for k in live if (k or "").casefold() in allowed_fold]
             elif keyword:
                 hl = [active_fold[keyword.casefold()]]
             else:
@@ -1813,7 +1871,11 @@ def _youtube_results_html(
         more = ""
     elif strict and not keyword_ids:
         grid = ('<div class="empty">Select one or more keywords from the watchlist '
-                "(click to mark ✓), then Search this date.</div>")
+                '(click to mark ✓), then <b>Show results</b>.</div>')
+        more = ""
+    elif filter_only and keyword_ids and not shown:
+        grid = ('<div class="empty">No exact matches for the selected keyword(s) on this date.'
+                "<br>Try Search &amp; transcribe to refresh bulletin transcripts.</div>")
         more = ""
     elif date_only:
         grid = (f'<div class="empty">No matches on <b>{html.escape(date_tag)}</b> yet.'
@@ -1833,7 +1895,9 @@ def _youtube_results_html(
           <div class="results-head">
             <h2>Results{spin}</h2>
             <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
+            <div class="results-actions">{show_results_btn}</div>
           </div>
+          {filter_hint}
           {grid}{more}
         </section>
         """
@@ -1871,12 +1935,20 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
 
     if module == "youtube":
         yt_st = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
+        selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
+        selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
+        filter_only = bool(qp.get("filter"))
         results_scanning = bool(
             yt_st.get("running")
             or any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
-        )
-        selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
-        selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
+        ) and not filter_only
+        sel_labels = []
+        if selected_kw_ids:
+            sel_labels = list(db.execute(
+                select(Keyword.text).where(
+                    Keyword.id.in_(selected_kw_ids), Keyword.module == "youtube",
+                )
+            ).scalars().all())
         html_out, sig = _youtube_results_html(
             db,
             show_date=show_date,
@@ -1885,6 +1957,8 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
             slot_times=selected_slot_times or None,
             date_only=bool(qp.get("go")),
             strict=bool(qp.get("go")),
+            filter_only=filter_only,
+            selected_kw_labels=sel_labels or None,
             results_scanning=results_scanning,
         )
         return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
