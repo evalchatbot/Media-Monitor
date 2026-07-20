@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -59,13 +60,31 @@ def slot_date_is_past(slot_date: str) -> bool:
 
 
 def repair_youtube_mentions(session) -> dict:
-    """Drop unverified keyword tags from stored YouTube mentions."""
-    repaired = deleted = 0
+    """Re-locate transcript hits and drop unverified keyword tags."""
+    repaired = deleted = rematched = 0
+    keywords = _active_youtube_keywords(session)
+    kw_by_text = {t: lang for t, lang in keywords}
     rows = session.execute(
         select(Mention).where(Mention.module == "youtube")
     ).scalars().all()
     for m in rows:
         before = list(m.matched_keywords or [])
+        tr = session.execute(
+            select(Transcript).where(Transcript.video_id == m.external_id)
+        ).scalar_one_or_none()
+        if tr and tr.text and tr.segments and m.matched_keywords:
+            labels = [k for k in (m.matched_keywords or []) if k in kw_by_text]
+            if labels:
+                search_kws = [(k, kw_by_text[k]) for k in labels]
+                fresh = matcher.find_all_hits(tr.text, tr.segments or [], search_kws)
+                if fresh:
+                    m.keyword_hits = matcher.hits_to_json(fresh)
+                    m.matched_keywords = sorted(fresh.keys())
+                    first = next((fresh[k][0] for k in sorted(fresh) if fresh[k]), None)
+                    if first:
+                        m.snippet = (first.excerpt or m.snippet or "")[:240]
+                        m.deeplink_seconds = first.start
+                    rematched += 1
         if _sanitize_youtube_mention(session, m):
             if list(m.matched_keywords or []) != before:
                 repaired += 1
@@ -73,7 +92,7 @@ def repair_youtube_mentions(session) -> dict:
             session.delete(m)
             deleted += 1
     session.commit()
-    return {"repaired": repaired, "deleted": deleted}
+    return {"repaired": repaired, "deleted": deleted, "rematched": rematched}
 
 
 def run_youtube_scan(
@@ -589,33 +608,33 @@ def _emit_mention(
     snippet = (first_hit.excerpt if first_hit else "") or (v.title or "")[:240]
     hits_json = matcher.hits_to_json(hits_map)
 
-    # One frame per video (first timed hit) — avoid N×slow captures per keyword.
+    # One frame per keyword at that keyword's own timestamp.
     media: dict[str, str] = {}
-    frame_path: str | None = None
-    if first_hit is not None:
-        out = settings.storage_dir / "youtube" / f"{v.video_id}_{first_hit.start}s.jpg"
+    for kw, kw_hits in hits_map.items():
+        if not kw_hits:
+            continue
+        h = kw_hits[0]
+        safe_kw = re.sub(r"[^\w\-]+", "_", kw, flags=re.UNICODE)[:40]
+        out = settings.storage_dir / "youtube" / f"{v.video_id}_{safe_kw}_{h.start}s.jpg"
         ok = frame.capture_frame(
             v.video_id,
-            first_hit.start,
+            h.start,
             out,
             mode=ch.media_source or settings.youtube_media_source,
         )
-        if ok:
-            frame.stamp_frame(
-                out,
-                channel=ch.name,
-                slot_label=slot.label or slot.local_time,
-                slot_date=b.slot_date,
-                mmss=frame.format_mmss(first_hit.start),
-            )
-            frame_path = str(out)
-    if frame_path:
-        for kw, hits in hits_map.items():
-            if not hits:
-                continue
-            media[kw] = frame_path
-            for item in hits_json.get(kw, [])[:1]:
-                item["screenshot"] = frame_path
+        if not ok:
+            continue
+        frame.stamp_frame(
+            out,
+            channel=ch.name,
+            slot_label=slot.label or slot.local_time,
+            slot_date=b.slot_date,
+            mmss=frame.format_mmss(h.start),
+        )
+        frame_path = str(out)
+        media[kw] = frame_path
+        for item in hits_json.get(kw, [])[:1]:
+            item["screenshot"] = frame_path
 
     existing = session.execute(
         select(Mention).where(Mention.module == "youtube", Mention.external_id == v.video_id)

@@ -804,13 +804,23 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
     keyword_path = None
     if len(hl) == 1:
         needle = hl[0].casefold()
-        keyword_path = next(
-            (
-                path for label, path in (m.keyword_media or {}).items()
-                if (label or "").casefold() == needle
-            ),
-            None,
-        )
+        if m.module == "youtube":
+            from app.youtube.matcher import verified_json_hits
+
+            lang = (keyword_langs or {}).get(hl[0], "ur")
+            for hit in verified_json_hits(hl[0], lang, (m.keyword_hits or {}).get(hl[0]) or []):
+                shot = hit.get("screenshot")
+                if shot and _storage_file(shot):
+                    keyword_path = shot
+                    break
+        if keyword_path is None:
+            keyword_path = next(
+                (
+                    path for label, path in (m.keyword_media or {}).items()
+                    if (label or "").casefold() == needle
+                ),
+                None,
+            )
         if keyword_path and not _storage_file(keyword_path):
             keyword_path = None
     # Legacy multi-keyword e-paper rows may predate keyword_media. Their one
@@ -870,12 +880,14 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
     if m.module == "youtube":
         from app.youtube.matcher import verified_json_hits
 
-        sec = m.deeplink_seconds
-        if sec is None and hl:
+        sec = None
+        if hl:
             lang = (keyword_langs or {}).get(hl[0], "ur")
             hits = verified_json_hits(hl[0], lang, (m.keyword_hits or {}).get(hl[0]) or [])
             if hits:
                 sec = hits[0].get("start")
+        if sec is None:
+            sec = m.deeplink_seconds
         if sec is not None:
             mm, ss = divmod(int(sec), 60)
             jump = (f'<a class="jump" href="{html.escape(m.url)}" target="_blank" rel="noopener">'
@@ -1597,7 +1609,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     """YouTube bulletin monitoring workspace (separate keyword watchlist)."""
     if not settings.youtube_enabled:
         return RedirectResponse("/", status_code=303)
-    from app.youtube.pipeline import bulletin_status_for_date, ensure_due_bulletins
+    from app.youtube.pipeline import bulletin_status_for_date, ensure_due_bulletins, repair_youtube_mentions
 
     today = datetime.now(_PKT).date()
     qp = request.query_params
@@ -1613,6 +1625,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
     selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
     ensure_due_bulletins(db, for_date=show_date.isoformat())
+    if search_requested:
+        repair_youtube_mentions(db)
 
     active_kws = db.execute(
         select(Keyword).where(

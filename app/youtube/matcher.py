@@ -19,27 +19,79 @@ class KeywordHit:
     confidence: float | None = None
 
 
-def hit_is_verified(keyword: str, language: str, start: int, excerpt: str) -> bool:
-    """Timed transcript hit must contain the exact keyword in its excerpt."""
+def _round_ts(seconds: float) -> int:
+    return max(0, int(round(seconds)))
+
+
+def _text_from_segments(segments: list[dict]) -> str:
+    return " ".join(
+        (s.get("text") or "").strip()
+        for s in segments
+        if (s.get("text") or "").strip()
+    )
+
+
+def _segments_word_level(segments: list[dict]) -> bool:
+    """True when Groq returned mostly one short token per segment."""
+    if not segments:
+        return False
+    sample = segments[: min(40, len(segments))]
+    short = sum(1 for s in sample if len((s.get("text") or "").split()) <= 2)
+    return short / len(sample) >= 0.7
+
+
+def _keyword_at_timestamp(
+    segments: list[dict],
+    start_s: int,
+    keyword: str,
+    language: str,
+    *,
+    window: float = 3.0,
+) -> bool:
+    """Confirm the keyword is spoken within a few seconds of the stored timestamp."""
+    parts: list[str] = []
+    for seg in segments:
+        s = float(seg.get("start", 0) or 0)
+        e = float(seg.get("end") or s)
+        if e < start_s - window or s > start_s + window + 0.5:
+            continue
+        parts.append((seg.get("text") or "").strip())
+    if not parts:
+        return False
+    return bool(find_matches(" ".join(parts), [(keyword, language)]))
+
+
+def hit_is_verified(
+    keyword: str,
+    language: str,
+    start: int,
+    excerpt: str,
+    segments: list[dict] | None = None,
+) -> bool:
+    """Timed transcript hit must contain the keyword near the stored timestamp."""
     if int(start or 0) <= 0:
         return False
     text = (excerpt or "").strip()
-    if not text:
+    if not text or not find_matches(text, [(keyword, language)]):
         return False
-    return bool(find_matches(text, [(keyword, language)]))
+    if segments and not _keyword_at_timestamp(segments, int(start), keyword, language):
+        return False
+    return True
 
 
-def _keyword_hit_verified(h: KeywordHit) -> bool:
-    return hit_is_verified(h.keyword, h.language, h.start, h.excerpt)
+def _keyword_hit_verified(h: KeywordHit, segments: list[dict] | None = None) -> bool:
+    return hit_is_verified(h.keyword, h.language, h.start, h.excerpt, segments)
 
 
 def verified_json_hits(keyword: str, language: str, hits: list) -> list[dict]:
-    """Keep only stored JSON hits that pass verification."""
+    """Keep only stored JSON hits that pass excerpt verification."""
     out: list[dict] = []
     for h in hits or []:
         if not isinstance(h, dict):
             continue
-        if not hit_is_verified(keyword, language, int(h.get("start") or 0), h.get("excerpt") or ""):
+        if not hit_is_verified(
+            keyword, language, int(h.get("start") or 0), h.get("excerpt") or "",
+        ):
             continue
         out.append(h)
     return out
@@ -90,19 +142,16 @@ def find_all_hits(
     segments: list[dict],
     keywords: list[tuple[str, str]],
 ) -> dict[str, list[KeywordHit]]:
-    """Return every exact spoken occurrence per keyword.
-
-    keywords: list of (text, language)
-    """
-    matched = find_matches(text, keywords)
+    """Return every exact spoken occurrence per keyword."""
+    corpus = _text_from_segments(segments) or text
+    matched = find_matches(corpus, keywords)
     if not matched:
-        # Title/description-only matches still useful later; no timestamps.
         return {}
 
     out: dict[str, list[KeywordHit]] = {}
     for m in matched:
         hits = _locate_keyword(segments, m.keyword, m.language)
-        hits = [h for h in hits if _keyword_hit_verified(h)]
+        hits = [h for h in hits if _keyword_hit_verified(h, segments)]
         if hits:
             out[m.keyword] = hits
     return out
@@ -122,8 +171,118 @@ def _locate_keyword(segments: list[dict], keyword: str, language: str) -> list[K
     kw_tokens = [t for t in norm_kw.split() if t]
     if not kw_tokens:
         return []
-    n = len(kw_tokens)
 
+    hits: list[KeywordHit] = []
+    if _segments_word_level(segments):
+        hits.extend(_locate_word_segments(segments, kw_tokens, keyword, language))
+
+    if not hits:
+        hits.extend(_locate_in_long_segments(segments, norm_kw, kw_tokens, keyword, language))
+
+    if not hits:
+        hits.extend(_locate_token_stream(segments, kw_tokens, keyword, language))
+
+    # Deduplicate near-identical timestamps for the same keyword.
+    deduped: list[KeywordHit] = []
+    seen_starts: set[int] = set()
+    for h in sorted(hits, key=lambda x: x.start):
+        if h.start in seen_starts:
+            continue
+        seen_starts.add(h.start)
+        deduped.append(h)
+    return deduped
+
+
+def _locate_word_segments(
+    segments: list[dict],
+    kw_tokens: list[str],
+    keyword: str,
+    language: str,
+) -> list[KeywordHit]:
+    """Match consecutive Groq word segments (one token each) for precise timing."""
+    stream: list[tuple[str, float, float | None]] = []
+    for seg in segments:
+        raw = (seg.get("text") or "").strip()
+        if not raw:
+            continue
+        norm = normalize(raw, language)
+        token = norm.split()[0] if norm.split() else ""
+        if not token:
+            tokens = _WORD_RE.findall(norm)
+            token = tokens[0] if tokens else ""
+        if not token:
+            continue
+        start = float(seg.get("start", 0) or 0)
+        end = seg.get("end")
+        stream.append((token, start, float(end) if end is not None else None))
+
+    n = len(kw_tokens)
+    hits: list[KeywordHit] = []
+    for i in range(len(stream) - n + 1):
+        if not all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
+            continue
+        start_s = _round_ts(stream[i][1])
+        end_raw = stream[i + n - 1][2]
+        end_i = _round_ts(end_raw) if end_raw is not None else start_s
+        hits.append(
+            KeywordHit(
+                keyword=keyword,
+                language=language,
+                start=start_s,
+                end=end_i,
+                excerpt=_excerpt_around(segments, start_s, language),
+            )
+        )
+    return hits
+
+
+def _locate_in_long_segments(
+    segments: list[dict],
+    norm_kw: str,
+    kw_tokens: list[str],
+    keyword: str,
+    language: str,
+) -> list[KeywordHit]:
+    """Find keyword inside long Whisper segments and interpolate the timestamp."""
+    pat = re.compile(exact_pattern(norm_kw))
+    hits: list[KeywordHit] = []
+    for seg in segments:
+        raw = (seg.get("text") or "").strip()
+        if not raw:
+            continue
+        seg_text = normalize(raw, language)
+        mt = pat.search(seg_text)
+        if not mt:
+            continue
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end") or start)
+        if end <= start:
+            start_s = _round_ts(start)
+        else:
+            pos = mt.start() / max(len(seg_text), 1)
+            start_s = _round_ts(start + pos * (end - start))
+        end_raw = seg.get("end")
+        end_i = _round_ts(float(end_raw)) if end_raw is not None else start_s
+        hits.append(
+            KeywordHit(
+                keyword=keyword,
+                language=language,
+                start=start_s,
+                end=end_i,
+                excerpt=raw[:240],
+            )
+        )
+    return hits
+
+
+def _locate_token_stream(
+    segments: list[dict],
+    kw_tokens: list[str],
+    keyword: str,
+    language: str,
+) -> list[KeywordHit]:
+    """Fallback: tokenize each segment and walk the stream."""
+    n = len(kw_tokens)
     stream: list[tuple[str, float, float | None]] = []
     for seg in segments:
         start = float(seg.get("start", 0) or 0)
@@ -134,52 +293,33 @@ def _locate_keyword(segments: list[dict], keyword: str, language: str) -> list[K
 
     hits: list[KeywordHit] = []
     for i in range(len(stream) - n + 1):
-        if all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
-            start_s = int(stream[i][1])
-            end_s = stream[i + n - 1][2]
-            end_i = int(end_s) if end_s is not None else start_s
-            excerpt = _excerpt_around(segments, start_s, language)
-            hit = KeywordHit(
+        if not all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
+            continue
+        start_s = _round_ts(stream[i][1])
+        end_s = stream[i + n - 1][2]
+        end_i = _round_ts(end_s) if end_s is not None else start_s
+        hits.append(
+            KeywordHit(
                 keyword=keyword,
                 language=language,
                 start=start_s,
                 end=end_i,
-                excerpt=excerpt,
+                excerpt=_excerpt_around(segments, start_s, language),
             )
-            if _keyword_hit_verified(hit):
-                hits.append(hit)
-
-    if hits:
-        return hits
-
-    # Fallback: whole keyword inside a segment's text.
-    pat = re.compile(exact_pattern(norm_kw))
-    for seg in segments:
-        seg_text = normalize(seg.get("text") or "", language)
-        if pat.search(seg_text):
-            start_s = int(float(seg.get("start", 0) or 0))
-            end_raw = seg.get("end")
-            end_i = int(float(end_raw)) if end_raw is not None else start_s
-            hit = KeywordHit(
-                keyword=keyword,
-                language=language,
-                start=start_s,
-                end=end_i,
-                excerpt=(seg.get("text") or "").strip()[:240],
-            )
-            if _keyword_hit_verified(hit):
-                hits.append(hit)
+        )
     return hits
 
 
-def _excerpt_around(segments: list[dict], start_s: int, language: str, radius: float = 8.0) -> str:
+def _excerpt_around(segments: list[dict], start_s: int, language: str, radius: float = 6.0) -> str:
     parts = []
     for seg in segments:
         s = float(seg.get("start", 0) or 0)
-        if abs(s - start_s) <= radius:
-            t = (seg.get("text") or "").strip()
-            if t:
-                parts.append(t)
+        e = float(seg.get("end") or s)
+        if e < start_s - radius or s > start_s + radius:
+            continue
+        t = (seg.get("text") or "").strip()
+        if t:
+            parts.append(t)
     text = " ".join(parts).strip()
     return text[:240] if text else ""
 

@@ -104,6 +104,32 @@ def test_verified_json_hits_filters_stale_rows():
     assert kept[0]["start"] == 95
 
 
+def test_interpolated_timestamp_in_long_segment():
+    segments = [
+        {
+            "start": 100.0,
+            "end": 130.0,
+            "text": "پہلے موسم کی تفصیلات اور اب سوشل میڈیا پر نئی پالیسی",
+        },
+    ]
+    text = segments[0]["text"]
+    hits = find_all_hits(text, segments, [("سوشل میڈیا", "ur")])
+    assert "سوشل میڈیا" in hits
+    # Keyword is late in a 30s segment — timestamp must not be the segment start.
+    assert hits["سوشل میڈیا"][0].start > 105
+
+
+def test_word_level_segments_use_word_timestamp():
+    segments = [
+        {"start": 10.0, "end": 10.3, "text": "سوشل"},
+        {"start": 10.4, "end": 10.8, "text": "میڈیا"},
+        {"start": 10.9, "end": 11.2, "text": "پر"},
+    ]
+    text = " ".join(s["text"] for s in segments)
+    hits = find_all_hits(text, segments, [("سوشل میڈیا", "ur")])
+    assert hits["سوشل میڈیا"][0].start == 10
+
+
 def test_cost_estimate_turbo():
     from app.youtube.transcribe import estimate_cost_usd
 
