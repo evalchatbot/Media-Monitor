@@ -249,6 +249,9 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
 .kw-play .spin,.kw-busy .spin{width:11px;height:11px;border-width:2px}
 .kw-chip.busy .kw-play{cursor:default;pointer-events:none}
 .kw-chip.on.busy .kw-play{color:#fff}
+.kw-sel{display:inline-flex;align-items:center;padding:0 .35rem 0 .5rem;border-right:1px solid var(--line)}
+.kw-chip.on .kw-sel{border-right-color:rgba(255,255,255,.28)}
+.kw-sel input{margin:0;cursor:pointer}
 .kw-del,.kw-play-form{margin:0;display:inline-flex}
 .results-head .spin{margin-left:.35rem;vertical-align:-1px;color:var(--blue-deep)}
 .det.scanning{position:relative}
@@ -416,6 +419,8 @@ _JS = """
       });
       var chip=btn.closest('.kw-chip');
       if(chip)chip.classList.add('on');else btn.classList.add('on');
+      var cb=chip?chip.querySelector('input[name=kw_id]'):null;
+      if(cb&&btn.getAttribute('data-kw'))cb.checked=true;
       form.requestSubmit?form.requestSubmit():form.submit();
     });
   });
@@ -1155,6 +1160,46 @@ def _start_keyword_scan(kw: Keyword) -> dict:
     }
 
 
+def _start_youtube_date_scan(
+    slot_date: str,
+    keyword_ids: list[int] | None = None,
+    *,
+    label: str | None = None,
+) -> bool:
+    """Run discover → transcribe → match for every bulletin slot on one date."""
+    from app.youtube.pipeline import slot_date_is_past
+
+    return yt_scan_runner.start_scan(
+        slot_date=slot_date,
+        keyword_ids=keyword_ids or None,
+        force=slot_date_is_past(slot_date),
+        label=label or f"date:{slot_date}",
+    )
+
+
+def _youtube_keyword_ids_from_query(
+    db: Session,
+    *,
+    kw_id_params: list[str],
+    keyword: str,
+    module: str = "youtube",
+) -> list[int]:
+    ids = [int(x) for x in kw_id_params if str(x).isdigit()]
+    if ids:
+        return ids
+    if keyword:
+        row = db.execute(
+            select(Keyword.id).where(
+                Keyword.active.is_(True),
+                Keyword.module == module,
+                func.lower(Keyword.text) == keyword.casefold(),
+            )
+        ).scalar_one_or_none()
+        if row:
+            return [int(row)]
+    return []
+
+
 def _upsert_watch_keyword(db: Session, text: str, language: str,
                           module: str = "newspaper") -> Keyword | None:
     """Create or reactivate a watchlist keyword. Does not start a scan."""
@@ -1393,7 +1438,25 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         show_date = today
         date_s = show_date.isoformat()
     keyword = (qp.get("q") or "").strip()
+    search_requested = bool(qp.get("go"))
+    selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
     ensure_due_bulletins(db, for_date=show_date.isoformat())
+
+    active_kws = db.execute(
+        select(Keyword).where(
+            Keyword.active.is_(True), Keyword.module == "youtube"
+        ).order_by(Keyword.text)
+    ).scalars().all()
+
+    if search_requested:
+        scan_kw_ids = selected_kw_ids or _youtube_keyword_ids_from_query(
+            db, kw_id_params=[], keyword=keyword,
+        )
+        _start_youtube_date_scan(
+            show_date.isoformat(),
+            scan_kw_ids or None,
+            label=f"search:{show_date.isoformat()}",
+        )
 
     status_rows = bulletin_status_for_date(db, show_date)
     status_html = '<div class="yt-status">' + "".join(
@@ -1411,7 +1474,12 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     yt_queue = [x for x in queue_items if (x.get("module") or "newspaper") == "youtube"]
     results_scanning = bool(yt_st.get("running") or yt_queue)
     results_html, _ = _youtube_results_html(
-        db, show_date=show_date, keyword=keyword, results_scanning=results_scanning,
+        db,
+        show_date=show_date,
+        keyword=keyword,
+        keyword_ids=selected_kw_ids or None,
+        date_only=search_requested,
+        results_scanning=results_scanning,
     )
 
     queued_ids = {
@@ -1424,15 +1492,12 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         for x in yt_queue
         if x and x.get("text")
     }
-    active_kws = db.execute(
-        select(Keyword).where(
-            Keyword.active.is_(True), Keyword.module == "youtube"
-        ).order_by(Keyword.text)
-    ).scalars().all()
     kw_l = keyword.casefold()
+    selected_kw_set = set(selected_kw_ids)
 
     def _kw_chip(k: Keyword) -> str:
         on = " on" if kw_l == k.text.casefold() else ""
+        sel = " checked" if k.id in selected_kw_set else ""
         this_busy = k.id in queued_ids or k.text.casefold() in queued_folds
         busy = " busy" if this_busy else ""
         play = (
@@ -1440,11 +1505,14 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             '<span class="spin"></span></span>'
             if this_busy else
             f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
-            f'<button type="submit" class="kw-play" title="Scan this keyword now" '
+            f'<input type="hidden" name="date" value="{html.escape(date_s)}">'
+            f'<button type="submit" class="kw-play" title="Scan this keyword on selected date" '
             f'aria-label="Scan">▶</button></form>'
         )
         return (
             f'<span class="kw-chip{on}{busy}">'
+            f'<label class="kw-sel" title="Search this keyword on the selected date">'
+            f'<input type="checkbox" form="yt-search" name="kw_id" value="{k.id}"{sel}></label>'
             f'<button type="button" class="kw-pick" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'{play}'
@@ -1496,12 +1564,13 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="module" value="youtube">
+          <input type="hidden" name="date" value="{html.escape(date_s)}">
           <button type="submit">Confirm &amp; scan</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Confirm matches cached transcripts instantly; scheduled jobs fill new bulletins.</p>
+        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Pick a date, tick keyword(s), then Show results — all bulletin slots for that day are checked; past dates run Groq immediately on any missing transcripts.</p>
         <div class="kw-bar">
-          <div class="cap">YouTube watchlist · click to filter · ▶ rematch · × hide</div>
+          <div class="cap">YouTube watchlist · tick to search · click name to filter · ▶ scan date</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
@@ -1511,7 +1580,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <input type="hidden" name="q" id="q" value="{html.escape(keyword)}">
         <input type="hidden" name="go" value="1">
         <div class="actions">
-          <button type="submit">Show results</button>
+          <button type="submit">Search this date</button>
           <a class="btn ghost" href="/youtube">Reset</a>
         </div>
       </form>
@@ -1521,14 +1590,25 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     return _shell("YouTube · Media Monitor", body, module="youtube")
 
 
-def _youtube_results_html(db: Session, *, show_date, keyword: str,
-                          results_scanning: bool) -> tuple[str, str]:
+def _youtube_results_html(
+    db: Session,
+    *,
+    show_date,
+    keyword: str,
+    keyword_ids: list[int] | None = None,
+    date_only: bool = False,
+    results_scanning: bool,
+) -> tuple[str, str]:
     active_fold = _active_keyword_fold(db, module="youtube")
-    first_date = show_date - timedelta(days=settings.keyword_search_days - 1)
+    if date_only:
+        first_date = show_date
+    else:
+        first_date = show_date - timedelta(days=settings.keyword_search_days - 1)
     day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
     day_end = datetime(show_date.year, show_date.month, show_date.day, tzinfo=_PKT) + timedelta(days=1)
     start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
+    date_tag = show_date.isoformat()
 
     mentions = db.execute(
         select(Mention).where(
@@ -1548,7 +1628,30 @@ def _youtube_results_html(db: Session, *, show_date, keyword: str,
         ).order_by(Mention.detected_at.desc())
     ).scalars().all()
 
-    if keyword:
+    if date_only:
+        mentions = [
+            m for m in mentions
+            if date_tag in (m.section or "") or date_tag in (m.title or "")
+        ]
+
+    allowed_labels: set[str] | None = None
+    if keyword_ids:
+        rows = db.execute(
+            select(Keyword.text).where(
+                Keyword.id.in_(keyword_ids),
+                Keyword.module == "youtube",
+            )
+        ).scalars().all()
+        allowed_labels = {t for t in rows if t}
+
+    if allowed_labels:
+        allowed_fold = {t.casefold() for t in allowed_labels}
+        mentions = [
+            m for m in mentions
+            if any((k or "").casefold() in allowed_fold for k in (m.matched_keywords or []))
+        ]
+        show_limit = settings.keyword_result_limit * max(len(allowed_labels), 1)
+    elif keyword:
         kw_l = keyword.casefold()
         if kw_l not in active_fold:
             mentions = []
@@ -1569,7 +1672,12 @@ def _youtube_results_html(db: Session, *, show_date, keyword: str,
         cards = []
         for m in shown:
             live = _live_matched(m, active_fold)
-            hl = [active_fold[keyword.casefold()]] if keyword else live
+            if allowed_labels:
+                hl = [k for k in live if k in allowed_labels]
+            elif keyword:
+                hl = [active_fold[keyword.casefold()]]
+            else:
+                hl = live
             cards.append(_detection_card(m, highlight_keywords=hl, scanning=results_scanning))
         grid = f'<div class="grid">{"".join(cards)}</div>'
         more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
@@ -1579,11 +1687,16 @@ def _youtube_results_html(db: Session, *, show_date, keyword: str,
         more = ""
     elif not active_fold:
         grid = ('<div class="empty">No YouTube keywords yet.'
-                "<br>Add keywords above, then Confirm &amp; scan.</div>")
+                "<br>Add keywords above, then search a date.</div>")
+        more = ""
+    elif date_only:
+        grid = (f'<div class="empty">No matches on <b>{html.escape(date_tag)}</b> yet.'
+                "<br>Searching all bulletin slots for that day — Groq runs on any "
+                "uploaded bulletins not yet transcribed.</div>")
         more = ""
     else:
         grid = ('<div class="empty">No YouTube matches for the 30 days through this date.'
-                "<br>Bulletins are processed one hour after each slot.</div>")
+                "<br>Pick a date and tick keywords to search bulletin slots.</div>")
         more = ""
 
     max_id = max((m.id for m in shown), default=0)
@@ -1636,8 +1749,14 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
             yt_st.get("running")
             or any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
         )
+        selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
         html_out, sig = _youtube_results_html(
-            db, show_date=show_date, keyword=keyword, results_scanning=results_scanning,
+            db,
+            show_date=show_date,
+            keyword=keyword,
+            keyword_ids=selected_kw_ids or None,
+            date_only=bool(qp.get("go")),
+            results_scanning=results_scanning,
         )
         return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
 
@@ -1683,10 +1802,12 @@ def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
 @app.post("/ui/keywords/batch")
 def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
                       module: str = Form("newspaper"),
+                      date: str = Form(""),
                       db: Session = Depends(get_db)):
     """Create/reactivate many keywords, then scan them FIFO (earliest first)."""
     module = module if module in ("newspaper", "youtube") else "newspaper"
     home = "/youtube" if module == "youtube" else "/"
+    slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
     raw = (texts or "").replace(",", "\n")
     seen: set[str] = set()
     ordered: list[str] = []
@@ -1711,8 +1832,20 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
     if not created:
         return RedirectResponse(home, status_code=303)
 
-    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
     first = created[0]
+    ids = [k.id for k in created]
+    if module == "youtube":
+        _start_youtube_date_scan(slot_date, ids, label=first.text)
+        params: list[tuple[str, str]] = [
+            ("q", first.text),
+            ("go", "1"),
+            ("date", slot_date),
+            ("scanning", "1"),
+        ]
+        params += [("kw_id", str(i)) for i in ids]
+        return RedirectResponse(f"{home}?{urlencode(params)}", status_code=303)
+
+    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
     q = urlencode({
         "q": first.text,
         "go": "1",
@@ -1761,16 +1894,27 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
 
 
 @app.post("/ui/keywords/{kid}/scan")
-def ui_scan_keyword(kid: int, db: Session = Depends(get_db)):
+def ui_scan_keyword(kid: int, date: str = Form(""), db: Session = Depends(get_db)):
     kw = db.get(Keyword, kid)
     if not kw:
         raise HTTPException(404, "keyword not found")
-    _start_keyword_scan(kw)
     home = "/youtube" if (kw.module or "newspaper") == "youtube" else "/"
+    slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
+    if (kw.module or "newspaper") == "youtube":
+        _start_youtube_date_scan(slot_date, [kw.id], label=kw.text)
+        params = [
+            ("q", kw.text),
+            ("go", "1"),
+            ("date", slot_date),
+            ("kw_id", str(kw.id)),
+            ("scanning", "1"),
+        ]
+        return RedirectResponse(f"{home}?{urlencode(params)}", status_code=303)
+    _start_keyword_scan(kw)
     q = urlencode({
         "q": kw.text,
         "go": "1",
-        "date": datetime.now(_PKT).date().isoformat(),
+        "date": slot_date,
         "scanning": "1",
     })
     return RedirectResponse(f"{home}?{q}", status_code=303)

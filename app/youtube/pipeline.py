@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core import result_policy
@@ -27,6 +27,14 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 _PKT = ZoneInfo(settings.youtube_timezone)
+
+
+def slot_date_is_past(slot_date: str) -> bool:
+    """True when the bulletin calendar day is before today (PKT)."""
+    try:
+        return date.fromisoformat(slot_date) < datetime.now(_PKT).date()
+    except ValueError:
+        return False
 
 
 def run_youtube_scan(
@@ -54,7 +62,13 @@ def run_youtube_scan(
     notifier = get_notifier()
     try:
         if match_only:
-            summary.update(_match_cached(session, notifier, keyword_ids=keyword_ids))
+            summary.update(
+                _match_cached(
+                    session, notifier,
+                    keyword_ids=keyword_ids,
+                    slot_date=slot_date,
+                )
+            )
             result_policy.enforce_limits(session)
             return summary
 
@@ -79,6 +93,8 @@ def run_youtube_scan(
         summary["channels"] = len(channels)
 
         keywords = _active_youtube_keywords(session, keyword_ids)
+        historical = bool(slot_date and slot_date_is_past(slot_date))
+        effective_force = force or historical
         for b in bulletins:
             summary["bulletins_checked"] += 1
             ch = channels.get(b.channel_db_id)
@@ -86,7 +102,7 @@ def run_youtube_scan(
             if not ch or not slot or not slot.enabled:
                 continue
             upgrade_meta = False
-            if not force and b.discovery_status in ("ready", "no_match") and b.transcription_status == "done":
+            if not effective_force and b.discovery_status in ("ready", "no_match") and b.transcription_status == "done":
                 # Metadata-only stubs must be upgraded to real Groq audio transcripts.
                 existing = None
                 if b.video_id:
@@ -100,10 +116,13 @@ def run_youtube_scan(
                     if keywords:
                         _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary)
                     continue
-            if not force and not upgrade_meta and not _is_due(b, slot, ch):
+            if not effective_force and not upgrade_meta and not _is_due(b, slot, ch):
                 continue
             try:
-                _process_bulletin(session, notifier, b, ch, slot, keywords, summary, force=force or upgrade_meta)
+                _process_bulletin(
+                    session, notifier, b, ch, slot, keywords, summary,
+                    force=effective_force or upgrade_meta,
+                )
             except Exception as exc:
                 logger.exception("bulletin %s failed: %s", b.id, exc)
                 b.discovery_status = "failed"
@@ -168,9 +187,30 @@ def ensure_due_bulletins(
     return created
 
 
-def run_quick_youtube_match(keyword_ids: list[int] | None = None) -> dict:
-    """Match YouTube keywords against cached transcripts only (no retranscription)."""
-    return run_youtube_scan(keyword_ids=keyword_ids, match_only=True)
+def run_quick_youtube_match(
+    keyword_ids: list[int] | None = None,
+    *,
+    slot_date: str | None = None,
+) -> dict:
+    """Match keywords against cached transcripts (optionally one bulletin date)."""
+    return run_youtube_scan(
+        keyword_ids=keyword_ids,
+        slot_date=slot_date,
+        match_only=True,
+    )
+
+
+def run_youtube_date_search(
+    slot_date: str,
+    keyword_ids: list[int] | None = None,
+) -> dict:
+    """Discover, transcribe if needed, and match every bulletin slot on one date."""
+    return run_youtube_scan(
+        slot_date=slot_date,
+        keyword_ids=keyword_ids,
+        force=slot_date_is_past(slot_date),
+        match_only=False,
+    )
 
 
 def bulletin_status_for_date(session, show_date: date) -> list[dict]:
@@ -554,15 +594,32 @@ def _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary) -> None
     _emit_mention(session, notifier, b, ch, slot, v, hits_map, summary, transcript=tr)
 
 
-def _match_cached(session, notifier, keyword_ids=None) -> dict:
+def _match_cached(
+    session, notifier, keyword_ids=None, slot_date: str | None = None,
+) -> dict:
     summary = {"mentions": 0, "alerts": 0, "pages_checked": 0}
     keywords = _active_youtube_keywords(session, keyword_ids)
     if not keywords:
         return summary
     since = result_policy.search_cutoff()
-    transcripts = session.execute(
-        select(Transcript).where(Transcript.created_at >= since)
-    ).scalars().all()
+    q = select(Transcript).where(Transcript.created_at >= since)
+    if slot_date:
+        b_rows = session.execute(
+            select(YouTubeBulletin.id, YouTubeBulletin.video_id).where(
+                YouTubeBulletin.slot_date == slot_date
+            )
+        ).all()
+        b_ids = [r[0] for r in b_rows]
+        v_ids = [r[1] for r in b_rows if r[1]]
+        clauses = []
+        if b_ids:
+            clauses.append(Transcript.bulletin_id.in_(b_ids))
+        if v_ids:
+            clauses.append(Transcript.video_id.in_(v_ids))
+        if not clauses:
+            return summary
+        q = q.where(or_(*clauses))
+    transcripts = session.execute(q).scalars().all()
     channels = {
         c.channel_id: c
         for c in session.execute(select(YouTubeChannel)).scalars()
