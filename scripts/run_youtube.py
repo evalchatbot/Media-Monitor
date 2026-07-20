@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--match-only", action="store_true",
                         help="match cached transcripts only (no discovery/transcription)")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--period-start", default="", help="ISO period start (UTC or offset)")
+    parser.add_argument("--period-end", default="", help="ISO period end (UTC or offset)")
     args = parser.parse_args()
 
     keyword_ids = [int(x) for x in args.keyword_ids.split(",") if x.strip()] or None
@@ -38,6 +40,8 @@ def main() -> None:
         slot_times=slot_times,
         force=args.force,
         match_only=args.match_only,
+        period_start=args.period_start or None,
+        period_end=args.period_end or None,
     )
 
     _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)

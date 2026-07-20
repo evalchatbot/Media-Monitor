@@ -348,6 +348,24 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   font-size:.82rem;font-weight:500}
 #yt-ch-slots li:last-child{border-bottom:0}
 #yt-ch-slots .slot-meta{color:var(--faint);font-size:.76rem;font-weight:500;margin-top:.15rem;line-height:1.35}
+
+#yt-period-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
+  padding:1rem;background:rgba(44,58,72,.45);backdrop-filter:blur(6px)}
+#yt-period-modal.open{display:flex}
+#yt-period-modal .box{width:min(520px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
+  border:1px solid var(--line);border-radius:var(--r);padding:1.35rem 1.4rem;box-shadow:var(--shadow)}
+#yt-period-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
+#yt-period-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem;line-height:1.45}
+#yt-period-modal .period-grid{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .75rem;margin-bottom:.75rem}
+#yt-period-modal label{font-size:.78rem;font-weight:600;color:var(--muted);display:block;margin-bottom:.25rem}
+#yt-period-modal input[type=date],#yt-period-modal input[type=time]{width:100%;padding:.55rem .75rem;
+  border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9}
+#yt-period-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
+#yt-period-modal #yt-period-result{margin-top:.75rem;padding:.75rem .9rem;border-radius:var(--r-sm);font-size:.88rem;
+  font-weight:600;line-height:1.45;display:none}
+#yt-period-modal #yt-period-result.show{display:block}
+#yt-period-modal #yt-period-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
+
 .ch-bar{margin:.65rem 0 .35rem}
 .ch-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem}
 .ch-tag{display:inline-flex;align-items:center;padding:.22rem .65rem;border-radius:999px;font-size:.78rem;
@@ -482,7 +500,19 @@ _JS = """
       document.querySelectorAll('.kw-chip[data-kw-id]').forEach(function(c){c.classList.remove('sel')});
     });
     var ytForm=document.getElementById('yt-search');
+    function syncPeriodHidden(){
+      var sd=document.getElementById('yt-p-start-date');
+      var ed=document.getElementById('yt-p-end-date');
+      var st=document.getElementById('yt-p-start-time');
+      var et=document.getElementById('yt-p-end-time');
+      var hs=document.getElementById('yt-period-start');
+      var he=document.getElementById('yt-period-end');
+      if(!sd||!ed||!st||!et||!hs||!he)return;
+      hs.value=sd.value+'T'+st.value+':00+05:00';
+      he.value=ed.value+'T'+et.value+':59+05:00';
+    }
     if(ytForm)ytForm.addEventListener('submit',function(){
+      syncPeriodHidden();
       var box=document.getElementById('yt-kw-hidden');
       if(!box)return;
       box.innerHTML='';
@@ -501,6 +531,45 @@ _JS = """
         filterInp.value='';
       }
     });
+    var periodOpen=document.getElementById('yt-period-open');
+    var periodModal=document.getElementById('yt-period-modal');
+    var periodClose=document.getElementById('yt-period-close');
+    var periodRun=document.getElementById('yt-period-run');
+    var periodForm=document.getElementById('yt-period-form');
+    var periodResult=document.getElementById('yt-period-result');
+    function openPeriodModal(){
+      if(!periodModal)return;
+      periodModal.classList.add('open');
+      if(periodResult){periodResult.className='';periodResult.textContent='';periodResult.classList.remove('show')}
+    }
+    function closePeriodModal(){if(periodModal)periodModal.classList.remove('open')}
+    if(periodOpen)periodOpen.addEventListener('click',openPeriodModal);
+    if(periodClose)periodClose.addEventListener('click',closePeriodModal);
+    if(periodModal)periodModal.addEventListener('click',function(e){if(e.target===periodModal)closePeriodModal()});
+    document.addEventListener('keydown',function(e){
+      if(e.key==='Escape'&&periodModal&&periodModal.classList.contains('open'))closePeriodModal();
+    });
+    if(periodRun)periodRun.addEventListener('click',function(){
+      if(!periodForm)return;
+      var sel=document.querySelectorAll('.kw-chip.sel[data-kw-id]');
+      if(!sel.length){
+        if(periodResult){periodResult.textContent='Select at least one keyword on the watchlist.';periodResult.className='show bad'}
+        return;
+      }
+      syncPeriodHidden();
+      var box=document.getElementById('yt-period-kw-hidden');
+      if(box){
+        box.innerHTML='';
+        sel.forEach(function(chip){
+          var id=chip.getAttribute('data-kw-id');
+          if(!id)return;
+          var inp=document.createElement('input');
+          inp.type='hidden';inp.name='kw_id';inp.value=id;
+          box.appendChild(inp);
+        });
+      }
+      periodForm.requestSubmit?periodForm.requestSubmit():periodForm.submit();
+    });
   }
 
   var wasScanning=__SCANNING__;
@@ -512,7 +581,7 @@ _JS = """
     var el=document.getElementById('results');
     if(!el)return;
     var params=new URLSearchParams(location.search);
-    if(!params.has('go')&&!(params.get('q')||'').trim())return;
+    if(!params.has('go')&&!(params.get('q')||'').trim()&&!params.get('start'))return;
     params.set('module', pageModule);
     try{
       var r=await fetch('/ui/results?'+params.toString(),{headers:{'Accept':'text/html'}});
@@ -1368,38 +1437,71 @@ def _start_keyword_scan(kw: Keyword) -> dict:
     }
 
 
-def _start_youtube_date_scan(
-    slot_date: str,
-    keyword_ids: list[int] | None = None,
+def _start_youtube_period_scan(
+    start_date: str,
+    end_date: str,
+    keyword_ids: list[int],
     *,
-    slot_times: list[str] | None = None,
+    start_time: str = "00:00",
+    end_time: str = "23:59",
     label: str | None = None,
 ) -> bool:
-    """Run discover → transcribe → match for bulletin slots on one date."""
-    from app.youtube.pipeline import slot_date_is_past
+    """User-triggered scan: all non-live uploads in a date/time window."""
+    from app.youtube.pipeline import period_bounds_from_parts, period_label
 
+    try:
+        p_start, p_end = period_bounds_from_parts(
+            start_date, end_date, start_time, end_time,
+        )
+    except ValueError:
+        return False
     return yt_scan_runner.start_scan(
-        slot_date=slot_date,
         keyword_ids=keyword_ids or None,
-        slot_times=slot_times or None,
-        force=slot_date_is_past(slot_date),
-        label=label or f"date:{slot_date}",
+        period_start=p_start.isoformat(),
+        period_end=p_end.isoformat(),
+        label=label or f"period:{period_label(p_start, p_end)}",
     )
 
 
-def _youtube_bulletin_periods(db: Session) -> list[dict]:
-    seen: set[str] = set()
-    out: list[dict] = []
-    for lt, label in db.execute(
-        select(BulletinSlot.local_time, BulletinSlot.label)
-        .where(BulletinSlot.enabled.is_(True))
-        .order_by(BulletinSlot.local_time)
-    ).all():
-        if lt in seen:
-            continue
-        seen.add(lt)
-        out.append({"local_time": lt, "label": label or lt[:5]})
-    return out
+def _youtube_period_from_query(qp) -> tuple[datetime | None, datetime | None, str]:
+    """Parse ?start=&end= ISO bounds from the URL (UTC-aware)."""
+    from app.youtube.pipeline import parse_period_iso, period_label
+
+    start_s = (qp.get("start") or "").strip()
+    end_s = (qp.get("end") or "").strip()
+    if not start_s or not end_s:
+        return None, None, ""
+    try:
+        p_start, p_end = parse_period_iso(start_s, end_s)
+        return p_start, p_end, period_label(p_start, p_end)
+    except ValueError:
+        return None, None, ""
+
+
+def _youtube_period_form_defaults(
+    qp,
+    *,
+    today=None,
+) -> dict[str, str]:
+    """Default date/time fields for the custom scan modal."""
+    today = today or datetime.now(_PKT).date()
+    p_start, p_end, _ = _youtube_period_from_query(qp)
+    if p_start and p_end:
+        s = p_start.astimezone(_PKT)
+        e = p_end.astimezone(_PKT)
+        return {
+            "start_date": s.date().isoformat(),
+            "end_date": e.date().isoformat(),
+            "start_time": s.strftime("%H:%M"),
+            "end_time": e.strftime("%H:%M"),
+        }
+    week_ago = today - timedelta(days=6)
+    return {
+        "start_date": week_ago.isoformat(),
+        "end_date": today.isoformat(),
+        "start_time": "00:00",
+        "end_time": "23:59",
+    }
 
 
 def _youtube_keyword_langs(
@@ -1734,18 +1836,13 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
 
     today = datetime.now(_PKT).date()
     qp = request.query_params
-    date_s = (qp.get("date") or today.isoformat()).strip()
-    try:
-        show_date = datetime.strptime(date_s, "%Y-%m-%d").date()
-    except ValueError:
-        show_date = today
-        date_s = show_date.isoformat()
     keyword = (qp.get("q") or "").strip()
     search_requested = bool(qp.get("go"))
     filter_only = bool(qp.get("filter"))
     selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
-    selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
-    ensure_due_bulletins(db, for_date=show_date.isoformat())
+    period_start, period_end, period_label_s = _youtube_period_from_query(qp)
+    period_defaults = _youtube_period_form_defaults(qp, today=today)
+    ensure_due_bulletins(db, for_date=today.isoformat())
     if search_requested:
         repair_youtube_mentions(db)
 
@@ -1754,17 +1851,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             Keyword.active.is_(True), Keyword.module == "youtube"
         ).order_by(Keyword.text)
     ).scalars().all()
-    periods = _youtube_bulletin_periods(db)
 
-    if search_requested and selected_kw_ids and not filter_only:
-        _start_youtube_date_scan(
-            show_date.isoformat(),
-            selected_kw_ids,
-            slot_times=selected_slot_times or None,
-            label=f"search:{show_date.isoformat()}",
-        )
-
-    status_rows = bulletin_status_for_date(db, show_date)
+    status_rows = bulletin_status_for_date(db, today)
     status_html = '<div class="yt-status">' + "".join(
         f'<div class="cell"><b>{html.escape(r["channel"])}</b>'
         f'<span class="st {html.escape((r["status"] or "").split("/")[0].split()[0])}">{html.escape(r["status"] or "waiting")}</span>'
@@ -1783,11 +1871,11 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     selected_kw_labels = [k.text for k in active_kws if k.id in selected_kw_set]
     results_html, _ = _youtube_results_html(
         db,
-        show_date=show_date,
         keyword=keyword,
         keyword_ids=selected_kw_ids or None,
-        slot_times=selected_slot_times or None,
-        date_only=search_requested,
+        period_start=period_start,
+        period_end=period_end,
+        period_label=period_label_s,
         strict=search_requested,
         filter_only=filter_only,
         selected_kw_labels=selected_kw_labels,
@@ -1809,20 +1897,10 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         sel = " sel" if k.id in selected_kw_set else ""
         this_busy = k.id in queued_ids or k.text.casefold() in queued_folds
         busy = " busy" if this_busy else ""
-        play = (
-            '<span class="kw-play" title="Scanning" aria-label="Scanning">'
-            '<span class="spin"></span></span>'
-            if this_busy else
-            f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
-            f'<input type="hidden" name="date" value="{html.escape(date_s)}">'
-            f'<button type="submit" class="kw-play" title="Scan this keyword on selected date" '
-            f'aria-label="Scan">▶</button></form>'
-        )
         return (
             f'<span class="kw-chip{sel}{busy}" data-kw-id="{k.id}">'
             f'<button type="button" class="kw-toggle" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
-            f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
             f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the YouTube watchlist? Results stay retained for 90 days.')\">"
             f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
@@ -1830,14 +1908,6 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         )
 
     kw_tags = "".join(_kw_chip(k) for k in active_kws)
-
-    slot_checks = "".join(
-        f'<label><input type="checkbox" form="yt-search" name="slot_time" '
-        f'value="{html.escape(p["local_time"], quote=True)}"'
-        f'{" checked" if p["local_time"] in selected_slot_times else ""}>'
-        f'{html.escape(p["label"])}</label>'
-        for p in periods
-    )
 
     banner = ""
     if qp.get("removed"):
@@ -1848,12 +1918,17 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     elif qp.get("added"):
         banner = (
             f'<div class="banner ok">Added <b>{html.escape(qp.get("added"))}</b> to the YouTube '
-            "watchlist (no scan yet).</div>"
+            "watchlist — use Custom scan to search a time period.</div>"
         )
     elif qp.get("channel_added"):
         banner = (
             f'<div class="banner ok">Added channel <b>{html.escape(qp.get("channel_added"))}</b> '
-            "with auto-detected bulletin slots. Run Search &amp; transcribe to start monitoring.</div>"
+            "with auto-detected bulletin slots. Daily bulletin scans run on schedule.</div>"
+        )
+    elif qp.get("scan_started"):
+        banner = (
+            f'<div class="banner ok">Scanning <b>{html.escape(qp.get("scan_started"))}</b> — '
+            "all non-live uploads in that window will be transcribed and matched.</div>"
         )
 
     channels = db.execute(
@@ -1863,19 +1938,18 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         f'<span class="ch-tag">{html.escape(c.name)}</span>' for c in channels
     ) or '<span class="hint">No channels yet.</span>'
 
+    p_start_iso = period_start.isoformat() if period_start else ""
+    p_end_iso = period_end.isoformat() if period_end else ""
+
     body = f"""
     {banner}
     <div class="hero">
       <h1>YouTube bulletins</h1>
-      <p>Monitor headline bulletins from news channels. Add a channel to auto-detect its main daily slots
-      (typically morning, noon, afternoon, evening). Keywords here are separate from Newspaper.</p>
+      <p>Daily bulletin slots are scanned automatically on schedule. Use <b>Custom scan</b> to pick a
+      date/time range — every non-live upload in that window is transcribed and matched to your keywords.</p>
     </div>
     <div class="panel">
-      <h2>Search</h2>
-      <div class="field">
-        <label for="date">Date</label>
-        <input form="yt-search" type="date" id="date" name="date" value="{html.escape(date_s)}" required>
-      </div>
+      <h2>Keyword search</h2>
       <div class="ch-bar">
         <div class="cap">Channels
           <button type="button" class="ghost" id="yt-ch-add" style="margin-left:.5rem;font-size:.72rem">+ Add channel</button>
@@ -1894,14 +1968,13 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="module" value="youtube">
-          <input type="hidden" name="date" value="{html.escape(date_s)}">
           <button type="submit" name="scan" value="0" class="ghost">Add only</button>
-          <button type="submit" name="scan" value="1">Add &amp; scan</button>
+          <button type="submit" name="scan" value="1" class="ghost">Add to watchlist</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Click keywords to select (✓), then <b>Show results</b> or Search &amp; transcribe.</p>
+        <p class="hint" style="margin-top:.45rem">Click keywords to select (✓), then open <b>Custom scan</b> or <b>Show results</b>.</p>
         <div class="kw-bar">
-          <div class="cap">Watchlist · click to select for search · ▶ scan date · × hide
+          <div class="cap">Watchlist · click to select · × hide
             <button type="button" class="ghost" id="kw-sel-all" style="margin-left:.5rem;font-size:.72rem">Select all</button>
             <button type="button" class="ghost" id="kw-sel-none" style="font-size:.72rem">Clear</button>
           </div>
@@ -1909,23 +1982,53 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         </div>
       </div>
       <div class="field">
-        <label>Bulletin times (optional — leave empty for all slots that day)</label>
-        <div class="slot-picks">{slot_checks or '<span class="hint">No bulletin slots configured.</span>'}</div>
+        <label>Today's bulletin auto-scan</label>
+        <p class="hint" style="margin:.25rem 0 .5rem">Scheduled scans pick up each channel's daily bulletin slots automatically.</p>
+        {status_html}
       </div>
-      <p class="hint">Latest bulletin status for the selected date:</p>
-      {status_html}
       <form method="get" action="/youtube" id="yt-search">
         <div id="yt-kw-hidden"></div>
         <input type="hidden" name="q" id="q" value="">
         <input type="hidden" name="go" value="1">
         <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
+        <input type="hidden" name="start" id="yt-period-start" value="{html.escape(p_start_iso)}">
+        <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
         <div class="actions">
-          <button type="submit">Search &amp; transcribe this date</button>
+          <button type="button" id="yt-period-open">Custom scan…</button>
           <a class="btn ghost" href="/youtube">Reset</a>
         </div>
       </form>
     </div>
     {results_html}
+    <div id="yt-period-modal" role="dialog" aria-modal="true" aria-labelledby="yt-period-title">
+      <div class="box">
+        <h3 id="yt-period-title">Custom scan period</h3>
+        <p class="sub">Pick a date and time range (Pakistan time). Every non-live upload published in that window
+        on all channels will be transcribed and matched to the keywords you selected on the watchlist.</p>
+        <form method="post" action="/ui/scan/youtube/period" id="yt-period-form">
+          <div id="yt-period-kw-hidden"></div>
+          <div class="period-grid">
+            <div><label for="yt-p-start-date">From date</label>
+              <input type="date" id="yt-p-start-date" name="start_date"
+                value="{html.escape(period_defaults["start_date"])}" required></div>
+            <div><label for="yt-p-end-date">To date</label>
+              <input type="date" id="yt-p-end-date" name="end_date"
+                value="{html.escape(period_defaults["end_date"])}" required></div>
+            <div><label for="yt-p-start-time">From time</label>
+              <input type="time" id="yt-p-start-time" name="start_time"
+                value="{html.escape(period_defaults["start_time"])}" required></div>
+            <div><label for="yt-p-end-time">To time</label>
+              <input type="time" id="yt-p-end-time" name="end_time"
+                value="{html.escape(period_defaults["end_time"])}" required></div>
+          </div>
+          <div class="row-btns">
+            <button type="button" id="yt-period-run">Scan period</button>
+            <button type="button" class="ghost" id="yt-period-close">Close</button>
+          </div>
+          <div id="yt-period-result"></div>
+        </form>
+      </div>
+    </div>
     <div id="yt-ch-modal" role="dialog" aria-modal="true" aria-labelledby="yt-ch-title">
       <div class="box">
         <h3 id="yt-ch-title">Add YouTube channel</h3>
@@ -1947,31 +2050,27 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
 def _youtube_results_html(
     db: Session,
     *,
-    show_date,
     keyword: str,
     keyword_ids: list[int] | None = None,
-    slot_times: list[str] | None = None,
-    date_only: bool = False,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    period_label: str = "",
     strict: bool = False,
     filter_only: bool = False,
     selected_kw_labels: list[str] | None = None,
     results_scanning: bool,
 ) -> tuple[str, str]:
     active_fold = _active_keyword_fold(db, module="youtube")
-    slot_labels: dict[str, str] = {}
-    for lt, label in db.execute(
-        select(BulletinSlot.local_time, BulletinSlot.label).where(BulletinSlot.enabled.is_(True))
-    ).all():
-        slot_labels.setdefault(lt, label or lt[:5])
-    if date_only:
-        first_date = show_date
+    today = datetime.now(_PKT).date()
+    if period_start and period_end:
+        start_utc = period_start.replace(tzinfo=None) if period_start.tzinfo else period_start
+        end_utc = period_end.replace(tzinfo=None) if period_end.tzinfo else period_end
     else:
-        first_date = show_date - timedelta(days=settings.keyword_search_days - 1)
-    day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
-    day_end = datetime(show_date.year, show_date.month, show_date.day, tzinfo=_PKT) + timedelta(days=1)
-    start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
-    end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
-    date_tag = show_date.isoformat()
+        first_date = today - timedelta(days=settings.keyword_search_days - 1)
+        day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
+        day_end = datetime(today.year, today.month, today.day, tzinfo=_PKT) + timedelta(days=1)
+        start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
 
     mentions = db.execute(
         select(Mention).where(
@@ -1980,29 +2079,16 @@ def _youtube_results_html(
                 and_(
                     Mention.published_at.is_not(None),
                     Mention.published_at >= start_utc,
-                    Mention.published_at < end_utc,
+                    Mention.published_at <= end_utc,
                 ),
                 and_(
                     Mention.published_at.is_(None),
                     Mention.detected_at >= start_utc,
-                    Mention.detected_at < end_utc,
+                    Mention.detected_at <= end_utc,
                 ),
             ),
         ).order_by(Mention.detected_at.desc())
     ).scalars().all()
-
-    if date_only:
-        mentions = [
-            m for m in mentions
-            if date_tag in (m.section or "") or date_tag in (m.title or "")
-        ]
-
-    if slot_times:
-        allowed_labels = {slot_labels.get(t, t) for t in slot_times}
-        mentions = [
-            m for m in mentions
-            if any(lbl and lbl in (m.section or "") for lbl in allowed_labels)
-        ]
 
     allowed_labels: set[str] | None = None
     keyword_langs: dict[str, str] = {}
@@ -2047,6 +2133,10 @@ def _youtube_results_html(
     shown = mentions[:show_limit]
     spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
 
+    period_hint = ""
+    if period_label:
+        period_hint = f'<p class="hint results-filter-hint">Period: <b>{html.escape(period_label)}</b></p>'
+
     filter_hint = ""
     if selected_kw_labels:
         kw_line = html.escape(", ".join(selected_kw_labels[:6]))
@@ -2059,7 +2149,7 @@ def _youtube_results_html(
     elif strict:
         filter_hint = (
             '<p class="hint results-filter-hint">Select keyword(s) on the watchlist, '
-            "then click <b>Show results</b>.</p>"
+            "then click <b>Show results</b> or run <b>Custom scan</b>.</p>"
         )
 
     show_results_btn = (
@@ -2090,24 +2180,23 @@ def _youtube_results_html(
         more = ""
     elif not active_fold:
         grid = ('<div class="empty">No YouTube keywords yet.'
-                "<br>Add keywords above, then search a date.</div>")
+                "<br>Add keywords above, then run Custom scan.</div>")
         more = ""
     elif strict and not keyword_ids:
         grid = ('<div class="empty">Select one or more keywords from the watchlist '
-                '(click to mark ✓), then <b>Show results</b>.</div>')
+                '(click to mark ✓), then <b>Show results</b> or <b>Custom scan</b>.</div>')
         more = ""
     elif filter_only and keyword_ids and not shown:
-        grid = ('<div class="empty">No exact matches for the selected keyword(s) on this date.'
-                "<br>Try Search &amp; transcribe to refresh bulletin transcripts.</div>")
+        grid = ('<div class="empty">No exact matches for the selected keyword(s) in this period.'
+                "<br>Run <b>Custom scan</b> to transcribe uploads in the window.</div>")
         more = ""
-    elif date_only:
-        grid = (f'<div class="empty">No matches on <b>{html.escape(date_tag)}</b> yet.'
-                "<br>Searching all bulletin slots for that day — Groq runs on any "
-                "uploaded bulletins not yet transcribed.</div>")
+    elif strict and period_label:
+        grid = (f'<div class="empty">No matches in <b>{html.escape(period_label)}</b> yet.'
+                "<br>Scanning non-live uploads in that window — results appear as they are found.</div>")
         more = ""
     else:
-        grid = ('<div class="empty">No YouTube matches for the 30 days through this date.'
-                "<br>Pick a date and tick keywords to search bulletin slots.</div>")
+        grid = ('<div class="empty">Select keywords and run <b>Custom scan</b> to search a time period, '
+                "or click <b>Show results</b> to filter existing matches.</div>")
         more = ""
 
     max_id = max((m.id for m in shown), default=0)
@@ -2120,6 +2209,7 @@ def _youtube_results_html(
             <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
             <div class="results-actions">{show_results_btn}</div>
           </div>
+          {period_hint}
           {filter_hint}
           {grid}{more}
         </section>
@@ -2159,7 +2249,7 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
     if module == "youtube":
         yt_st = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
         selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
-        selected_slot_times = [x.strip() for x in qp.getlist("slot_time") if x.strip()]
+        period_start, period_end, period_label_s = _youtube_period_from_query(qp)
         filter_only = bool(qp.get("filter"))
         results_scanning = bool(
             yt_st.get("running")
@@ -2174,11 +2264,11 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
             ).scalars().all())
         html_out, sig = _youtube_results_html(
             db,
-            show_date=show_date,
             keyword=keyword,
             keyword_ids=selected_kw_ids or None,
-            slot_times=selected_slot_times or None,
-            date_only=bool(qp.get("go")),
+            period_start=period_start,
+            period_end=period_end,
+            period_label=period_label_s,
             strict=bool(qp.get("go")),
             filter_only=filter_only,
             selected_kw_labels=sel_labels or None,
@@ -2271,15 +2361,8 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
         return RedirectResponse(f"{home}?{q}", status_code=303)
 
     if module == "youtube":
-        _start_youtube_date_scan(slot_date, ids, label=first.text)
-        params: list[tuple[str, str]] = [
-            ("q", first.text),
-            ("go", "1"),
-            ("date", slot_date),
-            ("scanning", "1"),
-        ]
-        params += [("kw_id", str(i)) for i in ids]
-        return RedirectResponse(f"{home}?{urlencode(params)}", status_code=303)
+        q = urlencode({"added": label})
+        return RedirectResponse(f"{home}?{q}", status_code=303)
 
     keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
     q = urlencode({
@@ -2337,15 +2420,8 @@ def ui_scan_keyword(kid: int, date: str = Form(""), db: Session = Depends(get_db
     home = "/youtube" if (kw.module or "newspaper") == "youtube" else "/"
     slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
     if (kw.module or "newspaper") == "youtube":
-        _start_youtube_date_scan(slot_date, [kw.id], label=kw.text)
-        params = [
-            ("q", kw.text),
-            ("go", "1"),
-            ("date", slot_date),
-            ("kw_id", str(kw.id)),
-            ("scanning", "1"),
-        ]
-        return RedirectResponse(f"{home}?{urlencode(params)}", status_code=303)
+        q = urlencode({"added": kw.text})
+        return RedirectResponse(f"{home}?{q}", status_code=303)
     _start_keyword_scan(kw)
     q = urlencode({
         "q": kw.text,
@@ -2367,6 +2443,52 @@ def ui_scan_all():
 def ui_scan_newspapers():
     scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/ui/scan/youtube/period")
+def ui_scan_youtube_period(
+    request: Request,
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    start_time: str = Form("00:00"),
+    end_time: str = Form("23:59"),
+):
+    """User-triggered scan of all non-live uploads in a custom date/time window."""
+    if not settings.youtube_enabled:
+        return RedirectResponse("/", status_code=303)
+    from app.youtube.pipeline import period_bounds_from_parts, period_label
+
+    kw_ids = [int(x) for x in request.form.getlist("kw_id") if str(x).isdigit()]
+    if not kw_ids:
+        return RedirectResponse("/youtube?period_error=keywords", status_code=303)
+    try:
+        p_start, p_end = period_bounds_from_parts(
+            start_date, end_date, start_time, end_time,
+        )
+    except ValueError:
+        return RedirectResponse("/youtube?period_error=range", status_code=303)
+
+    label = period_label(p_start, p_end)
+    if yt_scan_runner.is_running():
+        q = urlencode({"period_busy": label})
+        return RedirectResponse(f"/youtube?{q}", status_code=303)
+
+    _start_youtube_period_scan(
+        start_date,
+        end_date,
+        kw_ids,
+        start_time=start_time,
+        end_time=end_time,
+        label=label,
+    )
+    params: list[tuple[str, str]] = [
+        ("go", "1"),
+        ("start", p_start.isoformat()),
+        ("end", p_end.isoformat()),
+        ("scan_started", label),
+    ]
+    params += [("kw_id", str(i)) for i in kw_ids]
+    return RedirectResponse(f"/youtube?{urlencode(params)}", status_code=303)
 
 
 @app.post("/ui/scan/youtube")

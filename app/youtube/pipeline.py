@@ -105,8 +105,19 @@ def run_youtube_scan(
     slot_times: list[str] | None = None,
     force: bool = False,
     match_only: bool = False,
+    period_start: str | None = None,
+    period_end: str | None = None,
 ) -> dict:
-    """Process due bulletins (or rematch cached transcripts when match_only)."""
+    """Process due bulletins, a custom upload period, or rematch cached transcripts."""
+    if period_start and period_end and not match_only:
+        start_dt, end_dt = parse_period_iso(period_start, period_end)
+        return run_youtube_period_scan(
+            start_dt,
+            end_dt,
+            channel_ids=channel_ids,
+            keyword_ids=keyword_ids,
+            force=force,
+        )
     summary = {
         "channels": 0,
         "bulletins_checked": 0,
@@ -130,6 +141,8 @@ def run_youtube_scan(
                     keyword_ids=keyword_ids,
                     slot_date=slot_date,
                     slot_times=slot_times,
+                    period_start=period_start,
+                    period_end=period_end,
                 )
             )
             result_policy.enforce_limits(session)
@@ -309,6 +322,146 @@ def run_youtube_date_search(
         force=slot_date_is_past(slot_date),
         match_only=False,
     )
+
+
+def parse_period_iso(start: str, end: str) -> tuple[datetime, datetime]:
+    """Parse period bounds (ISO-8601, timezone-aware)."""
+    try:
+        s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid period bounds") from exc
+    if s.tzinfo is None:
+        s = s.replace(tzinfo=_PKT)
+    if e.tzinfo is None:
+        e = e.replace(tzinfo=_PKT)
+    if e < s:
+        raise ValueError("period end must be after start")
+    return s.astimezone(timezone.utc), e.astimezone(timezone.utc)
+
+
+def period_bounds_from_parts(
+    start_date: str,
+    end_date: str,
+    start_time: str = "00:00",
+    end_time: str = "23:59",
+) -> tuple[datetime, datetime]:
+    """Build UTC bounds from PKT calendar date + clock times."""
+    def _combine(d: str, t: str) -> datetime:
+        parts = d.strip().split("-")
+        hh, mm = (t.strip() or "00:00").split(":")[:2]
+        return datetime(
+            int(parts[0]), int(parts[1]), int(parts[2]),
+            int(hh), int(mm),
+            tzinfo=_PKT,
+        )
+
+    start = _combine(start_date.strip(), start_time)
+    end = _combine(end_date.strip(), end_time)
+    if end_time.strip() in ("23:59", "23:59:59"):
+        end = end.replace(second=59)
+    if end < start:
+        raise ValueError("end must be after start")
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def period_label(start: datetime, end: datetime) -> str:
+    s = start.astimezone(_PKT)
+    e = end.astimezone(_PKT)
+    if s.date() == e.date():
+        return f"{s.strftime('%d %b %Y')} · {s.strftime('%H:%M')}–{e.strftime('%H:%M')}"
+    return (
+        f"{s.strftime('%d %b %Y %H:%M')} – {e.strftime('%d %b %Y %H:%M')}"
+    )
+
+
+def run_youtube_period_scan(
+    period_start: datetime,
+    period_end: datetime,
+    *,
+    channel_ids: list[int] | None = None,
+    keyword_ids: list[int] | None = None,
+    force: bool = False,
+) -> dict:
+    """Discover all non-live uploads in a time window, transcribe, and match keywords."""
+    summary = {
+        "channels": 0,
+        "videos_checked": 0,
+        "transcribed": 0,
+        "mentions": 0,
+        "alerts": 0,
+        "skipped_live": 0,
+        "failed": 0,
+        "cost_usd_est": 0.0,
+        "period": period_label(period_start, period_end),
+    }
+    session = SessionLocal()
+    notifier = get_notifier()
+    label = summary["period"]
+    try:
+        repair_youtube_mentions(session)
+        keywords = _active_youtube_keywords(session, keyword_ids)
+        if not keywords:
+            logger.warning("period scan skipped: no keywords selected")
+            return summary
+
+        q = select(YouTubeChannel).where(YouTubeChannel.active.is_(True)).order_by(YouTubeChannel.name)
+        if channel_ids:
+            q = q.where(YouTubeChannel.id.in_(channel_ids))
+        channels = list(session.execute(q).scalars())
+        summary["channels"] = len(channels)
+
+        work: list[tuple[YouTubeChannel, discovery.Video]] = []
+        for ch in channels:
+            videos = discovery.fetch_uploads_in_range(
+                ch.channel_id,
+                published_after=period_start,
+                published_before=period_end,
+                playlist_id=ch.uploads_playlist_id or "",
+            )
+            for v in videos:
+                if v.live:
+                    summary["skipped_live"] += 1
+                    continue
+                work.append((ch, v))
+
+        total = len(work)
+        _write_progress(
+            phase="period",
+            slot_date=label,
+            checked=0,
+            total=total,
+            current="",
+        )
+        for idx, (ch, v) in enumerate(work, start=1):
+            summary["videos_checked"] += 1
+            _write_progress(
+                phase="period",
+                slot_date=label,
+                checked=idx,
+                total=total,
+                current=f"{ch.name} · {(v.title or '')[:48]}",
+            )
+            try:
+                _process_period_video(
+                    session,
+                    notifier,
+                    ch,
+                    v,
+                    keywords,
+                    summary,
+                    section_label=f"Period · {label}",
+                    force=force,
+                )
+            except Exception as exc:
+                logger.exception("period video %s failed: %s", v.video_id, exc)
+                summary["failed"] += 1
+
+        result_policy.enforce_limits(session)
+        _clear_progress()
+        return summary
+    finally:
+        session.close()
 
 
 def bulletin_status_for_date(session, show_date: date) -> list[dict]:
@@ -595,8 +748,158 @@ def _sanitize_youtube_mention(session, mention: Mention) -> bool:
     return True
 
 
+def _utc_naive(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _process_period_video(
+    session,
+    notifier,
+    ch: YouTubeChannel,
+    v: discovery.Video,
+    keywords: list[tuple[str, str]],
+    summary: dict,
+    *,
+    section_label: str,
+    force: bool,
+) -> None:
+    if v.live:
+        summary["skipped_live"] = summary.get("skipped_live", 0) + 1
+        return
+
+    tr = session.execute(
+        select(Transcript).where(Transcript.video_id == v.video_id)
+    ).scalar_one_or_none()
+    upgrade_metadata = _is_metadata_only(tr)
+    needs_transcribe = tr is None or upgrade_metadata
+
+    if needs_transcribe and not settings.youtube_metadata_only:
+        asset = media_source.acquire_audio(
+            video_id=v.video_id,
+            video_url=v.url or f"https://www.youtube.com/watch?v={v.video_id}",
+            media_source=ch.media_source or settings.youtube_media_source,
+            media_source_config=ch.media_source_config or {},
+        )
+        if asset is None:
+            text = f"{v.title}\n{v.description}"
+            segments: list[dict] = []
+            meta = {"model": "metadata", "confidence": {}}
+        else:
+            try:
+                prompt = ", ".join(k[0] for k in keywords[:20])
+                text, segments, meta = transcribe.transcribe_audio(
+                    asset.path,
+                    language="ur",
+                    prompt=prompt,
+                )
+                summary["cost_usd_est"] += transcribe.estimate_cost_usd(
+                    float(v.duration_seconds or meta.get("duration") or 0),
+                    model=meta.get("model"),
+                )
+                summary["transcribed"] = summary.get("transcribed", 0) + 1
+            finally:
+                media_source.cleanup_asset(asset)
+
+        if text or segments:
+            if upgrade_metadata and tr is not None:
+                tr.bulletin_id = None
+                tr.channel_id = ch.channel_id
+                tr.source = ch.name
+                tr.title = v.title
+                tr.url = v.url
+                tr.language = meta.get("language") or "ur"
+                tr.text = text
+                tr.segments = segments
+                tr.duration_seconds = v.duration_seconds
+                tr.is_live = False
+                tr.transcriber = (
+                    "groq" if meta.get("model") not in (None, "metadata") else "metadata"
+                )
+                tr.model = meta.get("model") or ""
+                tr.confidence = meta.get("confidence") or {}
+                _upsert_cache(session, v, ch, text)
+                session.commit()
+            elif tr is None:
+                tr = Transcript(
+                    video_id=v.video_id,
+                    bulletin_id=None,
+                    channel_id=ch.channel_id,
+                    source=ch.name,
+                    title=v.title,
+                    url=v.url,
+                    language=meta.get("language") or "ur",
+                    text=text,
+                    segments=segments,
+                    duration_seconds=v.duration_seconds,
+                    is_live=False,
+                    transcriber="groq" if meta.get("model") not in (None, "metadata") else "metadata",
+                    model=meta.get("model") or "",
+                    confidence=meta.get("confidence") or {},
+                )
+                session.add(tr)
+                _upsert_cache(session, v, ch, text)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    tr = session.execute(
+                        select(Transcript).where(Transcript.video_id == v.video_id)
+                    ).scalar_one_or_none()
+    elif tr is None and settings.youtube_metadata_only:
+        text = f"{v.title}\n{v.description}"
+        segments = []
+        tr = Transcript(
+            video_id=v.video_id,
+            channel_id=ch.channel_id,
+            source=ch.name,
+            title=v.title,
+            url=v.url,
+            language="ur",
+            text=text,
+            segments=segments,
+            duration_seconds=v.duration_seconds,
+            is_live=False,
+            transcriber="metadata",
+            model="metadata",
+        )
+        session.add(tr)
+        _upsert_cache(session, v, ch, text)
+        session.commit()
+    elif tr is not None and not force and not upgrade_metadata:
+        pass  # use existing transcript
+    elif tr is None:
+        summary["failed"] = summary.get("failed", 0) + 1
+        return
+
+    if tr is None:
+        return
+
+    hits_map = matcher.find_all_hits(tr.text or "", tr.segments or [], keywords)
+    if not hits_map:
+        return
+
+    class _B:
+        slot_date = (
+            v.published.astimezone(_PKT).date().isoformat()
+            if v.published else datetime.now(_PKT).date().isoformat()
+        )
+        id = None
+
+    class _S:
+        label = "Period"
+        local_time = "00:00:00"
+
+    _emit_mention(
+        session, notifier, _B(), ch, _S(), v, hits_map, summary,
+        transcript=tr, section_override=section_label,
+    )
+
+
 def _emit_mention(
     session, notifier, b, ch, slot, v, hits_map, summary, transcript=None,
+    section_override: str | None = None,
 ) -> None:
     hits_map = {k: v for k, v in hits_map.items() if v}
     if not hits_map:
@@ -631,7 +934,7 @@ def _emit_mention(
         frame.stamp_frame(
             out,
             channel=ch.name,
-            slot_label=slot.label or slot.local_time,
+            slot_label=slot.label or slot.local_time or "Period",
             slot_date=b.slot_date,
             mmss=frame.format_mmss(h.start),
         )
@@ -644,7 +947,7 @@ def _emit_mention(
         select(Mention).where(Mention.module == "youtube", Mention.external_id == v.video_id)
     ).scalar_one_or_none()
 
-    section = f"{slot.label or slot.local_time} · {b.slot_date}"
+    section = section_override or f"{slot.label or slot.local_time} · {b.slot_date}"
     if existing:
         present = {(k or "").casefold() for k in (existing.matched_keywords or [])}
         new_kw = [k for k in labels if k.casefold() not in present]
@@ -732,6 +1035,8 @@ def _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary) -> None
 def _match_cached(
     session, notifier, keyword_ids=None, slot_date: str | None = None,
     slot_times: list[str] | None = None,
+    period_start: str | None = None,
+    period_end: str | None = None,
 ) -> dict:
     summary = {"mentions": 0, "alerts": 0, "pages_checked": 0}
     keywords = _active_youtube_keywords(session, keyword_ids)
@@ -756,6 +1061,24 @@ def _match_cached(
             return summary
         q = q.where(or_(*clauses))
     transcripts = session.execute(q).scalars().all()
+    if period_start and period_end:
+        p_start, p_end = parse_period_iso(period_start, period_end)
+        filtered: list[Transcript] = []
+        for tr in transcripts:
+            pub = None
+            if tr.video_id:
+                row = session.execute(
+                    select(Mention.published_at).where(
+                        Mention.module == "youtube",
+                        Mention.external_id == tr.video_id,
+                    ).limit(1)
+                ).scalar_one_or_none()
+                pub = row
+            if pub is None:
+                pub = tr.created_at
+            if pub and _utc_naive(pub) >= p_start and _utc_naive(pub) <= p_end:
+                filtered.append(tr)
+        transcripts = filtered
     if slot_times and slot_date:
         slots = {s.id: s for s in session.execute(select(BulletinSlot)).scalars()}
         allowed = set(slot_times)

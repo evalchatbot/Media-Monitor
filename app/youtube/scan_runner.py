@@ -43,6 +43,8 @@ def start_scan(
     slot_date: str | None = None,
     slot_times: list[str] | None = None,
     force: bool = False,
+    period_start: str | None = None,
+    period_end: str | None = None,
 ) -> bool:
     """Launch a YouTube scan subprocess. False if one is already running."""
     global _proc, _label
@@ -64,6 +66,10 @@ def start_scan(
             cmd += ["--slot-times", ",".join(slot_times)]
         if force:
             cmd += ["--force"]
+        if period_start:
+            cmd += ["--period-start", period_start]
+        if period_end:
+            cmd += ["--period-end", period_end]
         logger.info("Launching YouTube scan subprocess: %s", " ".join(cmd))
         _proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), **_detached_kwargs())
         _label = label
@@ -85,7 +91,8 @@ def _human_detail(running: bool, label: str | None, progress: dict | None, last:
         if current:
             bits.append(current)
         if isinstance(checked, int) and isinstance(total, int) and total:
-            bits.append(f"{checked}/{total} bulletins")
+            unit = "videos" if phase == "period" else "bulletins"
+            bits.append(f"{checked}/{total} {unit}")
         msg = " · ".join(bits) if bits else (label or "YouTube scan")
         return f"{phase}: {msg}"
     if label:
