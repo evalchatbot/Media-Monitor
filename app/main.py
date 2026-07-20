@@ -328,6 +328,31 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #src-modal #src-result.ok{background:var(--blue-soft);border:1px solid var(--blue-mist);color:var(--blue-deep)}
 #src-modal #src-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
 
+#yt-ch-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
+  padding:1rem;background:rgba(44,58,72,.45);backdrop-filter:blur(6px)}
+#yt-ch-modal.open{display:flex}
+#yt-ch-modal .box{width:min(480px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
+  border:1px solid var(--line);border-radius:var(--r);padding:1.35rem 1.4rem;box-shadow:var(--shadow)}
+#yt-ch-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
+#yt-ch-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem}
+#yt-ch-modal input[type=url],#yt-ch-modal input[type=text]{width:100%;padding:.65rem .9rem;margin-bottom:.7rem;
+  border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9}
+#yt-ch-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem}
+#yt-ch-modal #yt-ch-result{margin-top:.9rem;padding:.75rem .9rem;border-radius:var(--r-sm);font-size:.88rem;
+  font-weight:600;line-height:1.45;display:none}
+#yt-ch-modal #yt-ch-result.show{display:block}
+#yt-ch-modal #yt-ch-result.ok{background:var(--blue-soft);border:1px solid var(--blue-mist);color:var(--blue-deep)}
+#yt-ch-modal #yt-ch-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
+#yt-ch-slots{margin:.65rem 0 0;padding:0;list-style:none;max-height:11rem;overflow:auto}
+#yt-ch-slots li{display:flex;gap:.5rem;align-items:flex-start;padding:.45rem 0;border-bottom:1px solid var(--line);
+  font-size:.82rem;font-weight:500}
+#yt-ch-slots li:last-child{border-bottom:0}
+#yt-ch-slots .slot-meta{color:var(--faint);font-size:.76rem;font-weight:500;margin-top:.15rem;line-height:1.35}
+.ch-bar{margin:.65rem 0 .35rem}
+.ch-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem}
+.ch-tag{display:inline-flex;align-items:center;padding:.22rem .65rem;border-radius:999px;font-size:.78rem;
+  font-weight:600;background:var(--blue-soft);color:var(--blue-deep);border:1px solid var(--blue-mist)}
+
 .spin{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;
   border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
 @keyframes s{to{transform:rotate(360deg)}}
@@ -661,6 +686,88 @@ _JS = """
     }
     saveBtn.disabled=false;
   });
+})();
+
+  /* Add YouTube channel modal */
+  (function(){
+    if(pageModule!=='youtube')return;
+    var modal=document.getElementById('yt-ch-modal');
+    var openBtn=document.getElementById('yt-ch-add');
+    var closeBtn=document.getElementById('yt-ch-close');
+    var checkBtn=document.getElementById('yt-ch-check');
+    var saveBtn=document.getElementById('yt-ch-save');
+    var result=document.getElementById('yt-ch-result');
+    var slotsBox=document.getElementById('yt-ch-slots');
+    var lastProbe=null;
+    function openModal(){
+      if(!modal)return;
+      modal.classList.add('open');
+      lastProbe=null;
+      if(result){result.className='';result.textContent='';result.classList.remove('show')}
+      if(slotsBox)slotsBox.innerHTML='';
+      if(saveBtn)saveBtn.style.display='none';
+    }
+    function closeModal(){if(modal)modal.classList.remove('open')}
+    function renderSlots(slots){
+      if(!slotsBox||!slots||!slots.length){if(slotsBox)slotsBox.innerHTML='';return}
+      slotsBox.innerHTML=slots.map(function(s,i){
+        var ex=(s.example_title||'').replace(/</g,'&lt;');
+        return '<li><label><input type="checkbox" class="yt-slot-pick" data-i="'+i+'" checked> '
+          +'<span><b>'+s.label+'</b> · '+s.samples+' recent upload'+(s.samples===1?'':'s')
+          +(ex?'<div class="slot-meta">e.g. '+ex+'</div>':'')+'</span></label></li>';
+      }).join('');
+    }
+    if(openBtn)openBtn.addEventListener('click',openModal);
+    if(closeBtn)closeBtn.addEventListener('click',closeModal);
+    if(modal)modal.addEventListener('click',function(e){if(e.target===modal)closeModal()});
+    document.addEventListener('keydown',function(e){
+      if(e.key==='Escape'&&modal&&modal.classList.contains('open'))closeModal();
+    });
+    if(checkBtn)checkBtn.addEventListener('click',async function(){
+      var url=(document.getElementById('yt-ch-url')||{}).value||'';
+      checkBtn.disabled=true;checkBtn.innerHTML='<span class="spin"></span> Checking…';
+      try{
+        var r=await fetch('/api/probe-youtube-channel',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({url:url})}).then(function(x){return x.json()});
+        lastProbe=r;
+        if(result){
+          result.textContent=r.summary||'No result';
+          result.className='show '+(r.ok?'ok':'bad');
+        }
+        renderSlots(r.detail&&r.detail.slots);
+        if(saveBtn)saveBtn.style.display=r.ok?'inline-flex':'none';
+      }catch(err){
+        if(result){result.textContent='Check failed — try again.';result.className='show bad'}
+        if(saveBtn)saveBtn.style.display='none';
+        if(slotsBox)slotsBox.innerHTML='';
+      }
+      checkBtn.disabled=false;checkBtn.textContent='Find bulletins';
+    });
+    if(saveBtn)saveBtn.addEventListener('click',async function(){
+      if(!lastProbe||!lastProbe.ok||!lastProbe.detail)return;
+      var picks=[].slice.call(document.querySelectorAll('.yt-slot-pick:checked'))
+        .map(function(el){return parseInt(el.getAttribute('data-i'),10)})
+        .filter(function(n){return !isNaN(n)});
+      var slots=(lastProbe.detail.slots||[]).filter(function(_,i){return picks.indexOf(i)>=0});
+      if(!slots.length){
+        if(result){result.textContent='Select at least one bulletin slot.';result.className='show bad'}
+        return;
+      }
+      saveBtn.disabled=true;
+      try{
+        var body=Object.assign({},lastProbe.detail,{slots:slots});
+        var r=await fetch('/api/youtube/channels',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(body)}).then(function(x){return x.json()});
+        if(r.ok)location.href='/youtube?channel_added='+encodeURIComponent(r.name||'');
+        else if(result){result.textContent=r.summary||'Could not add channel.';result.className='show bad'}
+      }catch(err){
+        if(result){result.textContent='Save failed.';result.className='show bad'}
+      }
+      saveBtn.disabled=false;
+    });
+  })();
 })();
 """
 
@@ -1744,24 +1851,37 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             f'<div class="banner ok">Added <b>{html.escape(qp.get("added"))}</b> to the YouTube '
             "watchlist (no scan yet).</div>"
         )
+    elif qp.get("channel_added"):
+        banner = (
+            f'<div class="banner ok">Added channel <b>{html.escape(qp.get("channel_added"))}</b> '
+            "with auto-detected bulletin slots. Run Search &amp; transcribe to start monitoring.</div>"
+        )
 
     channels = db.execute(
         select(YouTubeChannel).where(YouTubeChannel.active.is_(True)).order_by(YouTubeChannel.name)
     ).scalars().all()
-    ch_list = ", ".join(html.escape(c.name) for c in channels) or "—"
+    ch_tags = "".join(
+        f'<span class="ch-tag">{html.escape(c.name)}</span>' for c in channels
+    ) or '<span class="hint">No channels yet.</span>'
 
     body = f"""
     {banner}
     <div class="hero">
       <h1>YouTube bulletins</h1>
-      <p>Monitor Geo, ARY, Express, SAMAA, and City42 headline bulletins.
-      Processing starts one hour after each slot. Keywords here are separate from Newspaper.</p>
+      <p>Monitor headline bulletins from news channels. Add a channel to auto-detect its main daily slots
+      (typically morning, noon, afternoon, evening). Keywords here are separate from Newspaper.</p>
     </div>
     <div class="panel">
       <h2>Search</h2>
       <div class="field">
         <label for="date">Date</label>
         <input form="yt-search" type="date" id="date" name="date" value="{html.escape(date_s)}" required>
+      </div>
+      <div class="ch-bar">
+        <div class="cap">Channels
+          <button type="button" class="ghost" id="yt-ch-add" style="margin-left:.5rem;font-size:.72rem">+ Add channel</button>
+        </div>
+        <div class="ch-tags">{ch_tags}</div>
       </div>
       <div class="field">
         <label>Add to YouTube watchlist</label>
@@ -1780,7 +1900,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <button type="submit" name="scan" value="1">Add &amp; scan</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Channels: {ch_list}. Click keywords to select (✓), then <b>Show results</b> or Search &amp; transcribe.</p>
+        <p class="hint" style="margin-top:.45rem">Click keywords to select (✓), then <b>Show results</b> or Search &amp; transcribe.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to select for search · ▶ scan date · × hide
             <button type="button" class="ghost" id="kw-sel-all" style="margin-left:.5rem;font-size:.72rem">Select all</button>
@@ -1807,6 +1927,20 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
       </form>
     </div>
     {results_html}
+    <div id="yt-ch-modal" role="dialog" aria-modal="true" aria-labelledby="yt-ch-title">
+      <div class="box">
+        <h3 id="yt-ch-title">Add YouTube channel</h3>
+        <p class="sub">Paste a channel URL or @handle. We scan recent uploads and suggest up to five daily bulletin times.</p>
+        <input type="url" id="yt-ch-url" placeholder="https://www.youtube.com/@ChannelName" autocomplete="off">
+        <div class="row-btns">
+          <button type="button" id="yt-ch-check">Find bulletins</button>
+          <button type="button" id="yt-ch-save" style="display:none">Add channel</button>
+          <button type="button" class="ghost" id="yt-ch-close">Close</button>
+        </div>
+        <ul id="yt-ch-slots"></ul>
+        <div id="yt-ch-result"></div>
+      </div>
+    </div>
     """
     return _shell("YouTube · Media Monitor", body, module="youtube")
 
@@ -2409,6 +2543,60 @@ def youtube_scan_status():
 @app.post("/api/scan/youtube")
 def trigger_youtube_scan():
     return {"started": yt_scan_runner.start_scan(label="api", force=True)}
+
+
+class _YoutubeProbeIn(BaseModel):
+    url: str = ""
+
+
+class _YoutubeChannelSlotIn(BaseModel):
+    local_time: str
+    label: str = ""
+    title_rules: list[str] = Field(default_factory=list)
+    samples: int = 0
+    example_title: str = ""
+
+
+class _YoutubeChannelIn(BaseModel):
+    channel_id: str
+    name: str = ""
+    url: str = ""
+    handle: str = ""
+    uploads_playlist_id: str = ""
+    slots: list[_YoutubeChannelSlotIn] = Field(default_factory=list)
+
+
+@app.post("/api/probe-youtube-channel")
+def api_probe_youtube_channel(body: _YoutubeProbeIn):
+    from app.youtube import channel_probe
+    return channel_probe.probe_channel(body.url)
+
+
+@app.post("/api/youtube/channels")
+def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_db)):
+    from app.youtube import channel_probe
+    from app.youtube.pipeline import ensure_due_bulletins
+
+    if not body.channel_id.strip():
+        return {"ok": False, "summary": "Missing channel id."}
+    if not body.slots:
+        return {"ok": False, "summary": "Select at least one bulletin slot."}
+    existing = db.execute(
+        select(YouTubeChannel).where(YouTubeChannel.channel_id == body.channel_id.strip())
+    ).scalar_one_or_none()
+    if existing:
+        return {"ok": False, "summary": f"“{existing.name}” is already added."}
+    row = channel_probe.save_channel(
+        db,
+        channel_id=body.channel_id.strip(),
+        name=body.name.strip(),
+        url=body.url.strip(),
+        handle=body.handle.strip(),
+        uploads_playlist_id=body.uploads_playlist_id.strip(),
+        slots=[s.model_dump() for s in body.slots],
+    )
+    ensure_due_bulletins(db)
+    return {"ok": True, "name": row.name, "id": row.id, "summary": f"Added {row.name}."}
 
 
 @app.get("/api/youtube/channels")
