@@ -2447,18 +2447,18 @@ def ui_scan_newspapers():
 
 @app.post("/ui/scan/youtube/period")
 def ui_scan_youtube_period(
-    request: Request,
     start_date: str = Form(...),
     end_date: str = Form(...),
     start_time: str = Form("00:00"),
     end_time: str = Form("23:59"),
+    kw_id: list[str] = Form(default=[]),
 ):
     """User-triggered scan of all non-live uploads in a custom date/time window."""
     if not settings.youtube_enabled:
         return RedirectResponse("/", status_code=303)
     from app.youtube.pipeline import period_bounds_from_parts, period_label
 
-    kw_ids = [int(x) for x in request.form.getlist("kw_id") if str(x).isdigit()]
+    kw_ids = [int(x) for x in kw_id if str(x).isdigit()]
     if not kw_ids:
         return RedirectResponse("/youtube?period_error=keywords", status_code=303)
     try:

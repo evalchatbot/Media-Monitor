@@ -358,7 +358,8 @@ def period_bounds_from_parts(
 
     start = _combine(start_date.strip(), start_time)
     end = _combine(end_date.strip(), end_time)
-    if end_time.strip() in ("23:59", "23:59:59"):
+    t_end = end_time.strip()
+    if t_end.startswith("23:59"):
         end = end.replace(second=59)
     if end < start:
         raise ValueError("end must be after start")
