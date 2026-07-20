@@ -1,6 +1,7 @@
 """YouTube bulletin pipeline: discover → classify → transcribe → match → frame."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core import result_policy
 from app.core.keywords import find_matches
 from app.db.base import SessionLocal
+from config import BASE_DIR
 from app.db.models import (
     ArticleCache,
     BulletinSlot,
@@ -27,6 +29,25 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 _PKT = ZoneInfo(settings.youtube_timezone)
+_PROGRESS_FILE = BASE_DIR / "data" / "youtube_scan_progress.json"
+
+
+def _write_progress(**payload) -> None:
+    try:
+        _PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PROGRESS_FILE.write_text(
+            json.dumps({**payload, "at": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _clear_progress() -> None:
+    try:
+        _PROGRESS_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def slot_date_is_past(slot_date: str) -> bool:
@@ -42,6 +63,7 @@ def run_youtube_scan(
     channel_ids: list[int] | None = None,
     keyword_ids: list[int] | None = None,
     slot_date: str | None = None,
+    slot_times: list[str] | None = None,
     force: bool = False,
     match_only: bool = False,
 ) -> dict:
@@ -67,10 +89,20 @@ def run_youtube_scan(
                     session, notifier,
                     keyword_ids=keyword_ids,
                     slot_date=slot_date,
+                    slot_times=slot_times,
                 )
             )
             result_policy.enforce_limits(session)
+            _clear_progress()
             return summary
+
+        _write_progress(
+            phase="starting",
+            slot_date=slot_date or "",
+            checked=0,
+            total=0,
+            current="",
+        )
 
         ensure_due_bulletins(session, channel_ids=channel_ids, for_date=slot_date)
         q = select(YouTubeBulletin).order_by(YouTubeBulletin.slot_date.desc(), YouTubeBulletin.id)
@@ -90,17 +122,38 @@ def run_youtube_scan(
             for c in session.execute(select(YouTubeChannel).where(YouTubeChannel.active.is_(True))).scalars()
         }
         slots = {s.id: s for s in session.execute(select(BulletinSlot)).scalars()}
+        if slot_times:
+            allowed = set(slot_times)
+            bulletins = [
+                b for b in bulletins
+                if (s := slots.get(b.slot_id)) and s.local_time in allowed
+            ]
         summary["channels"] = len(channels)
 
         keywords = _active_youtube_keywords(session, keyword_ids)
         historical = bool(slot_date and slot_date_is_past(slot_date))
         effective_force = force or historical
+        total = len(bulletins)
+        _write_progress(
+            phase="scanning",
+            slot_date=slot_date or "",
+            checked=0,
+            total=total,
+            current="",
+        )
         for b in bulletins:
             summary["bulletins_checked"] += 1
             ch = channels.get(b.channel_db_id)
             slot = slots.get(b.slot_id)
             if not ch or not slot or not slot.enabled:
                 continue
+            _write_progress(
+                phase="scanning",
+                slot_date=slot_date or b.slot_date,
+                checked=summary["bulletins_checked"],
+                total=total,
+                current=f"{ch.name} · {slot.label or slot.local_time}",
+            )
             upgrade_meta = False
             if not effective_force and b.discovery_status in ("ready", "no_match") and b.transcription_status == "done":
                 # Metadata-only stubs must be upgraded to real Groq audio transcripts.
@@ -133,6 +186,7 @@ def run_youtube_scan(
                 summary["failed"] += 1
 
         result_policy.enforce_limits(session)
+        _clear_progress()
         return summary
     finally:
         session.close()
@@ -191,11 +245,13 @@ def run_quick_youtube_match(
     keyword_ids: list[int] | None = None,
     *,
     slot_date: str | None = None,
+    slot_times: list[str] | None = None,
 ) -> dict:
     """Match keywords against cached transcripts (optionally one bulletin date)."""
     return run_youtube_scan(
         keyword_ids=keyword_ids,
         slot_date=slot_date,
+        slot_times=slot_times,
         match_only=True,
     )
 
@@ -203,11 +259,13 @@ def run_quick_youtube_match(
 def run_youtube_date_search(
     slot_date: str,
     keyword_ids: list[int] | None = None,
+    slot_times: list[str] | None = None,
 ) -> dict:
-    """Discover, transcribe if needed, and match every bulletin slot on one date."""
+    """Discover, transcribe if needed, and match bulletin slots on one date."""
     return run_youtube_scan(
         slot_date=slot_date,
         keyword_ids=keyword_ids,
+        slot_times=slot_times,
         force=slot_date_is_past(slot_date),
         match_only=False,
     )
@@ -596,6 +654,7 @@ def _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary) -> None
 
 def _match_cached(
     session, notifier, keyword_ids=None, slot_date: str | None = None,
+    slot_times: list[str] | None = None,
 ) -> dict:
     summary = {"mentions": 0, "alerts": 0, "pages_checked": 0}
     keywords = _active_youtube_keywords(session, keyword_ids)
@@ -620,6 +679,19 @@ def _match_cached(
             return summary
         q = q.where(or_(*clauses))
     transcripts = session.execute(q).scalars().all()
+    if slot_times and slot_date:
+        slots = {s.id: s for s in session.execute(select(BulletinSlot)).scalars()}
+        allowed = set(slot_times)
+        allowed_bids: set[int] = set()
+        for bid, sid in session.execute(
+            select(YouTubeBulletin.id, YouTubeBulletin.slot_id).where(
+                YouTubeBulletin.slot_date == slot_date
+            )
+        ).all():
+            slot = slots.get(sid)
+            if slot and slot.local_time in allowed:
+                allowed_bids.add(bid)
+        transcripts = [tr for tr in transcripts if tr.bulletin_id in allowed_bids]
     channels = {
         c.channel_id: c
         for c in session.execute(select(YouTubeChannel)).scalars()
