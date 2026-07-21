@@ -2472,17 +2472,18 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
     if len(created) > 3:
         label += f" +{len(created) - 3}"
 
-    if not do_scan:
-        q = urlencode({"added": label, "date": slot_date})
-        return RedirectResponse(f"{home}?{q}", status_code=303)
-
     if module == "youtube":
         # Match the new keyword against transcripts already on disk before the
         # 15-minute scan comes round. This costs no download and no Groq call,
-        # so results for past bulletins appear immediately instead of looking
-        # like "no match" until the next scheduled run.
+        # so it runs for "Add only" as well — gating it behind the scan button
+        # left a saved keyword reading "no results" until some later scan
+        # happened to pick it up.
         start_instant_youtube_match(ids)
         q = urlencode({"added": label, "scanning": "1"})
+        return RedirectResponse(f"{home}?{q}", status_code=303)
+
+    if not do_scan:
+        q = urlencode({"added": label, "date": slot_date})
         return RedirectResponse(f"{home}?{q}", status_code=303)
 
     keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
