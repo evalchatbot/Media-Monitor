@@ -166,6 +166,9 @@ class Settings(BaseSettings):
     youtube_discovery_window_minutes: int = 90
     youtube_max_duration_seconds: int = 3600
     youtube_transcribe_concurrency: int = 1
+    # Opus bitrate for the 16 kHz mono audio sent to Groq. 32 kbps is transparent
+    # for speech; raising it only slows uploads. Set 0 to force lossless FLAC.
+    youtube_audio_bitrate_kbps: int = 32
     # ytdlp (bulletin watch URL → audio → Groq) | authorized | stub
     youtube_media_source: str = "ytdlp"
     # Monthly Groq spend alert threshold (USD). Soft limit used for logging.

@@ -113,8 +113,10 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
     tmp = Path(tempfile.mkdtemp(prefix="yt-ytdlp-"))
     outtmpl = str(tmp / "audio.%(ext)s")
     opts = {
-        # Prefer audio-only; fall back to muxed if YouTube hides standalone audio.
-        "format": "bestaudio/best",
+        # Speech ASR gains nothing above ~64 kbps once we downmix to 16 kHz mono,
+        # so take the smallest adequate audio-only stream and skip downloading a
+        # high-bitrate track we immediately throw away.
+        "format": "bestaudio[abr<=64]/bestaudio[abr<=96]/bestaudio/best",
         "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
@@ -150,23 +152,40 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
 
 
 def _to_flac(src: Path) -> Path | None:
+    """Encode to 16 kHz mono for Groq.
+
+    Opus by default: Whisper resamples to 16 kHz mono regardless, so lossless
+    FLAC only buys upload size. FLAC runs ~1 MB/min, which pushed bulletins past
+    the 20 MB limit and forced multi-request chunking; Opus at 32 kbps is ~4x
+    smaller and keeps even a 40-minute bulletin in a single request.
+    Falls back to FLAC when the Opus encoder is unavailable.
+    """
     if shutil.which("ffmpeg") is None:
         logger.warning("ffmpeg not on PATH — cannot convert audio for Groq")
         return None
-    dest = src.with_suffix(".flac")
-    cmd = [
-        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
-        "-i", str(src),
-        "-ar", "16000", "-ac", "1", "-map", "0:a", "-c:a", "flac",
-        str(dest),
+
+    kbps = max(8, int(settings.youtube_audio_bitrate_kbps or 32))
+    attempts = [
+        (".ogg", ["-c:a", "libopus", "-b:a", f"{kbps}k", "-vbr", "on"]),
+        (".flac", ["-c:a", "flac"]),
     ]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=180, check=False)
-    except Exception as exc:
-        logger.warning("ffmpeg convert failed: %s", exc)
-        return None
-    if dest.exists() and dest.stat().st_size > 0:
-        return dest
+    for suffix, codec_args in attempts:
+        dest = src.with_suffix(suffix)
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", str(src),
+            "-ar", "16000", "-ac", "1", "-map", "0:a",
+            *codec_args,
+            str(dest),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        except Exception as exc:
+            logger.warning("ffmpeg convert failed (%s): %s", suffix, exc)
+            continue
+        if dest.exists() and dest.stat().st_size > 0:
+            return dest
+        logger.info("audio encode produced nothing for %s — trying next codec", suffix)
     return None
 
 
