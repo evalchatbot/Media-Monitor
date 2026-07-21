@@ -996,7 +996,14 @@ def _process_period_video(
 def _emit_mention(
     session, notifier, b, ch, slot, v, hits_map, summary, transcript=None,
     section_override: str | None = None,
+    defer_media: bool = False,
 ) -> None:
+    """Write a mention for the located hits.
+
+    `defer_media` skips frame capture so the result is visible immediately;
+    grabbing a frame costs ~8s per video, which is the whole wait on an
+    interactive search. backfill_youtube_frames fills them in afterwards.
+    """
     hits_map = {k: v for k, v in hits_map.items() if v}
     if not hits_map:
         return
@@ -1013,7 +1020,7 @@ def _emit_mention(
 
     # One frame per keyword at that keyword's own timestamp.
     media: dict[str, str] = {}
-    for kw, kw_hits in hits_map.items():
+    for kw, kw_hits in ({} if defer_media else hits_map).items():
         if not kw_hits:
             continue
         h = kw_hits[0]
@@ -1126,6 +1133,72 @@ def _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary) -> None
     v.published = b.published_at
     v.duration_seconds = b.duration_seconds
     _emit_mention(session, notifier, b, ch, slot, v, hits_map, summary, transcript=tr)
+
+
+def backfill_youtube_frames(session, *, limit: int = 40) -> int:
+    """Capture frames for mentions written with deferred media.
+
+    Runs after the matching pass so results are on screen while the ~8s per
+    video of stream resolution and frame grabbing happens behind them.
+    """
+    rows = session.execute(
+        select(Mention).where(
+            Mention.module == "youtube",
+            Mention.external_id.is_not(None),
+        ).order_by(Mention.id.desc()).limit(400)
+    ).scalars().all()
+
+    channels = {
+        c.name: c for c in session.execute(select(YouTubeChannel)).scalars()
+    }
+    filled = 0
+    for m in rows:
+        if filled >= limit:
+            break
+        stored = m.keyword_hits or {}
+        have = m.keyword_media or {}
+        missing = [k for k, v in stored.items() if v and k not in have]
+        if not missing:
+            continue
+        ch = channels.get(m.source or "")
+        media = dict(have)
+        # Deep copy: mutating the JSON in place leaves SQLAlchemy comparing the
+        # column against the object it just changed, so the write is dropped.
+        hits = {k: [dict(h) for h in (v or [])] for k, v in stored.items()}
+        for kw in missing:
+            hit = (hits.get(kw) or [{}])[0]
+            start = hit.get("start")
+            if start is None:
+                continue
+            safe_kw = re.sub(r"[^\w\-]+", "_", kw, flags=re.UNICODE)[:40]
+            out = settings.storage_dir / "youtube" / f"{m.external_id}_{safe_kw}_{int(start)}s.jpg"
+            ok = frame.capture_frame(
+                m.external_id,
+                int(start),
+                out,
+                mode=(ch.media_source if ch else None) or settings.youtube_media_source,
+            )
+            if not ok:
+                continue
+            frame.stamp_frame(
+                out,
+                channel=m.source or "",
+                slot_label=(m.section or "").split("·")[0].strip() or "Bulletin",
+                slot_date=(m.section or "").split("·")[-1].strip(),
+                mmss=frame.format_mmss(int(start)),
+            )
+            media[kw] = str(out)
+            hit["screenshot"] = str(out)
+            filled += 1
+        if media != have:
+            m.keyword_media = media
+            m.keyword_hits = dict(hits)
+            if not m.screenshot_path:
+                m.screenshot_path = next(iter(media.values()), None)
+            session.add(m)
+    if filled:
+        session.commit()
+    return filled
 
 
 def _keyword_prefilter(session, keywords: list[tuple[str, str]]):
@@ -1272,10 +1345,16 @@ def _match_cached(
         v.published = tr.created_at
         v.duration_seconds = tr.duration_seconds
         before = summary["mentions"]
-        _emit_mention(session, notifier, b, ch, slot, v, hits_map, summary, transcript=tr)
+        _emit_mention(
+            session, notifier, b, ch, slot, v, hits_map, summary,
+            transcript=tr, defer_media=True,
+        )
         if summary["mentions"] == before:
             # Existing mention may have been updated; still count as activity.
             pass
+
+    # Results are committed and on screen by now; fill the frames in behind them.
+    summary["frames_filled"] = backfill_youtube_frames(session)
     return summary
 
 
