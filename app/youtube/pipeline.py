@@ -8,11 +8,12 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import defer
 
 from app.core import result_policy
-from app.core.keywords import find_matches
+from app.core.keywords import _UR_CHAR_MAP, find_matches, normalize
 from app.db.base import SessionLocal
 from config import BASE_DIR
 from app.db.models import (
@@ -34,6 +35,11 @@ _PROGRESS_FILE = BASE_DIR / "data" / "youtube_scan_progress.json"
 # channel_id -> (oldest_day_fetched, uploads). One listing serves every slot
 # in range; cleared per scan so a later scan sees newly published videos.
 _day_uploads_cache: dict[str, tuple[date, list]] = {}
+
+# Same Arabic->Urdu folding the matcher applies, expressed for SQL translate()
+# so the server-side prefilter agrees with the Python matcher.
+_UR_VARIANTS_FROM = "".join(_UR_CHAR_MAP.keys())
+_UR_VARIANTS_TO = "".join(_UR_CHAR_MAP.values())
 
 
 def _write_progress(**payload) -> None:
@@ -1122,6 +1128,38 @@ def _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary) -> None
     _emit_mention(session, notifier, b, ch, slot, v, hits_map, summary, transcript=tr)
 
 
+def _keyword_prefilter(session, keywords: list[tuple[str, str]]):
+    """Narrow the transcript scan to plausible rows, server-side.
+
+    Pulling every transcript to search it in Python moves hundreds of MB per
+    query. This pushes a cheap containment test into SQL instead.
+
+    Only ever tests a SINGLE token, never the whole phrase: a transcript
+    containing "عمران خان" must contain "عمران", but the phrase itself may be
+    split by a newline or double space that LIKE would not match. False
+    positives are harmless — the exact matcher still runs on whatever survives.
+    Returns None when the dialect cannot normalize inline, leaving behaviour
+    unchanged.
+    """
+    try:
+        if session.get_bind().dialect.name != "postgresql":
+            return None
+    except Exception:
+        return None
+
+    clauses = []
+    for kw_text, lang in keywords:
+        norm = normalize(kw_text, lang)
+        token = max(norm.split(), key=len, default="")
+        if len(token) < 2:
+            return None  # too generic to narrow safely — scan everything
+        col = func.lower(Transcript.text)
+        if lang == "ur":
+            col = func.translate(col, _UR_VARIANTS_FROM, _UR_VARIANTS_TO)
+        clauses.append(col.like(f"%{token}%"))
+    return or_(*clauses) if clauses else None
+
+
 def _match_cached(
     session, notifier, keyword_ids=None, slot_date: str | None = None,
     slot_times: list[str] | None = None,
@@ -1133,7 +1171,17 @@ def _match_cached(
     if not keywords:
         return summary
     since = result_policy.search_cutoff()
-    q = select(Transcript).where(Transcript.created_at >= since)
+    # Word-level segments are ~3x the size of the text and are only needed for
+    # transcripts that actually contain a keyword, so defer them: SQLAlchemy
+    # loads each one on first access, i.e. only for real hits.
+    q = (
+        select(Transcript)
+        .options(defer(Transcript.segments))
+        .where(Transcript.created_at >= since)
+    )
+    narrowed = _keyword_prefilter(session, keywords)
+    if narrowed is not None:
+        q = q.where(narrowed)
     if slot_date:
         b_rows = session.execute(
             select(YouTubeBulletin.id, YouTubeBulletin.video_id).where(
@@ -1188,7 +1236,14 @@ def _match_cached(
     }
     for tr in transcripts:
         summary["pages_checked"] = summary.get("pages_checked", 0) + 1
-        hits_map = matcher.find_all_hits(tr.text or "", tr.segments or [], keywords)
+        text = tr.text or ""
+        # Cheap gate on the plain text before touching tr.segments: segments are
+        # deferred, so reading them here would load word timings for every
+        # transcript in the window and undo the saving. Empty text falls through
+        # so segment-only rows are still searched.
+        if text and not find_matches(text, keywords):
+            continue
+        hits_map = matcher.find_all_hits(text, tr.segments or [], keywords)
         if not hits_map:
             continue
         ch = channels.get(tr.channel_id or "")
