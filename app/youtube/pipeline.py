@@ -156,6 +156,16 @@ def run_youtube_scan(
             _clear_progress()
             return summary
 
+        keywords = _active_youtube_keywords(session, keyword_ids)
+        if not keywords:
+            # Transcription is the expensive step and its only consumer is the
+            # matcher. With nothing to match, a scan would download and bill
+            # every due bulletin to produce no mentions at all.
+            logger.warning("YouTube scan skipped: no active keywords to match")
+            summary["skipped_no_keywords"] = True
+            _clear_progress()
+            return summary
+
         _write_progress(
             phase="starting",
             slot_date=slot_date or "",
@@ -190,7 +200,6 @@ def run_youtube_scan(
             ]
         summary["channels"] = len(channels)
 
-        keywords = _active_youtube_keywords(session, keyword_ids)
         historical = bool(slot_date and slot_date_is_past(slot_date))
         effective_force = force or historical
         total = len(bulletins)
