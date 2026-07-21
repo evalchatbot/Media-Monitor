@@ -31,9 +31,9 @@ from config import settings
 logger = logging.getLogger(__name__)
 _PKT = ZoneInfo(settings.youtube_timezone)
 _PROGRESS_FILE = BASE_DIR / "data" / "youtube_scan_progress.json"
-# (channel_id, slot_date) -> uploads. One fetch serves every slot on that day;
-# cleared per scan so a later scan sees newly published videos.
-_day_uploads_cache: dict[tuple[str, str], list] = {}
+# channel_id -> (oldest_day_fetched, uploads). One listing serves every slot
+# in range; cleared per scan so a later scan sees newly published videos.
+_day_uploads_cache: dict[str, tuple[date, list]] = {}
 
 
 def _write_progress(**payload) -> None:
@@ -578,11 +578,20 @@ def _uploads_for_bulletin_day(ch, b) -> list:
     before, and some slots upload ahead of their airtime.
     """
     tz = ZoneInfo(ch.timezone or settings.youtube_timezone)
-    key = (ch.channel_id, "window")
-    if key not in _day_uploads_cache:
-        today = datetime.now(_PKT).date()
-        span = max(1, settings.youtube_catchup_days)
-        oldest = today - timedelta(days=span - 1)
+    today = datetime.now(_PKT).date()
+    try:
+        day = date.fromisoformat(b.slot_date)
+    except (ValueError, TypeError):
+        day = today
+
+    # Only page back as far as the oldest bulletin that actually needs work.
+    # Listing a day costs 5-6 pages on a busy channel, so a scan where only
+    # today's slot is due must not pay for the whole catch-up window.
+    key = ch.channel_id
+    cached = _day_uploads_cache.get(key)
+    if cached is None or day < cached[0]:
+        oldest = day if cached is None else min(day, cached[0])
+        span = max(1, (today - oldest).days + 1)
         start = datetime(oldest.year, oldest.month, oldest.day, tzinfo=tz) - timedelta(hours=4)
         end = datetime(today.year, today.month, today.day, tzinfo=tz) + timedelta(days=1, hours=8)
 
@@ -604,13 +613,9 @@ def _uploads_for_bulletin_day(ch, b) -> list:
                 playlist_id=ch.uploads_playlist_id or "",
                 max_results=40,
             )
-        _day_uploads_cache[key] = videos
+        _day_uploads_cache[key] = (oldest, videos)
 
-    window = _day_uploads_cache[key]
-    try:
-        day = date.fromisoformat(b.slot_date)
-    except (ValueError, TypeError):
-        return window
+    window = _day_uploads_cache[key][1]
 
     lo = datetime(day.year, day.month, day.day, tzinfo=tz) - timedelta(hours=4)
     hi = lo + timedelta(days=1, hours=8)
