@@ -12,6 +12,24 @@ from config import settings
 _PKT = ZoneInfo(settings.youtube_timezone)
 
 
+# "12AM", "9 am", "10PM", "3 pm" — the edition a bulletin title announces.
+_TITLE_TIME_RE = re.compile(r"(?<![\d:])(\d{1,2})\s*([ap])\.?m\.?\b", re.IGNORECASE)
+
+
+def _title_hours(title: str) -> set[int]:
+    """Clock hours (24h) named in a title, e.g. "12AM News Bulletin" -> {0}."""
+    hours: set[int] = set()
+    for m in _TITLE_TIME_RE.finditer(title or ""):
+        raw = int(m.group(1))
+        if not 1 <= raw <= 12:
+            continue
+        hour = raw % 12
+        if m.group(2).lower() == "p":
+            hour += 12
+        hours.add(hour)
+    return hours
+
+
 @dataclass
 class Classification:
     video: Video
@@ -75,6 +93,22 @@ def classify_candidates(
         if any(tok in title for tok in ("headline", "headlines", "bulletin")):
             score += 2.0
             reasons.append("bulletin_word")
+
+        # The clock time in the title says which bulletin this actually is.
+        # Without this, "10PM News Bulletin" and "12AM News Bulletin" score
+        # alike for the midnight slot and the pair lands in needs_review.
+        title_hours = _title_hours(v.title or "")
+        if title_hours:
+            if air.hour in title_hours:
+                score += 4.0
+                reasons.append(f"slot_time:{air.hour:02d}")
+            else:
+                # Names a different edition — penalise rather than exclude, in
+                # case the time refers to something in the story itself.
+                score -= 4.0
+                reasons.append(
+                    "other_slot_time:" + ",".join(f"{h:02d}" for h in sorted(title_hours))
+                )
 
         # Publication window relative to expected airtime.
         if v.published is not None:
