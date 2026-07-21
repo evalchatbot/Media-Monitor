@@ -134,7 +134,9 @@ class Settings(BaseSettings):
     # How long results (and soft-hidden keywords' hits) are kept on disk/DB.
     keyword_result_retention_days: int = 90
     # Live search / Confirm / Results UI look back this many days from "today".
-    keyword_search_days: int = 30
+    # Keep this equal to keyword_result_retention_days: anything retained but
+    # outside this window is stored and paid for yet invisible to a new keyword.
+    keyword_search_days: int = 90
     # Screenshots, e-paper scans, YouTube transcripts and bulletin rows all
     # expire on this window (or keyword_result_retention_days, whichever is
     # longer) so a scan's transcript and its frames are never orphaned.
