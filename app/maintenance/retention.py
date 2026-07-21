@@ -1,9 +1,13 @@
 """Data-retention cleanup (runs daily via the scheduler).
 
 Windows (configurable in .env):
-  screenshots  90 days   — delete screenshots + e-paper page scans under
-                           data/storage; clear dead DB paths
+  scan media   90 days   — delete screenshots + e-paper page scans under
+                           data/storage, plus the YouTube transcripts and
+                           bulletin rows they belong to; clear dead DB paths.
+                           These share one cutoff and always expire together.
   cached text  12 months — delete ArticleCache + EPaperPage rows past the window
+                           (RETENTION_TRANSCRIPTS_DAYS — the name is historical;
+                           it governs cached article text, NOT YouTube transcripts)
   logs         24 months — delete ScrapeRun audit rows past the window
 
 alerts.log is append-only; rotate it with an OS log-rotation tool if it grows.
@@ -34,9 +38,12 @@ def run_retention() -> dict:
                "transcripts_deleted": 0, "bulletins_deleted": 0,
                "mentions_expired": 0, "keyword_links_trimmed": 0}
 
-    # --- Screenshots + e-paper page scans ---
+    # --- Screenshots, e-paper page scans, transcripts ---
+    # One cutoff for every artefact of a scan: a transcript whose frames are gone
+    # is unusable, and a frame whose transcript is gone can't be re-verified, so
+    # they must expire together no matter how the windows are configured.
     # Never prune a visual before its keyword result expires.
-    cutoff_shots = now - timedelta(days=max(
+    cutoff_media = now - timedelta(days=max(
         settings.retention_screenshots_days,
         settings.keyword_result_retention_days,
     ))
@@ -46,7 +53,7 @@ def run_retention() -> dict:
             for img in storage.rglob(pattern):
                 try:
                     mtime = datetime.fromtimestamp(img.stat().st_mtime, tz=timezone.utc)
-                    if mtime < cutoff_shots:
+                    if mtime < cutoff_media:
                         img.unlink()
                         summary["screenshots_deleted"] += 1
                 except Exception as exc:  # pragma: no cover
@@ -84,11 +91,12 @@ def run_retention() -> dict:
         summary["epaper_rows_deleted"] = res.rowcount or 0
 
         # --- YouTube transcripts + old bulletin rows ---
-        cutoff_yt = now - timedelta(days=settings.keyword_result_retention_days)
-        res = session.execute(delete(Transcript).where(Transcript.created_at < cutoff_yt))
+        # Same cutoff as the frames above, so a bulletin's transcript and its
+        # screenshots always disappear on the same day.
+        res = session.execute(delete(Transcript).where(Transcript.created_at < cutoff_media))
         summary["transcripts_deleted"] = res.rowcount or 0
         res = session.execute(
-            delete(YouTubeBulletin).where(YouTubeBulletin.created_at < cutoff_yt)
+            delete(YouTubeBulletin).where(YouTubeBulletin.created_at < cutoff_media)
         )
         summary["bulletins_deleted"] = res.rowcount or 0
 
