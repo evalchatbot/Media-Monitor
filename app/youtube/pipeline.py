@@ -31,6 +31,9 @@ from config import settings
 logger = logging.getLogger(__name__)
 _PKT = ZoneInfo(settings.youtube_timezone)
 _PROGRESS_FILE = BASE_DIR / "data" / "youtube_scan_progress.json"
+# (channel_id, slot_date) -> uploads. One fetch serves every slot on that day;
+# cleared per scan so a later scan sees newly published videos.
+_day_uploads_cache: dict[tuple[str, str], list] = {}
 
 
 def _write_progress(**payload) -> None:
@@ -140,6 +143,7 @@ def run_youtube_scan(
     session = SessionLocal()
     notifier = get_notifier()
     try:
+        _day_uploads_cache.clear()
         repair_youtube_mentions(session, rematch=False)
         if match_only:
             summary.update(
@@ -181,9 +185,13 @@ def run_youtube_scan(
         if slot_date:
             q = q.where(YouTubeBulletin.slot_date == slot_date)
         else:
-            # Process recent open bulletins (today + yesterday for midnight).
+            # Process today plus the previous few days, so a slot missed while
+            # the host was down is still caught up rather than lost for good.
             today = datetime.now(_PKT).date()
-            days = {(today - timedelta(days=i)).isoformat() for i in range(0, 3)}
+            days = {
+                (today - timedelta(days=i)).isoformat()
+                for i in range(0, max(1, settings.youtube_catchup_days))
+            }
             q = q.where(YouTubeBulletin.slot_date.in_(days))
 
         bulletins = session.execute(q).scalars().all()
@@ -267,11 +275,19 @@ def ensure_due_bulletins(
     channel_ids: list[int] | None = None,
     for_date: str | None = None,
 ) -> int:
-    """Create waiting bulletin rows for today (and yesterday midnight) as needed."""
+    """Create waiting bulletin rows across the catch-up window as needed.
+
+    Must span the same days the scan queries, otherwise a widened scan window
+    finds no rows to process for the older days.
+    """
     today = date.fromisoformat(for_date) if for_date else datetime.now(_PKT).date()
-    dates = [today]
-    if not for_date:
-        dates.append(today - timedelta(days=1))
+    if for_date:
+        dates = [today]
+    else:
+        dates = [
+            today - timedelta(days=i)
+            for i in range(0, max(1, settings.youtube_catchup_days))
+        ]
     created = 0
     q = select(YouTubeChannel).where(YouTubeChannel.active.is_(True))
     if channel_ids:
@@ -416,6 +432,7 @@ def run_youtube_period_scan(
     notifier = get_notifier()
     label = summary["period"]
     try:
+        _day_uploads_cache.clear()
         repair_youtube_mentions(session, rematch=False)
         keywords = _active_youtube_keywords(session, keyword_ids)
         if not keywords:
@@ -548,17 +565,70 @@ def bulletin_status_for_date(session, show_date: date) -> list[dict]:
 # Internals
 # ---------------------------------------------------------------------------
 
+def _uploads_for_bulletin_day(ch, b) -> list:
+    """Uploads published on the bulletin's own calendar day.
+
+    Fetching the newest N uploads cannot reach a slot from a few days back on a
+    busy channel — it finds no candidate and the slot gets marked missing. So we
+    pull the whole catch-up window for the channel ONCE (pagination walks back
+    from newest, so asking per-day would re-walk the same pages every time) and
+    slice each day out of it in memory.
+
+    Padded either side because a midnight bulletin often uploads late the night
+    before, and some slots upload ahead of their airtime.
+    """
+    tz = ZoneInfo(ch.timezone or settings.youtube_timezone)
+    key = (ch.channel_id, "window")
+    if key not in _day_uploads_cache:
+        today = datetime.now(_PKT).date()
+        span = max(1, settings.youtube_catchup_days)
+        oldest = today - timedelta(days=span - 1)
+        start = datetime(oldest.year, oldest.month, oldest.day, tzinfo=tz) - timedelta(hours=4)
+        end = datetime(today.year, today.month, today.day, tzinfo=tz) + timedelta(days=1, hours=8)
+
+        # These channels run 180-260 uploads a day, so the default 15-page cap
+        # (750 videos) truncates before reaching the oldest day and that day
+        # silently finds no candidates. Pagination stops early once it passes
+        # the window start, so a generous cap costs nothing on quiet channels.
+        videos = discovery.fetch_uploads_in_range(
+            ch.channel_id,
+            published_after=start.astimezone(timezone.utc),
+            published_before=end.astimezone(timezone.utc),
+            playlist_id=ch.uploads_playlist_id or "",
+            max_pages=min(60, 14 * span),
+        )
+        if not videos:
+            # No API key, or the window is beyond pagination reach.
+            videos = discovery.fetch_uploads(
+                ch.channel_id,
+                playlist_id=ch.uploads_playlist_id or "",
+                max_results=40,
+            )
+        _day_uploads_cache[key] = videos
+
+    window = _day_uploads_cache[key]
+    try:
+        day = date.fromisoformat(b.slot_date)
+    except (ValueError, TypeError):
+        return window
+
+    lo = datetime(day.year, day.month, day.day, tzinfo=tz) - timedelta(hours=4)
+    hi = lo + timedelta(days=1, hours=8)
+    same_day = [
+        v for v in window
+        if v.published is not None and lo <= v.published.astimezone(tz) <= hi
+    ]
+    # Undated uploads can still be the right video; let the classifier judge.
+    return same_day or window
+
+
 def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, force: bool) -> None:
     b.discovery_status = "discovering"
     b.attempts = (b.attempts or 0) + 1
     b.last_processed_at = datetime.now(timezone.utc)
     session.commit()
 
-    videos = discovery.fetch_uploads(
-        ch.channel_id,
-        playlist_id=ch.uploads_playlist_id or "",
-        max_results=40,
-    )
+    videos = _uploads_for_bulletin_day(ch, b)
     scored = classifier.classify_candidates(
         videos,
         slot_date=b.slot_date,

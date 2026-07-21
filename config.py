@@ -166,6 +166,11 @@ class Settings(BaseSettings):
     youtube_discovery_window_minutes: int = 90
     youtube_max_duration_seconds: int = 3600
     youtube_transcribe_concurrency: int = 1
+    # Bulletin days each auto scan covers: today plus the previous N-1 days.
+    # This is the catch-up window — a slot missed while the host was down is
+    # still picked up this many days later. It does NOT bound how much history
+    # is kept; that is keyword_result_retention_days (90).
+    youtube_catchup_days: int = 4
     # Opus bitrate for the 16 kHz mono audio sent to Groq. 32 kbps is transparent
     # for speech; raising it only slows uploads. Set 0 to force lossless FLAC.
     youtube_audio_bitrate_kbps: int = 32
