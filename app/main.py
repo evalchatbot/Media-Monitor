@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1612,6 +1613,38 @@ def _youtube_keyword_ids_from_query(
     return []
 
 
+_instant_match_lock = threading.Lock()
+
+
+def start_instant_youtube_match(keyword_ids: list[int]) -> None:
+    """Match new keywords against stored transcripts without waiting for a scan.
+
+    The scan runner allows one subprocess at a time, so while a bulletin scan is
+    working through its backlog — which is most of the time — a request to match
+    is refused and dropped. A newly added keyword would then find nothing until
+    some later scan happened to re-match it.
+
+    Matching cached transcripts needs no download, so it runs in-process on a
+    worker thread instead and cannot be blocked by that lock.
+    """
+    if not keyword_ids:
+        return
+
+    def _run() -> None:
+        # One at a time: several adds in quick succession should queue, not
+        # pile up concurrent passes over the same transcripts.
+        with _instant_match_lock:
+            try:
+                from app.youtube.pipeline import run_quick_youtube_match
+
+                summary = run_quick_youtube_match(keyword_ids)
+                logger.info("instant youtube match done: %s", summary)
+            except Exception:
+                logger.exception("instant youtube match failed")
+
+    threading.Thread(target=_run, name="yt-instant-match", daemon=True).start()
+
+
 def _upsert_watch_keywords(db: Session, texts: list[str], language: str,
                            module: str = "newspaper") -> list[Keyword]:
     """Create or reactivate several watchlist keywords in one round trip.
@@ -2412,11 +2445,7 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
         # 15-minute scan comes round. This costs no download and no Groq call,
         # so results for past bulletins appear immediately instead of looking
         # like "no match" until the next scheduled run.
-        yt_scan_runner.start_scan(
-            keyword_ids=ids,
-            match_only=True,
-            label=f"instant:{label}",
-        )
+        start_instant_youtube_match(ids)
         q = urlencode({"added": label, "scanning": "1"})
         return RedirectResponse(f"{home}?{q}", status_code=303)
 
