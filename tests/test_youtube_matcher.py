@@ -114,3 +114,31 @@ def test_chunk_dedupe_keeps_speech_past_the_overlap():
     existing = words(["الف"], t0=600.0, step=1.0)  # ends 601
     new = words(["عمران", "خان"], t0=602.0, step=1.0)
     assert transcribe._dedupe_overlap(existing, new, 600.0) == new
+
+
+def test_keyword_merged_into_an_existing_mention_keeps_its_language():
+    """A new keyword lands in keyword_hits before it lands in matched_keywords.
+
+    Looking its language up from the old labels alone left it defaulting to
+    Urdu, and Urdu normalisation does not lowercase — so an English keyword
+    failed its own case-insensitive check and vanished from any video that
+    already had a mention for something else.
+    """
+    hits = {
+        "سپین": [{"start": 100, "end": 101, "excerpt": "سپین کے خلاف میچ"}],
+        "Child Protection Bureau": [
+            {"start": 283, "end": 286,
+             "excerpt": "the child protection bureau said today"},
+        ],
+    }
+    # only the pre-existing label's language is known
+    verified, clean = matcher.prune_stored_hits(hits, {"سپین": "ur"})
+    assert "Child Protection Bureau" in verified
+    assert clean["Child Protection Bureau"]
+
+
+def test_unknown_language_falls_back_to_the_script_not_a_guess():
+    from app.core.keywords import script_language
+
+    assert script_language("Child Protection Bureau") == "en"
+    assert script_language("عمران خان") == "ur"

@@ -817,7 +817,12 @@ def _youtube_keyword_langs(session, labels: list[str] | set[str] | None = None) 
 
 def _sanitize_youtube_mention(session, mention: Mention) -> bool:
     """Keep only verified transcript hits on a YouTube mention row."""
-    labels = list(mention.matched_keywords or [])
+    # Include the hit keys, not just the current labels: a keyword merged into
+    # an existing mention is in keyword_hits before it is in matched_keywords.
+    # Looking up only the labels left it falling back to "ur", and Urdu
+    # normalisation does not lowercase — so an English keyword failed its own
+    # verification and was dropped from any video that already had a mention.
+    labels = set(mention.matched_keywords or []) | set((mention.keyword_hits or {}).keys())
     langs = _youtube_keyword_langs(session, labels)
     verified, clean_hits = matcher.prune_stored_hits(mention.keyword_hits or {}, langs)
     mention.matched_keywords = verified

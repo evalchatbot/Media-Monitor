@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from app.core.keywords import exact_pattern, find_matches, normalize
+from app.core.keywords import exact_pattern, find_matches, normalize, script_language
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -142,7 +142,7 @@ def prune_stored_hits(
     clean: dict = {}
     labels: list[str] = []
     for kw, hits in (keyword_hits or {}).items():
-        lang = keyword_langs.get(kw, "ur")
+        lang = keyword_langs.get(kw) or script_language(kw)
         verified = verified_json_hits(kw, lang, hits if isinstance(hits, list) else [])
         if verified:
             labels.append(kw)
@@ -166,7 +166,7 @@ def mention_verified_keywords(
             continue
         if active_fold is not None and fold not in active_fold:
             continue
-        lang = keyword_langs.get(kw, "ur")
+        lang = keyword_langs.get(kw) or script_language(kw)
         if verified_json_hits(kw, lang, (keyword_hits or {}).get(kw) or []):
             seen.add(fold)
             canonical = (active_fold or {}).get(fold, kw)

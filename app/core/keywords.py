@@ -34,6 +34,19 @@ class KeywordMatch:
     exact: bool
 
 
+# Arabic block + Urdu/Persian supplements and presentation forms.
+_ARABIC_SCRIPT = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+
+
+def script_language(text: str) -> str:
+    """Language a term must be normalized under, judged from its own script.
+
+    Guessing wrong is silent: Urdu normalization does not lowercase, so an
+    English keyword treated as Urdu fails its own case-insensitive match.
+    """
+    return "ur" if _ARABIC_SCRIPT.search(text or "") else "en"
+
+
 def normalize(text: str, language: str = "en") -> str:
     text = unicodedata.normalize("NFC", text)
     if language == "ur":

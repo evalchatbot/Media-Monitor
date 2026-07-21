@@ -34,6 +34,7 @@ from config import settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, YouTubeChannel
 from app.core import keyword_scan_queue, result_policy
+from app.core.keywords import script_language
 from app.epaper import scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
@@ -1616,10 +1617,6 @@ def _youtube_keyword_ids_from_query(
 
 _instant_match_lock = threading.Lock()
 
-# Arabic block + Urdu/Persian supplements and presentation forms.
-_ARABIC_SCRIPT = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
-
-
 def detect_keyword_language(text: str, requested: str = "en") -> str:
     """Language to match a keyword under, from its own script.
 
@@ -1628,7 +1625,7 @@ def detect_keyword_language(text: str, requested: str = "en") -> str:
     silently misses any transcript spelling the word with Arabic yeh or kaf.
     The script is unambiguous, so trust it over the form.
     """
-    if _ARABIC_SCRIPT.search(text or ""):
+    if script_language(text) == "ur":
         return "ur"
     if requested == "ur":
         # Latin text explicitly marked Urdu — folding would do nothing useful.
