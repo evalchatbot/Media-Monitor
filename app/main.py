@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -1615,6 +1616,25 @@ def _youtube_keyword_ids_from_query(
 
 _instant_match_lock = threading.Lock()
 
+# Arabic block + Urdu/Persian supplements and presentation forms.
+_ARABIC_SCRIPT = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+
+
+def detect_keyword_language(text: str, requested: str = "en") -> str:
+    """Language to match a keyword under, from its own script.
+
+    The add form defaults to English, so an Urdu term typed without touching
+    the selector was stored as English — which skips Urdu letter folding and
+    silently misses any transcript spelling the word with Arabic yeh or kaf.
+    The script is unambiguous, so trust it over the form.
+    """
+    if _ARABIC_SCRIPT.search(text or ""):
+        return "ur"
+    if requested == "ur":
+        # Latin text explicitly marked Urdu — folding would do nothing useful.
+        return "en"
+    return requested if requested in ("en", "ur") else "en"
+
 
 def start_instant_youtube_match(keyword_ids: list[int]) -> None:
     """Match new keywords against stored transcripts without waiting for a scan.
@@ -1652,32 +1672,40 @@ def _upsert_watch_keywords(db: Session, texts: list[str], language: str,
     Adding them one at a time cost a SELECT plus a COMMIT each, and against a
     remote database that latency is the whole of the perceived delay.
     """
-    language = language if language in ("en", "ur") else "en"
     module = module if module in ("newspaper", "youtube") else "newspaper"
     cleaned = [t.strip() for t in texts if (t or "").strip()]
     if not cleaned:
         return []
 
+    # Per keyword: one batch may mix scripts, and the script decides.
+    langs = {t: detect_keyword_language(t, language) for t in cleaned}
+
     lowered = [t.lower() for t in cleaned]
-    existing = {
-        (k.text or "").lower(): k
-        for k in db.execute(
-            select(Keyword).where(
-                func.lower(Keyword.text).in_(lowered),
-                Keyword.language == language,
-                Keyword.module == module,
-            )
-        ).scalars()
-    }
+    # Keyed on text alone: a row stored under the wrong language must be
+    # repaired in place, not shadowed by a duplicate under the right one.
+    existing: dict[str, list[Keyword]] = {}
+    for k in db.execute(
+        select(Keyword).where(
+            func.lower(Keyword.text).in_(lowered),
+            Keyword.module == module,
+        )
+    ).scalars():
+        existing.setdefault((k.text or "").lower(), []).append(k)
 
     out: list[Keyword] = []
     for text in cleaned:
-        kw = existing.get(text.lower())
+        lang = langs[text]
+        rows = existing.get(text.lower()) or []
+        kw = next((r for r in rows if r.language == lang), None) or (rows[0] if rows else None)
         if kw is None:
-            kw = Keyword(text=text, language=language, module=module, active=True)
+            kw = Keyword(text=text, language=lang, module=module, active=True)
             db.add(kw)
-        elif not kw.active:
-            kw.active = True
+            existing.setdefault(text.lower(), []).append(kw)
+        else:
+            if not kw.active:
+                kw.active = True
+            if kw.language != lang:
+                kw.language = lang  # repair a previously mis-tagged row
         out.append(kw)
     db.commit()  # one commit for the batch, not one per keyword
     return out
@@ -1689,7 +1717,7 @@ def _upsert_watch_keyword(db: Session, text: str, language: str,
     text = (text or "").strip()
     if not text:
         return None
-    language = language if language in ("en", "ur") else "en"
+    language = detect_keyword_language(text, language)
     module = module if module in ("newspaper", "youtube") else "newspaper"
     existing = db.execute(
         select(Keyword).where(
@@ -2476,7 +2504,7 @@ def ui_edit_keyword(kid: int, text: str = Form(...), language: str = Form("en"),
     kw = db.get(Keyword, kid)
     if kw and text.strip():
         kw.text = text.strip()
-        kw.language = language if language in ("en", "ur") else kw.language
+        kw.language = detect_keyword_language(kw.text, language)
         db.commit()
     return RedirectResponse("/", status_code=303)
 

@@ -82,3 +82,37 @@ def test_urdu_keyword_keeps_its_language(db):
     _upsert_watch_keywords(db, ["سوشل میڈیا"], "ur", module="youtube")
     kw = db.execute(select(Keyword)).scalar_one()
     assert kw.language == "ur"
+
+
+def test_urdu_typed_with_the_default_english_selector_is_stored_as_urdu(db):
+    """The add form defaults to English; the script must win over the default."""
+    _upsert_watch_keywords(db, ["میسی"], "en", module="youtube")
+    kw = db.execute(select(Keyword)).scalar_one()
+    assert kw.language == "ur", "an Urdu term tagged en silently misses variants"
+
+
+def test_latin_marked_urdu_is_stored_as_english(db):
+    _upsert_watch_keywords(db, ["Sarah Ahmed"], "ur", module="youtube")
+    kw = db.execute(select(Keyword)).scalar_one()
+    assert kw.language == "en"
+
+
+def test_one_batch_can_mix_scripts(db):
+    _upsert_watch_keywords(db, ["جنگ", "child abuse"], "en", module="youtube")
+    langs = {
+        k.text: k.language
+        for k in db.execute(select(Keyword)).scalars()
+    }
+    assert langs == {"جنگ": "ur", "child abuse": "en"}
+
+
+def test_readding_repairs_a_mis_tagged_row(db):
+    kw = Keyword(text="میسی", language="en", module="youtube", active=True)
+    db.add(kw)
+    db.commit()
+
+    _upsert_watch_keywords(db, ["میسی"], "en", module="youtube")
+
+    rows = db.execute(select(Keyword)).scalars().all()
+    assert len(rows) == 1, "must repair in place, not create a second row"
+    assert rows[0].language == "ur"
