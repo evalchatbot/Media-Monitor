@@ -2077,11 +2077,12 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="module" value="youtube">
-          <button type="submit" name="scan" value="0" class="ghost">Add only</button>
-          <button type="submit" name="scan" value="1" class="ghost">Add to watchlist</button>
+          <input type="hidden" name="scan" value="1">
+          <button type="submit">Add to watchlist</button>
           <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
-        <p class="hint" style="margin-top:.45rem">Click keywords to select (✓), then open <b>Custom scan</b> or <b>Show results</b>.</p>
+        <p class="hint" style="margin-top:.45rem">Adding searches transcripts already stored — no rescan needed.
+        Click keywords to select (✓), then open <b>Custom scan</b> or <b>Show results</b>.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to select · × hide
             <button type="button" class="ghost" id="kw-sel-all" style="margin-left:.5rem;font-size:.72rem">Select all</button>
