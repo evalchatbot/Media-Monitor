@@ -2177,19 +2177,24 @@ def _youtube_results_html(
     allowed_labels: set[str] | None = None
     keyword_langs: dict[str, str] = {}
     allowed_fold: set[str] | None = None
+    paused_labels: list[str] = []
     if strict and not keyword_ids:
         mentions = []
         allowed_labels = set()
     elif keyword_ids:
         rows = db.execute(
-            select(Keyword.text, Keyword.language).where(
+            select(Keyword.text, Keyword.language, Keyword.active).where(
                 Keyword.id.in_(keyword_ids),
                 Keyword.module == "youtube",
             )
         ).all()
-        allowed_labels = {t for t, _ in rows if t}
-        keyword_langs = {t: lang or "ur" for t, lang in rows if t}
+        allowed_labels = {t for t, _, _ in rows if t}
+        keyword_langs = {t: lang or "ur" for t, lang, _ in rows if t}
         allowed_fold = {t.casefold() for t in allowed_labels}
+        # A paused keyword is never matched, so it can only ever come back
+        # empty. Saying "run a Custom scan" here sends the user to rescan
+        # bulletins that would still be searched without it.
+        paused_labels = [t for t, _, act in rows if t and not act]
     elif keyword:
         kw_l = keyword.casefold()
         if kw_l not in active_fold:
@@ -2269,6 +2274,12 @@ def _youtube_results_html(
     elif strict and not keyword_ids:
         grid = ('<div class="empty">Select one or more keywords from the watchlist '
                 '(click to mark ✓), then <b>Show results</b> or <b>Custom scan</b>.</div>')
+        more = ""
+    elif keyword_ids and paused_labels and not shown:
+        names = ", ".join(html.escape(t) for t in sorted(paused_labels))
+        grid = (f'<div class="empty">Paused: <b>{names}</b>.'
+                "<br>Paused keywords are never matched. Resume on the watchlist "
+                "above, and past bulletins are searched straight away.</div>")
         more = ""
     elif filter_only and keyword_ids and not shown:
         grid = ('<div class="empty">No exact matches for the selected keyword(s) in this period.'
