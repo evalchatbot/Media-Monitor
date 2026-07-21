@@ -1,8 +1,8 @@
 """Groq Whisper transcription with word/segment timestamps."""
 from __future__ import annotations
 
+import bisect
 import logging
-import math
 from pathlib import Path
 
 from config import settings
@@ -94,13 +94,18 @@ def _transcribe_one(
     text = getattr(resp, "text", "") or ""
     words = getattr(resp, "words", None) or []
     segments_raw = getattr(resp, "segments", None) or []
+    quality = _quality_spans(segments_raw)
     segments: list[dict] = []
     if words:
         for w in words:
+            start = float(_attr(w, "start", 0) or 0)
             segments.append({
-                "start": float(_attr(w, "start", 0) or 0) + time_offset,
+                "start": start + time_offset,
                 "end": _maybe_float(_attr(w, "end", None), time_offset),
                 "text": (_attr(w, "word", None) or _attr(w, "text", "") or "").strip(),
+                # Word timings carry no quality of their own — inherit the
+                # enclosing segment's so hallucinated speech stays detectable.
+                **_quality_at(quality, start),
             })
     else:
         for s in segments_raw:
@@ -108,6 +113,7 @@ def _transcribe_one(
                 "start": float(_attr(s, "start", 0) or 0) + time_offset,
                 "end": _maybe_float(_attr(s, "end", None), time_offset),
                 "text": (_attr(s, "text", "") or "").strip(),
+                **_quality_of(s),
             })
 
     conf = _confidence_from_segments(segments_raw)
@@ -185,10 +191,17 @@ def _transcribe_chunked(
 
 
 def _dedupe_overlap(existing: list[dict], new_segs: list[dict], chunk_start: float) -> list[dict]:
-    """Drop overlapping words from the overlap region of a new chunk."""
+    """Drop overlapping words from the overlap region of a new chunk.
+
+    Cut at where the previous chunk actually stopped, not at a fixed fraction of
+    the overlap — a fixed cutoff re-transcribes the tail of the previous chunk
+    and duplicates that speech in the token stream.
+    """
     if not existing:
         return new_segs
-    cutoff = chunk_start + _OVERLAP_SEC / 2
+    tail = existing[-1]
+    last_end = float(tail.get("end") or tail.get("start") or 0)
+    cutoff = max(chunk_start, last_end)
     return [s for s in new_segs if float(s.get("start") or 0) >= cutoff]
 
 
@@ -209,6 +222,41 @@ def _probe_duration(path: Path) -> float | None:
         return float(out.decode().strip())
     except Exception:
         return None
+
+
+def _quality_of(seg) -> dict:
+    """Whisper's own reliability signals for one segment."""
+    out = {}
+    lp = _attr(seg, "avg_logprob", None)
+    ns = _attr(seg, "no_speech_prob", None)
+    if isinstance(lp, (int, float)):
+        out["avg_logprob"] = float(lp)
+    if isinstance(ns, (int, float)):
+        out["no_speech_prob"] = float(ns)
+    return out
+
+
+def _quality_spans(segments_raw) -> list[tuple[float, float, dict]]:
+    spans: list[tuple[float, float, dict]] = []
+    for s in segments_raw or []:
+        q = _quality_of(s)
+        if not q:
+            continue
+        start = float(_attr(s, "start", 0) or 0)
+        end = float(_attr(s, "end", start) or start)
+        spans.append((start, end, q))
+    return spans
+
+
+def _quality_at(spans: list[tuple[float, float, dict]], t: float) -> dict:
+    """Quality of the segment containing `t`. Spans are time-ordered."""
+    if not spans:
+        return {}
+    i = bisect.bisect_right(spans, (t, float("inf"), {})) - 1
+    if i < 0:
+        return {}
+    start, end, q = spans[i]
+    return q if start <= t <= end else {}
 
 
 def _attr(obj, name, default=None):

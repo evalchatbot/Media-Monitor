@@ -8,6 +8,16 @@ from app.core.keywords import exact_pattern, find_matches, normalize
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
+# Two hits of the same keyword closer than this are the same spoken utterance
+# (re-found via an overlapping segment or a chunk boundary), not two mentions.
+_MIN_HIT_GAP_S = 3.0
+
+# Whisper's own reliability thresholds. Speech it reports with this little
+# confidence — or over audio it flags as non-speech — is where it invents
+# words, so a keyword "found" there is a hallucination, not a mention.
+_NO_SPEECH_MAX = 0.6
+_AVG_LOGPROB_MIN = -1.0
+
 
 @dataclass
 class KeywordHit:
@@ -29,6 +39,25 @@ def _text_from_segments(segments: list[dict]) -> str:
         for s in segments
         if (s.get("text") or "").strip()
     )
+
+
+def segment_is_reliable(seg: dict) -> bool:
+    """False when Whisper itself signalled this span is not dependable speech.
+
+    Segments transcribed before quality was recorded carry neither field; they
+    are trusted so existing transcripts keep working.
+    """
+    ns = seg.get("no_speech_prob")
+    if isinstance(ns, (int, float)) and ns > _NO_SPEECH_MAX:
+        return False
+    lp = seg.get("avg_logprob")
+    if isinstance(lp, (int, float)) and lp < _AVG_LOGPROB_MIN:
+        return False
+    return True
+
+
+def _reliable_segments(segments: list[dict]) -> list[dict]:
+    return [s for s in segments or [] if segment_is_reliable(s)]
 
 
 def _segments_word_level(segments: list[dict]) -> bool:
@@ -53,7 +82,7 @@ def _keyword_at_timestamp(
     for seg in segments:
         s = float(seg.get("start", 0) or 0)
         e = float(seg.get("end") or s)
-        if e < start_s - window or s > start_s + window + 0.5:
+        if e < start_s - window or s > start_s + window:
             continue
         parts.append((seg.get("text") or "").strip())
     if not parts:
@@ -69,7 +98,9 @@ def hit_is_verified(
     segments: list[dict] | None = None,
 ) -> bool:
     """Timed transcript hit must contain the keyword near the stored timestamp."""
-    if int(start or 0) <= 0:
+    # 0 is a legitimate timestamp — headlines are read at 0:00 — so only a
+    # missing or negative offset is invalid.
+    if start is None or int(start) < 0:
         return False
     text = (excerpt or "").strip()
     if not text or not find_matches(text, [(keyword, language)]):
@@ -84,14 +115,20 @@ def _keyword_hit_verified(h: KeywordHit, segments: list[dict] | None = None) -> 
 
 
 def verified_json_hits(keyword: str, language: str, hits: list) -> list[dict]:
-    """Keep only stored JSON hits that pass excerpt verification."""
+    """Keep only stored JSON hits that pass excerpt verification.
+
+    Also collapses same-utterance duplicates, so rows written before the
+    location fix stop showing repeats without waiting for a re-match.
+    """
     out: list[dict] = []
-    for h in hits or []:
-        if not isinstance(h, dict):
+    for h in sorted(
+        (x for x in (hits or []) if isinstance(x, dict)),
+        key=lambda x: int(x.get("start") or 0),
+    ):
+        start = int(h.get("start") or 0)
+        if not hit_is_verified(keyword, language, start, h.get("excerpt") or ""):
             continue
-        if not hit_is_verified(
-            keyword, language, int(h.get("start") or 0), h.get("excerpt") or "",
-        ):
+        if out and start - int(out[-1].get("start") or 0) < _MIN_HIT_GAP_S:
             continue
         out.append(h)
     return out
@@ -143,15 +180,23 @@ def find_all_hits(
     keywords: list[tuple[str, str]],
 ) -> dict[str, list[KeywordHit]]:
     """Return every exact spoken occurrence per keyword."""
-    corpus = _text_from_segments(segments) or text
+    if segments:
+        # Search only speech Whisper stands behind. Falling back to `text` here
+        # would put the discarded low-confidence spans straight back in.
+        trusted = _reliable_segments(segments)
+        corpus = _text_from_segments(trusted)
+    else:
+        trusted = []
+        corpus = text
+
     matched = find_matches(corpus, keywords)
     if not matched:
         return {}
 
     out: dict[str, list[KeywordHit]] = {}
     for m in matched:
-        hits = _locate_keyword(segments, m.keyword, m.language)
-        hits = [h for h in hits if _keyword_hit_verified(h, segments)]
+        hits = _locate_keyword(trusted, m.keyword, m.language)
+        hits = [h for h in hits if _keyword_hit_verified(h, trusted)]
         if hits:
             out[m.keyword] = hits
     return out
@@ -173,67 +218,72 @@ def _locate_keyword(segments: list[dict], keyword: str, language: str) -> list[K
         return []
 
     hits: list[KeywordHit] = []
-    if _segments_word_level(segments):
-        hits.extend(_locate_word_segments(segments, kw_tokens, keyword, language))
+    word_level = _segments_word_level(segments)
+    if word_level:
+        # Word-level Groq output: every token carries its own exact timing, so
+        # walking the token stream is both the most precise path and immune to
+        # punctuation glued onto a word ("خان،").
+        hits.extend(_locate_token_stream(segments, kw_tokens, keyword, language))
 
     if not hits:
         hits.extend(_locate_in_long_segments(segments, norm_kw, kw_tokens, keyword, language))
 
-    if not hits:
+    if not hits and not word_level:
         hits.extend(_locate_token_stream(segments, kw_tokens, keyword, language))
 
-    # Deduplicate near-identical timestamps for the same keyword.
+    # Collapse re-finds of one utterance; keep genuinely separate occurrences.
     deduped: list[KeywordHit] = []
-    seen_starts: set[int] = set()
     for h in sorted(hits, key=lambda x: x.start):
-        if h.start in seen_starts:
+        if deduped and h.start - deduped[-1].start < _MIN_HIT_GAP_S:
             continue
-        seen_starts.add(h.start)
         deduped.append(h)
+
+    loops = _loop_ranges(segments, kw_tokens, language)
+    if loops:
+        deduped = [
+            h for h in deduped
+            if not any(lo - 1 <= h.start <= hi + 1 for lo, hi in loops)
+        ]
     return deduped
 
 
-def _locate_word_segments(
-    segments: list[dict],
-    kw_tokens: list[str],
-    keyword: str,
-    language: str,
-) -> list[KeywordHit]:
-    """Match consecutive Groq word segments (one token each) for precise timing."""
-    stream: list[tuple[str, float, float | None]] = []
-    for seg in segments:
-        raw = (seg.get("text") or "").strip()
-        if not raw:
-            continue
-        norm = normalize(raw, language)
-        token = norm.split()[0] if norm.split() else ""
-        if not token:
-            tokens = _WORD_RE.findall(norm)
-            token = tokens[0] if tokens else ""
-        if not token:
-            continue
-        start = float(seg.get("start", 0) or 0)
-        end = seg.get("end")
-        stream.append((token, start, float(end) if end is not None else None))
+def _loop_ranges(
+    segments: list[dict], kw_tokens: list[str], language: str
+) -> list[tuple[float, float]]:
+    """Time spans where the phrase repeats back-to-back.
 
+    A decoder stuck in a loop emits "<phrase> <phrase> <phrase>" over silence or
+    noise. Nobody reads the news that way, so those spans are dropped — while
+    real repeat mentions elsewhere in the bulletin are left alone.
+    """
     n = len(kw_tokens)
-    hits: list[KeywordHit] = []
-    for i in range(len(stream) - n + 1):
-        if not all(stream[i + j][0] == kw_tokens[j] for j in range(n)):
-            continue
-        start_s = _round_ts(stream[i][1])
-        end_raw = stream[i + n - 1][2]
-        end_i = _round_ts(end_raw) if end_raw is not None else start_s
-        hits.append(
-            KeywordHit(
-                keyword=keyword,
-                language=language,
-                start=start_s,
-                end=end_i,
-                excerpt=_excerpt_around(segments, start_s, language),
-            )
-        )
-    return hits
+    stream: list[tuple[str, float]] = []
+    for seg in segments or []:
+        start = float(seg.get("start", 0) or 0)
+        for w in _WORD_RE.findall(normalize(seg.get("text") or "", language)):
+            stream.append((w, start))
+
+    idxs = [
+        i
+        for i in range(len(stream) - n + 1)
+        if all(stream[i + j][0] == kw_tokens[j] for j in range(n))
+    ]
+
+    ranges: list[tuple[float, float]] = []
+    run: list[int] = []
+
+    def close(r: list[int]) -> None:
+        if len(r) >= 3:  # three back-to-back repeats = loop, not speech
+            ranges.append((stream[r[0]][1], stream[min(r[-1] + n - 1, len(stream) - 1)][1]))
+
+    for i in idxs:
+        if run and i - run[-1] <= n + 1:  # at most one word between repeats
+            run.append(i)
+        else:
+            close(run)
+            run = [i]
+    close(run)
+    return ranges
 
 
 def _locate_in_long_segments(

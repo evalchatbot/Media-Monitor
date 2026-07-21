@@ -59,8 +59,13 @@ def slot_date_is_past(slot_date: str) -> bool:
         return False
 
 
-def repair_youtube_mentions(session) -> dict:
-    """Re-locate transcript hits and drop unverified keyword tags."""
+def repair_youtube_mentions(session, *, rematch: bool = True) -> dict:
+    """Re-locate transcript hits and drop unverified keyword tags.
+
+    `rematch=False` skips the per-mention transcript re-scan and only prunes
+    unverified tags. A scan already re-matches everything it touches, so paying
+    the full re-scan over the whole mention history first only delays results.
+    """
     repaired = deleted = rematched = 0
     keywords = _active_youtube_keywords(session)
     kw_by_text = {t: lang for t, lang in keywords}
@@ -69,9 +74,11 @@ def repair_youtube_mentions(session) -> dict:
     ).scalars().all()
     for m in rows:
         before = list(m.matched_keywords or [])
-        tr = session.execute(
-            select(Transcript).where(Transcript.video_id == m.external_id)
-        ).scalar_one_or_none()
+        tr = None
+        if rematch:
+            tr = session.execute(
+                select(Transcript).where(Transcript.video_id == m.external_id)
+            ).scalar_one_or_none()
         if tr and tr.text and tr.segments and m.matched_keywords:
             labels = [k for k in (m.matched_keywords or []) if k in kw_by_text]
             if labels:
@@ -133,7 +140,7 @@ def run_youtube_scan(
     session = SessionLocal()
     notifier = get_notifier()
     try:
-        repair_youtube_mentions(session)
+        repair_youtube_mentions(session, rematch=False)
         if match_only:
             summary.update(
                 _match_cached(
@@ -400,7 +407,7 @@ def run_youtube_period_scan(
     notifier = get_notifier()
     label = summary["period"]
     try:
-        repair_youtube_mentions(session)
+        repair_youtube_mentions(session, rematch=False)
         keywords = _active_youtube_keywords(session, keyword_ids)
         if not keywords:
             logger.warning("period scan skipped: no keywords selected")
@@ -617,11 +624,10 @@ def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, forc
             b.transcription_status = "skipped"
         else:
             try:
-                prompt = ", ".join(k[0] for k in keywords[:20])
                 text, segments, meta = transcribe.transcribe_audio(
                     asset.path,
                     language="ur",
-                    prompt=prompt,
+                    prompt=settings.youtube_transcribe_prompt,
                 )
                 summary["cost_usd_est"] += transcribe.estimate_cost_usd(
                     float(v.duration_seconds or meta.get("duration") or 0),
@@ -789,11 +795,10 @@ def _process_period_video(
             meta = {"model": "metadata", "confidence": {}}
         else:
             try:
-                prompt = ", ".join(k[0] for k in keywords[:20])
                 text, segments, meta = transcribe.transcribe_audio(
                     asset.path,
                     language="ur",
-                    prompt=prompt,
+                    prompt=settings.youtube_transcribe_prompt,
                 )
                 summary["cost_usd_est"] += transcribe.estimate_cost_usd(
                     float(v.duration_seconds or meta.get("duration") or 0),

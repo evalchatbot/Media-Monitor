@@ -139,6 +139,11 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
   background:var(--blue-soft);color:var(--blue-deep);font-size:.72rem;font-weight:700;
   text-decoration:none;border:1px solid var(--blue-mist);margin-right:.35rem}
 .jump:hover{background:var(--blue-mist)}
+.hits{display:flex;flex-direction:column;gap:.2rem;margin-top:.3rem}
+.hitrow{display:flex;flex-wrap:wrap;align-items:center;gap:.15rem}
+.hitkw{font-size:.68rem;font-weight:700;color:var(--muted);margin-right:.3rem;
+  max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hitrow .jump{margin-top:0}
 .brand .mark{width:34px;height:34px;border-radius:11px;
   background:linear-gradient(145deg,var(--blue) 0%,var(--blue-deep) 100%);color:#fff;
   display:inline-flex;align-items:center;justify-content:center;font-size:.95rem;
@@ -1067,29 +1072,46 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
     if m.module == "youtube":
         from app.youtube.matcher import verified_json_hits
 
-        sec = None
-        if hl:
-            lang = (keyword_langs or {}).get(hl[0], "ur")
-            hits = verified_json_hits(hl[0], lang, (m.keyword_hits or {}).get(hl[0]) or [])
-            if hits:
-                sec = hits[0].get("start")
-        if sec is None:
-            sec = m.deeplink_seconds
-        if sec is not None:
-            yt_sec = int(sec)
-        watch_url = m.url or "#"
-        if yt_sec is not None and (m.external_id or "").strip():
-            watch_url = _youtube_watch_url(m, yt_sec)
-        if yt_sec is not None:
-            mm, ss = divmod(yt_sec, 60)
-            jump = (f'<a class="jump" href="{html.escape(watch_url)}" target="_blank" rel="noopener">'
-                    f'Watch at {mm}:{ss:02d}</a>')
-        occ = 0
+        # Every keyword gets its own timestamps, so a video matching two terms
+        # shows which term was said when instead of one ambiguous jump link.
+        rows: list[str] = []
         for label in hl or (m.matched_keywords or []):
             lang = (keyword_langs or {}).get(label, "ur")
-            occ += len(verified_json_hits(label, lang, (m.keyword_hits or {}).get(label) or []))
-        if occ > 1:
-            jump += f'<span class="tag">{occ} hits</span>'
+            hits = verified_json_hits(label, lang, (m.keyword_hits or {}).get(label) or [])
+            if not hits:
+                continue
+            links = []
+            for hit in hits:
+                start = hit.get("start")
+                if start is None:
+                    continue
+                s = int(start)
+                if yt_sec is None:
+                    yt_sec = s
+                mm, ss = divmod(s, 60)
+                href = (
+                    _youtube_watch_url(m, s)
+                    if (m.external_id or "").strip()
+                    else (m.url or "#")
+                )
+                links.append(
+                    f'<a class="jump" href="{html.escape(href)}" target="_blank" '
+                    f'rel="noopener">{mm}:{ss:02d}</a>'
+                )
+            if links:
+                rows.append(
+                    f'<div class="hitrow"><span class="hitkw">{html.escape(label)}</span>'
+                    f'{"".join(links)}</div>'
+                )
+
+        if rows:
+            jump = f'<div class="hits">{"".join(rows)}</div>'
+        elif m.deeplink_seconds is not None:
+            yt_sec = int(m.deeplink_seconds)
+            mm, ss = divmod(yt_sec, 60)
+            href = _youtube_watch_url(m, yt_sec) if (m.external_id or "").strip() else (m.url or "#")
+            jump = (f'<a class="jump" href="{html.escape(href)}" target="_blank" '
+                    f'rel="noopener">Watch at {mm}:{ss:02d}</a>')
     busy = " scanning" if scanning else ""
     title_href = m.url or "#"
     if m.module == "youtube" and yt_sec is not None and (m.external_id or "").strip():

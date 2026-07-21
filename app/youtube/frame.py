@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 _EMBED_GOTO_MS = 8_000
 _EMBED_SHOT_MS = 5_000
 _FFMPEG_FRAME_SEC = 25
+
+# Resolving a stream URL costs a full yt-dlp round trip. One video yields one
+# frame per matched keyword, so without this every extra keyword re-paid it.
+# Google signs these URLs for hours; 30 min is a safe reuse window.
+_STREAM_TTL_S = 1800
+_stream_cache: dict[str, tuple[float, str]] = {}
 
 
 def capture_frame(
@@ -158,6 +165,17 @@ def _capture_thumbnail(video_id: str, out_path: Path) -> bool:
 
 
 def _stream_url(video_url: str) -> str | None:
+    cached = _stream_cache.get(video_url)
+    if cached and time.monotonic() - cached[0] < _STREAM_TTL_S:
+        return cached[1]
+
+    url = _resolve_stream_url(video_url)
+    if url:
+        _stream_cache[video_url] = (time.monotonic(), url)
+    return url
+
+
+def _resolve_stream_url(video_url: str) -> str | None:
     try:
         import yt_dlp
     except ImportError:

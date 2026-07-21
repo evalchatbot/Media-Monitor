@@ -135,7 +135,12 @@ class Settings(BaseSettings):
     keyword_result_retention_days: int = 90
     # Live search / Confirm / Results UI look back this many days from "today".
     keyword_search_days: int = 30
+    # Screenshots, e-paper scans, YouTube transcripts and bulletin rows all
+    # expire on this window (or keyword_result_retention_days, whichever is
+    # longer) so a scan's transcript and its frames are never orphaned.
     retention_screenshots_days: int = 90
+    # Historical name: governs CACHED ARTICLE TEXT (ArticleCache + EPaperPage),
+    # not YouTube transcripts. Those follow retention_screenshots_days above.
     retention_transcripts_days: int = 365
     retention_logs_days: int = 730
 
@@ -145,6 +150,11 @@ class Settings(BaseSettings):
     # Default Whisper model on Groq ($0.04/audio-hour). Large V3 is accuracy fallback.
     groq_whisper_model: str = "whisper-large-v3-turbo"
     groq_whisper_fallback_model: str = "whisper-large-v3"
+    # Whisper decoder prompt. MUST NOT contain watchlist keywords: the prompt
+    # biases the decoder toward its own text, so priming it with the terms being
+    # searched makes Whisper emit them over silence and noise — the model then
+    # "finds" keywords in bulletins that never said them. Empty = no bias.
+    youtube_transcribe_prompt: str = ""
     youtube_timezone: str = "Asia/Karachi"
     # Process each bulletin this many minutes after its scheduled airtime.
     youtube_process_delay_minutes: int = 60
