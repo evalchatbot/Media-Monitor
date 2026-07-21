@@ -618,25 +618,14 @@ _JS = """
         ? !!(y.running||queueForPage)
         : !!(n.running||e.running||queueForPage);
       var queueOn=!!queueForPage;
-      var side=document.getElementById('live-state');
       var detailEl=document.getElementById('live-detail');
       var b=document.getElementById('scanbtn');
       // Stream new matches into the results grid while work is ongoing.
       await refreshResults();
-      if(running){
-        var msg='Working…';
-        if(pageModule==='youtube'){
-          msg=(y.detail||y.label||'YouTube bulletin scan')+'…';
-          if(q.current&&q.current.text)msg='Matching keywords: '+q.current.text;
-        }else if(n.running)msg='Scanning newspaper websites…';
-        else if(e.running)msg='Reading e-paper pages…';
-        else if(q.current&&q.current.text)msg='Matching: '+q.current.text;
-        if(side)side.innerHTML='<span class="dot busy"></span>'+msg.split('…')[0];
-        if(detailEl)detailEl.textContent=msg;
-        if(b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
-      }else{
-        if(detailEl)detailEl.textContent='';
-      }
+      // Scan progress stays out of the chrome: the results grid shows its own
+      // spinner, so the header does not narrate bulletin counts at the user.
+      if(detailEl)detailEl.textContent='';
+      if(running && b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
       // Keyword Confirm finished — reload so chip spinners clear even if a
       // scheduled crawl is still going in the background.
       if(wasQueue && !queueOn){location.reload();return}
@@ -873,8 +862,9 @@ def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
     else:
         scanning = bool(news["running"] or ep["running"] or news_queue_on)
         queue_on = news_queue_on
-    state = ('<span class="dot busy"></span>Working…' if scanning
-             else '<span class="dot live"></span>Live')
+    # Deliberately does not announce scanning — progress belongs in the results
+    # grid, not the header.
+    state = '<span class="dot live"></span>Live'
     if module == "youtube":
         scan_btn = (
             '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
@@ -1382,7 +1372,8 @@ def _results_section_html(
                 "<br>Add keywords above, then Confirm &amp; scan.</div>")
         more = ""
     else:
-        grid = ('<div class="empty">No matches for the 30 days through this date '
+        grid = (f'<div class="empty">No matches for the '
+                f'{settings.keyword_search_days} days through this date '
                 "and paper selection."
                 "<br>Try another date or run ▶ on a keyword.</div>")
         more = ""
@@ -1619,6 +1610,44 @@ def _youtube_keyword_ids_from_query(
         if row:
             return [int(row)]
     return []
+
+
+def _upsert_watch_keywords(db: Session, texts: list[str], language: str,
+                           module: str = "newspaper") -> list[Keyword]:
+    """Create or reactivate several watchlist keywords in one round trip.
+
+    Adding them one at a time cost a SELECT plus a COMMIT each, and against a
+    remote database that latency is the whole of the perceived delay.
+    """
+    language = language if language in ("en", "ur") else "en"
+    module = module if module in ("newspaper", "youtube") else "newspaper"
+    cleaned = [t.strip() for t in texts if (t or "").strip()]
+    if not cleaned:
+        return []
+
+    lowered = [t.lower() for t in cleaned]
+    existing = {
+        (k.text or "").lower(): k
+        for k in db.execute(
+            select(Keyword).where(
+                func.lower(Keyword.text).in_(lowered),
+                Keyword.language == language,
+                Keyword.module == module,
+            )
+        ).scalars()
+    }
+
+    out: list[Keyword] = []
+    for text in cleaned:
+        kw = existing.get(text.lower())
+        if kw is None:
+            kw = Keyword(text=text, language=language, module=module, active=True)
+            db.add(kw)
+        elif not kw.active:
+            kw.active = True
+        out.append(kw)
+    db.commit()  # one commit for the batch, not one per keyword
+    return out
 
 
 def _upsert_watch_keyword(db: Session, text: str, language: str,
@@ -2363,11 +2392,7 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
     if not ordered:
         return RedirectResponse(home, status_code=303)
 
-    created: list[Keyword] = []
-    for text in ordered:
-        kw = _upsert_watch_keyword(db, text, language, module=module)
-        if kw:
-            created.append(kw)
+    created = _upsert_watch_keywords(db, ordered, language, module=module)
 
     if not created:
         return RedirectResponse(home, status_code=303)
