@@ -20,6 +20,7 @@ class Base(DeclarativeBase):
 def _make_engine():
     url = settings.database_url
     connect_args = {}
+    engine_kwargs: dict = {"future": True}
     if url.startswith("sqlite"):
         # Ensure the SQLite file's directory exists.
         db_path = url.split("///")[-1]
@@ -27,7 +28,26 @@ def _make_engine():
         # check_same_thread: allow cross-thread use; timeout: wait on locks so a
         # scan process writing doesn't make the web process error with "locked".
         connect_args = {"check_same_thread": False, "timeout": 30}
-    engine = create_engine(url, connect_args=connect_args, future=True)
+    else:
+        # Postgres/Supabase. The web process and each scan subprocess open their
+        # own pool, and the Supabase pooler caps total clients, so keep each
+        # pool small and hand connections back quickly.
+        engine_kwargs.update(
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            # Recover connections the pooler dropped instead of erroring on the
+            # next query — the usual cause of a request hanging then failing.
+            pool_pre_ping=True,
+            pool_recycle=settings.db_pool_recycle,
+        )
+        if url.startswith("postgresql+psycopg"):
+            # Safe on the transaction pooler (port 6543): that pooler may route
+            # successive statements to different server connections, so a
+            # server-side prepared statement can vanish mid-flight. Disabling
+            # them is also harmless on the session pooler (5432).
+            connect_args["prepare_threshold"] = None
+    engine = create_engine(url, connect_args=connect_args, **engine_kwargs)
     if url.startswith("sqlite"):
         # WAL lets a reader (web) and a writer (scan process) work concurrently.
         from sqlalchemy import event

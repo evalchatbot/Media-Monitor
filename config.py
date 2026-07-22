@@ -43,6 +43,14 @@ class Settings(BaseSettings):
 
     # --- Database ---
     database_url: str = "sqlite:///./data/media_monitoring.db"
+    # Connection pool (Postgres only). The web process and every scan subprocess
+    # each open a pool, and the Supabase pooler caps total clients, so keep these
+    # small. Prefer the transaction pooler (port 6543) in DATABASE_URL for a web
+    # workload — it frees the server connection after each transaction.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    db_pool_timeout: int = 30
+    db_pool_recycle: int = 1800
 
     # --- Supabase (optional) ---
     # The app talks to Postgres directly via DATABASE_URL. These are only used if
