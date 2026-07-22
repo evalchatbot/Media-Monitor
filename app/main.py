@@ -518,16 +518,31 @@ _JS = """
   document.querySelectorAll('.kw-pick').forEach(function(btn){
     btn.addEventListener('click',function(){
       if(!q||!form)return;
-      q.value=btn.getAttribute('data-kw')||'';
+      var kw=btn.getAttribute('data-kw')||'';
+      q.value=kw;
       document.querySelectorAll('.kw-chip,.kw-pick.kw-all').forEach(function(el){
         el.classList.remove('on');
       });
       var chip=btn.closest('.kw-chip');
       if(chip)chip.classList.add('on');else btn.classList.add('on');
-      form.requestSubmit?form.requestSubmit():form.submit();
+      // Newspaper: filter the stored results in place, like the YouTube page —
+      // no full reload. Other modules keep the plain form submit.
+      if(pageModule==='newspaper'){autoShowNewspaper(kw);}
+      else{form.requestSubmit?form.requestSubmit():form.submit();}
     });
   });
   var autoShowTimer=null;
+  function autoShowNewspaper(kw){
+    // Match the clicked keyword against the data already stored and swap the
+    // results in place — no scrape, no page reload. Keeps the current date and
+    // newspaper selection by serialising the search form.
+    var p=new URLSearchParams(form?new FormData(form):location.search);
+    if(kw){p.set('q',kw);}else{p.delete('q');}
+    p.set('go','1');
+    p.set('module','newspaper');
+    history.replaceState(null,'','?'+p.toString());
+    refreshResults(true);
+  }
   function autoShowYoutube(){
     // Selecting a keyword shows its matches straight away — no Show results
     // click, and an in-place fragment swap instead of a full page reload.
@@ -1895,9 +1910,13 @@ def home(request: Request, db: Session = Depends(get_db)):
             results_scanning=results_scanning,
         )
     else:
+        # Always ship a #results container, even empty, so clicking a keyword can
+        # swap results in place instead of finding nothing to update.
         results_html = (
-            '<div class="empty">Pick a date, type a keyword if you like, choose newspapers, '
-            "then show results.</div>"
+            '<section class="results" id="results">'
+            '<div class="empty">Pick a date, type a keyword if you like, choose '
+            "newspapers, then show results — or click a keyword above to filter "
+            "what's already stored.</div></section>"
         )
 
     active_kws = db.execute(
