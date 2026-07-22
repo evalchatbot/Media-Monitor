@@ -147,6 +147,13 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
 .hitkw{font-size:.68rem;font-weight:700;color:var(--muted);margin-right:.3rem;
   max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hitrow .jump{margin-top:0}
+.more-wrap{display:flex;align-items:center;gap:.8rem;justify-content:center;margin:1.1rem 0 .3rem}
+.more-btn{padding:.5rem 1.4rem;border-radius:999px;border:1px solid var(--blue-mist);
+  background:var(--blue-soft);color:var(--blue-deep);font-weight:700;font-size:.82rem;cursor:pointer}
+.more-btn:hover{background:var(--blue-mist)}
+.more-btn:disabled{opacity:.6;cursor:default}
+.more-count{font-size:.75rem;color:var(--muted)}
+#results{transition:opacity .12s ease}
 .brand .mark{width:34px;height:34px;border-radius:11px;
   background:linear-gradient(145deg,var(--blue) 0%,var(--blue-deep) 100%);color:#fff;
   display:inline-flex;align-items:center;justify-content:center;font-size:.95rem;
@@ -490,6 +497,26 @@ _JS = """
       form.requestSubmit?form.requestSubmit():form.submit();
     });
   });
+  var autoShowTimer=null;
+  function autoShowYoutube(){
+    // Selecting a keyword shows its matches straight away — no Show results
+    // click, and an in-place fragment swap instead of a full page reload.
+    clearTimeout(autoShowTimer);
+    autoShowTimer=setTimeout(function(){
+      var ids=[];
+      document.querySelectorAll('.kw-chip.sel[data-kw-id]').forEach(function(c){
+        var id=c.getAttribute('data-kw-id'); if(id)ids.push(id);
+      });
+      var p=new URLSearchParams(location.search);
+      p.delete('kw_id'); p.delete('ymax');  // new selection resets pagination
+      ids.forEach(function(id){p.append('kw_id',id)});
+      p.set('module','youtube');
+      if(ids.length){p.set('filter','1');p.set('go','1');}
+      else{p.delete('filter');}
+      history.replaceState(null,'','?'+p.toString());
+      refreshResults(true);
+    },200);  // debounce so selecting several fires one query
+  }
   if(pageModule==='youtube'){
     document.querySelectorAll('.kw-toggle').forEach(function(btn){
       btn.addEventListener('click',function(e){
@@ -497,15 +524,18 @@ _JS = """
         var chip=btn.closest('.kw-chip');
         if(!chip)return;
         chip.classList.toggle('sel');
+        autoShowYoutube();
       });
     });
     var selAll=document.getElementById('kw-sel-all');
     var selNone=document.getElementById('kw-sel-none');
     if(selAll)selAll.addEventListener('click',function(){
       document.querySelectorAll('.kw-chip[data-kw-id]').forEach(function(c){c.classList.add('sel')});
+      if(pageModule==='youtube')autoShowYoutube();
     });
     if(selNone)selNone.addEventListener('click',function(){
       document.querySelectorAll('.kw-chip[data-kw-id]').forEach(function(c){c.classList.remove('sel')});
+      if(pageModule==='youtube')autoShowYoutube();
     });
     var ytForm=document.getElementById('yt-search');
     function syncPeriodHidden(){
@@ -585,60 +615,79 @@ _JS = """
   var lastResultsSig=(document.getElementById('results')||{}).getAttribute
     ? (document.getElementById('results').getAttribute('data-sig')||'')
     : '';
-  async function refreshResults(){
+  async function refreshResults(force){
     var el=document.getElementById('results');
     if(!el)return;
     var params=new URLSearchParams(location.search);
-    if(!params.has('go')&&!(params.get('q')||'').trim()&&!params.get('start'))return;
+    if(!force && !params.has('go')&&!(params.get('q')||'').trim()&&!params.get('start'))return;
     params.set('module', pageModule);
+    if(force)el.style.opacity='0.45';  // instant feedback on click
     try{
       var r=await fetch('/ui/results?'+params.toString(),{headers:{'Accept':'text/html'}});
-      if(!r.ok)return;
+      if(!r.ok){el.style.opacity='';return;}
       var sig=r.headers.get('X-Results-Sig')||'';
       var html=await r.text();
-      if(sig && sig===lastResultsSig)return;
+      if(!force && sig && sig===lastResultsSig){el.style.opacity='';return;}
       lastResultsSig=sig||lastResultsSig;
       var wrap=document.createElement('div');
       wrap.innerHTML=html.trim();
       var next=wrap.firstElementChild;
       if(next)el.replaceWith(next);
     }catch(err){}
+    var back=document.getElementById('results');
+    if(back)back.style.opacity='';
   }
+  var IDLE_MS=6000, BUSY_MS=1500, pollTimer=null;
   async function poll(){
+    var running=false, queueOn=false;
     try{
-      var n=await fetch('/api/scan/status').then(function(r){return r.json()});
-      var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
-      var y=await fetch('/api/scan/youtube/status').then(function(r){return r.json()}).catch(function(){return {}});
+      // Only the status feeds this page cares about — the other module's poll
+      // was pure waste. These read a progress file, not the database.
       var q=await fetch('/api/scan/queue').then(function(r){return r.json()});
       var queueItems=[].concat(q.batch||[], q.pending||[]);
-      var queueForPage=queueItems.some(function(x){
+      queueOn=queueItems.some(function(x){
         var m=(x&&x.module)||'newspaper';
         return pageModule==='youtube'?m==='youtube':m!=='youtube';
       });
-      // Keep modules isolated: YouTube page only tracks YT work; Newspaper
-      // ignores the YouTube scanner.
-      var running=pageModule==='youtube'
-        ? !!(y.running||queueForPage)
-        : !!(n.running||e.running||queueForPage);
-      var queueOn=!!queueForPage;
-      var detailEl=document.getElementById('live-detail');
+      if(pageModule==='youtube'){
+        var y=await fetch('/api/scan/youtube/status').then(function(r){return r.json()}).catch(function(){return {}});
+        running=!!(y.running||queueOn);
+      }else{
+        var n=await fetch('/api/scan/status').then(function(r){return r.json()});
+        var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
+        running=!!(n.running||e.running||queueOn);
+      }
       var b=document.getElementById('scanbtn');
-      // Stream new matches into the results grid while work is ongoing.
-      await refreshResults();
-      // Scan progress stays out of the chrome: the results grid shows its own
-      // spinner, so the header does not narrate bulletin counts at the user.
-      if(detailEl)detailEl.textContent='';
       if(running && b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
-      // Keyword Confirm finished — reload so chip spinners clear even if a
-      // scheduled crawl is still going in the background.
+      // Only re-query results while something is producing them; the idle case
+      // was re-running the full results query every tick for no change.
+      if(running) await refreshResults();
       if(wasQueue && !queueOn){location.reload();return}
       if(!running && wasScanning){location.reload();return}
       wasScanning=running;
       wasQueue=queueOn;
     }catch(err){}
+    finally{
+      // Fast heartbeat while working, slow one when idle — cuts steady-state
+      // background requests roughly fourfold.
+      pollTimer=setTimeout(poll, running?BUSY_MS:IDLE_MS);
+    }
   }
-  setInterval(poll,1500);
+  pollTimer=setTimeout(poll, BUSY_MS);
   if(document.getElementById('results'))setTimeout(refreshResults,400);
+  // "Show more" lives inside the results fragment, which is swapped out on each
+  // refresh, so bind it by delegation on the document rather than directly.
+  document.addEventListener('click',function(ev){
+    var more=ev.target.closest?ev.target.closest('#yt-more'):null;
+    if(!more)return;
+    var next=more.getAttribute('data-next');
+    var p=new URLSearchParams(location.search);
+    if(next)p.set('ymax',next);
+    p.set('module',pageModule);
+    history.replaceState(null,'','?'+p.toString());
+    more.disabled=true;more.textContent='Loading…';
+    refreshResults(true);
+  });
 
   /* Draft multiple keywords, then Confirm & scan (FIFO) */
   (function(){
@@ -2169,6 +2218,7 @@ def _youtube_results_html(
     filter_only: bool = False,
     selected_kw_labels: list[str] | None = None,
     results_scanning: bool,
+    max_results: int | None = None,
 ) -> tuple[str, str]:
     active_fold = _active_keyword_fold(db, module="youtube")
     today = datetime.now(_PKT).date()
@@ -2236,15 +2286,13 @@ def _youtube_results_html(
             mentions, keyword_langs, active_fold, allowed_fold,
         )
 
-    if allowed_labels:
-        show_limit = settings.keyword_result_limit * max(len(allowed_labels), 1)
-    elif keyword:
-        show_limit = settings.keyword_result_limit
-    else:
-        show_limit = min(200, settings.keyword_result_limit * max(len(active_fold), 1))
+    page = max(1, settings.keyword_result_limit)
+    # max_results paginates: each "Show more" click asks for one more page.
+    show_limit = max_results if max_results and max_results > 0 else page
 
     mentions.sort(key=result_policy.effective_time, reverse=True)
     mentions = _dedupe_youtube_mentions(mentions)
+    total = len(mentions)
     shown = mentions[:show_limit]
     spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
 
@@ -2288,8 +2336,19 @@ def _youtube_results_html(
                 keyword_langs=keyword_langs,
             ))
         grid = f'<div class="grid">{"".join(cards)}</div>'
-        more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
-                f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
+        if total > len(shown):
+            remaining = total - len(shown)
+            step = min(page, remaining)
+            more = (
+                '<div class="more-wrap">'
+                f'<button type="button" class="more-btn" id="yt-more" '
+                f'data-next="{len(shown) + step}">Show next {step}</button>'
+                f'<span class="more-count">Showing {len(shown)} of {total}</span>'
+                "</div>"
+            )
+        else:
+            more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
+                    f"{total}.</p>" if total > page else "")
     elif results_scanning:
         grid = '<div class="empty loading"><span class="spin"></span></div>'
         more = ""
@@ -2322,7 +2381,9 @@ def _youtube_results_html(
 
     max_id = max((m.id for m in shown), default=0)
     shots = sum(1 for m in shown if m.screenshot_path)
-    sig = f"yt:{len(mentions)}:{max_id}:{shots}:{int(results_scanning)}"
+    # len(shown) is in the signature so paginating (same total, more shown)
+    # counts as a change and the fragment actually swaps in.
+    sig = f"yt:{len(mentions)}:{len(shown)}:{max_id}:{shots}:{int(results_scanning)}"
     html_out = f"""
         <section class="results" id="results" data-sig="{html.escape(sig)}">
           <div class="results-head">
@@ -2394,6 +2455,7 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
             filter_only=filter_only,
             selected_kw_labels=sel_labels or None,
             results_scanning=results_scanning,
+            max_results=int(qp.get("ymax")) if str(qp.get("ymax") or "").isdigit() else None,
         )
         return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
 
