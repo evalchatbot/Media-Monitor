@@ -26,7 +26,6 @@ _lock = threading.Lock()
 _queue: list[dict] = []  # {id, text, module, enqueued_at}
 _current_batch: list[dict] = []
 _worker: threading.Thread | None = None
-_BACKFILL_WAIT_S = 8 * 60  # never leave the UI spinning forever
 
 
 def _load() -> None:
@@ -162,19 +161,6 @@ def is_keyword_busy(keyword_id: int | None = None, text: str | None = None) -> b
     return False
 
 
-def _wait_backfill_idle(timeout_s: float = _BACKFILL_WAIT_S) -> None:
-    from app.newspaper import scan_manager
-
-    deadline = time.time() + timeout_s
-    time.sleep(0.8)
-    while scan_manager.is_running():
-        if time.time() >= deadline:
-            logger.warning("keyword queue: screenshot backfill still running after %ss — releasing UI",
-                           int(timeout_s))
-            return
-        time.sleep(1.5)
-
-
 def _run_batch(batch: list[dict]) -> None:
     from app.newspaper import scan_manager
     from app.newspaper.pipeline import run_quick_match
@@ -202,6 +188,8 @@ def _run_batch(batch: list[dict]) -> None:
         return
 
     # 1) Exact match on stored articles + e-paper pages (clips created here).
+    #    This is the instant search — text results and e-paper cutouts appear as
+    #    soon as it commits, which is what the user is waiting on.
     try:
         summary = run_quick_match(keyword_ids=news_ids)
         logger.info("keyword queue: quick match done %s", summary)
@@ -209,21 +197,31 @@ def _run_batch(batch: list[dict]) -> None:
         logger.exception("keyword queue: quick match failed for %s", news_ids)
         return
 
-    # 2) Screenshot ONLY the web hits that still need one (no full crawl).
-    started = scan_manager.start_scan(
-        keyword_ids=news_ids, keyword_label=label, capped=True, backfill_only=True,
-    )
-    if started:
-        _wait_backfill_idle()
-    else:
-        # Another scan owns the browser — try once more after a short wait.
-        time.sleep(3)
-        if scan_manager.start_scan(
-            keyword_ids=news_ids, keyword_label=label, capped=True, backfill_only=True,
-        ):
-            _wait_backfill_idle()
-
+    # 2) Screenshot the new web hits in the BACKGROUND. The keyword worker does
+    #    not wait for it: capturing pages needs the browser and can take minutes,
+    #    and blocking here held the next keyword's instant match hostage. The
+    #    screenshots stream in on their own; the text results are already shown.
+    _spawn_screenshot_backfill(news_ids, label)
     logger.info("keyword queue: fast batch finished (%s)", label)
+
+
+def _spawn_screenshot_backfill(news_ids: list[int], label: str) -> None:
+    """Fire the screenshot backfill without blocking, retrying if the browser is
+    busy so a rapid burst of keyword adds doesn't lose anyone's screenshots."""
+    def _run() -> None:
+        from app.newspaper import scan_manager
+
+        for attempt in range(20):  # ~1 min of retries, then give up quietly
+            if scan_manager.start_scan(
+                keyword_ids=news_ids, keyword_label=label,
+                capped=True, backfill_only=True,
+            ):
+                return
+            time.sleep(3)
+        logger.info("keyword queue: screenshot backfill deferred for %s "
+                    "(browser busy) — the scheduled scan will catch it", label)
+
+    threading.Thread(target=_run, name="kw-screenshot-backfill", daemon=True).start()
 
 
 def _worker_loop() -> None:
