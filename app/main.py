@@ -730,12 +730,13 @@ _JS = """
   if(document.getElementById('results'))setTimeout(refreshResults,400);
   // "Show more" lives inside the results fragment, which is swapped out on each
   // refresh, so bind it by delegation on the document rather than directly.
+  // #yt-more paginates YouTube (ymax); #news-more paginates newspaper (nmax).
   document.addEventListener('click',function(ev){
-    var more=ev.target.closest?ev.target.closest('#yt-more'):null;
+    var more=ev.target.closest?ev.target.closest('.more-btn'):null;
     if(!more)return;
     var next=more.getAttribute('data-next');
     var p=new URLSearchParams(location.search);
-    if(next)p.set('ymax',next);
+    if(next)p.set(more.id==='news-more'?'nmax':'ymax', next);
     p.set('module',pageModule);
     history.replaceState(null,'','?'+p.toString());
     more.disabled=true;more.textContent='Loading…';
@@ -1401,6 +1402,7 @@ def _results_section_html(
     keyword: str,
     selected_set: set[str],
     results_scanning: bool,
+    max_results: int | None = None,
 ) -> tuple[str, str]:
     """Build the Results panel HTML and a cheap change-detection signature."""
     active_fold = _active_keyword_fold(db, module="newspaper")
@@ -1446,15 +1448,15 @@ def _results_section_html(
                 m for m in mentions
                 if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
             ]
-        show_limit = settings.keyword_result_limit
     else:
         mentions = [m for m in mentions if _live_matched(m, active_fold)]
-        show_limit = min(
-            200,
-            settings.keyword_result_limit * max(len(active_fold), 1),
-        )
+
+    page = max(1, settings.keyword_result_limit)
+    # max_results paginates: each "Show more" click asks for one more page.
+    show_limit = max_results if max_results and max_results > 0 else page
 
     mentions.sort(key=result_policy.effective_time, reverse=True)
+    total = len(mentions)
     shown = mentions[:show_limit]
     spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
     if shown:
@@ -1468,8 +1470,19 @@ def _results_section_html(
             cards.append(_detection_card(
                 m, highlight_keywords=hl, scanning=results_scanning))
         grid = f'<div class="grid">{"".join(cards)}</div>'
-        more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
-                f"{len(mentions)}.</p>" if len(mentions) > len(shown) else "")
+        if total > len(shown):
+            remaining = total - len(shown)
+            step = min(page, remaining)
+            more = (
+                '<div class="more-wrap">'
+                f'<button type="button" class="more-btn" id="news-more" '
+                f'data-next="{len(shown) + step}">Show next {step}</button>'
+                f'<span class="more-count">Showing {len(shown)} of {total}</span>'
+                "</div>"
+            )
+        else:
+            more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
+                    f"{total}.</p>" if total > page else "")
     elif results_scanning:
         grid = '<div class="empty loading"><span class="spin"></span></div>'
         more = ""
@@ -1486,7 +1499,9 @@ def _results_section_html(
 
     max_id = max((m.id for m in shown), default=0)
     shots = sum(1 for m in shown if m.screenshot_path)
-    sig = f"{len(mentions)}:{max_id}:{shots}:{int(results_scanning)}"
+    # len(shown) in the signature so paginating (more shown, same total) counts
+    # as a change and the fragment actually swaps in.
+    sig = f"{total}:{len(shown)}:{max_id}:{shots}:{int(results_scanning)}"
     html_out = f"""
         <section class="results" id="results" data-sig="{html.escape(sig)}">
           <div class="results-head">
@@ -2532,6 +2547,7 @@ def ui_results_partial(request: Request, db: Session = Depends(get_db)):
         keyword=keyword,
         selected_set=selected_set,
         results_scanning=results_scanning,
+        max_results=int(qp.get("nmax")) if str(qp.get("nmax") or "").isdigit() else None,
     )
     return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
 

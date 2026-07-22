@@ -74,16 +74,18 @@ def all_full(counts: dict[str, int]) -> bool:
 
 
 def enforce_limits(session, *, delete_expired: bool = True) -> dict[str, int]:
-    """Keep only the newest N results per keyword and optionally delete expiry.
+    """Keep only the newest N results per keyword PER MODULE, plus time expiry.
 
-    Keyword labels are independent: trimming one label from a shared result does
-    not remove another keyword's retained result.
+    The count is tracked per (keyword, module) so a keyword's newspaper results
+    and its e-paper results each keep their own N. Sharing one count let a flood
+    of recent web articles trim away every print-edition hit for the same word
+    (e.g. کشمیر showed 25 articles and zero e-paper pages though it was on 21).
     """
     rows = session.execute(select(Mention)).scalars().all()
     before_paths = {path for row in rows for path in _media_paths(row)}
     rows.sort(key=effective_time, reverse=True)
     threshold = cutoff()
-    kept: dict[str, int] = {}
+    kept: dict[tuple[str, str], int] = {}
     trimmed = expired = deleted = 0
     deleted_ids: set[int] = set()
 
@@ -94,17 +96,20 @@ def enforce_limits(session, *, delete_expired: bool = True) -> dict[str, int]:
             expired += 1
             continue
 
+        # Web (newspaper) and print (epaper) each get their own quota.
+        module = (mention.module or "newspaper")
         labels: list[str] = []
         removed: set[str] = set()
         for label in mention.matched_keywords or []:
             folded = (label or "").casefold()
             if not folded:
                 continue
-            if kept.get(folded, 0) >= settings.keyword_result_limit:
+            key = (folded, module)
+            if kept.get(key, 0) >= settings.keyword_result_limit:
                 removed.add(folded)
                 trimmed += 1
                 continue
-            kept[folded] = kept.get(folded, 0) + 1
+            kept[key] = kept.get(key, 0) + 1
             labels.append(label)
 
         if removed:
