@@ -774,55 +774,26 @@ _JS = """
     refreshResults(true);
   });
 
-  /* Draft multiple keywords, then Confirm & scan (FIFO) */
+  /* One "Add" button: type a keyword (or a comma list), Add — it's saved and
+     matched against stored data straight away. */
   (function(){
-    var pending=[], box=document.getElementById('kw-pending'),
+    var input=document.getElementById('kw-draft-text'),
+        lang=document.getElementById('kw-draft-lang'),
+        form=document.getElementById('kw-confirm'),
         texts=document.getElementById('kw-pending-texts'),
         langH=document.getElementById('kw-pending-lang'),
-        confirm=document.getElementById('kw-confirm'),
-        input=document.getElementById('kw-draft-text'),
-        lang=document.getElementById('kw-draft-lang'),
-        addBtn=document.getElementById('kw-draft-add'),
-        clearBtn=document.getElementById('kw-draft-clear');
-    function sync(){
-      if(!box||!texts||!confirm)return;
-      box.innerHTML=pending.map(function(t,i){
-        return '<span class="kw-draft">'+t.replace(/[<>&]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;'}[c];})
-          +'<button type="button" data-i="'+i+'" title="Remove" aria-label="Remove">×</button></span>';
-      }).join('');
-      texts.value=pending.join('\\n');
-      if(langH&&lang)langH.value=lang.value||'en';
-      confirm.classList.toggle('show', pending.length>0);
-    }
-    function addOne(){
-      if(!input)return;
+        addBtn=document.getElementById('kw-add-btn');
+    function submitAdd(){
+      if(!input||!form||!texts)return;
       var raw=(input.value||'').trim();
       if(!raw)return;
-      raw.split(/[,\\n]+/).forEach(function(part){
-        var t=part.trim();
-        if(!t)return;
-        var fold=t.toLowerCase();
-        if(pending.some(function(p){return p.toLowerCase()===fold}))return;
-        pending.push(t);
-      });
-      input.value='';
-      sync();
-      input.focus();
-    }
-    if(addBtn)addBtn.addEventListener('click',addOne);
-    if(input)input.addEventListener('keydown',function(e){
-      if(e.key==='Enter'){e.preventDefault();addOne()}
-    });
-    if(box)box.addEventListener('click',function(e){
-      var btn=e.target.closest('button[data-i]');
-      if(!btn)return;
-      pending.splice(parseInt(btn.getAttribute('data-i'),10),1);
-      sync();
-    });
-    if(clearBtn)clearBtn.addEventListener('click',function(){pending=[];sync()});
-    if(confirm)confirm.addEventListener('submit',function(){
+      texts.value=raw;                       // endpoint splits on comma/newline
       if(langH&&lang)langH.value=lang.value||'en';
-      texts.value=pending.join('\\n');
+      form.requestSubmit?form.requestSubmit():form.submit();
+    }
+    if(addBtn)addBtn.addEventListener('click',submitAdd);
+    if(input)input.addEventListener('keydown',function(e){
+      if(e.key==='Enter'){e.preventDefault();submitAdd();}
     });
   })();
 
@@ -2028,17 +1999,14 @@ def home(request: Request, db: Session = Depends(get_db)):
         <div class="kw-add" id="kw-draft-row">
           <input id="kw-draft-text" type="text" placeholder="Type a keyword, then Add" maxlength="120">
           <select id="kw-draft-lang"><option value="en">EN</option><option value="ur">UR</option></select>
-          <button type="button" id="kw-draft-add">+ Add</button>
+          <button type="button" id="kw-add-btn">Add</button>
         </div>
-        <div class="kw-pending" id="kw-pending" aria-live="polite"></div>
-        <form class="kw-confirm" id="kw-confirm" method="post" action="/ui/keywords/batch">
+        <form id="kw-confirm" method="post" action="/ui/keywords/batch" style="display:none">
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
-          <button type="submit" name="scan" value="0" class="ghost">Add only</button>
-          <button type="submit" name="scan" value="1">Add &amp; scan</button>
-          <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
+          <input type="hidden" name="scan" value="1">
         </form>
-        <p class="hint" style="margin-top:.45rem">Add several keywords first — Add only saves to the watchlist; Add &amp; scan runs them one by one.</p>
+        <p class="hint" style="margin-top:.45rem">Adds the keyword and matches it against everything already stored.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to filter · ▶ scan · × hide</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
@@ -2223,16 +2191,13 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <div class="kw-add" id="kw-draft-row">
           <input id="kw-draft-text" type="text" placeholder="Type a keyword, then Add" maxlength="120">
           <select id="kw-draft-lang"><option value="en">EN</option><option value="ur">UR</option></select>
-          <button type="button" id="kw-draft-add">+ Add</button>
+          <button type="button" id="kw-add-btn">Add</button>
         </div>
-        <div class="kw-pending" id="kw-pending" aria-live="polite"></div>
-        <form class="kw-confirm" id="kw-confirm" method="post" action="/ui/keywords/batch">
+        <form id="kw-confirm" method="post" action="/ui/keywords/batch" style="display:none">
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="module" value="youtube">
           <input type="hidden" name="scan" value="1">
-          <button type="submit">Add to watchlist</button>
-          <button type="button" class="ghost" id="kw-draft-clear">Clear list</button>
         </form>
         <p class="hint" style="margin-top:.45rem">Adding searches transcripts already stored — no rescan needed.
         Click keywords to select (✓), then open <b>Custom scan</b> or <b>Show results</b>.</p>
