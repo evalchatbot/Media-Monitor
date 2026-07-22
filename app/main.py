@@ -527,21 +527,29 @@ _JS = """
       if(chip)chip.classList.add('on');else btn.classList.add('on');
       // Newspaper: filter the stored results in place, like the YouTube page —
       // no full reload. Other modules keep the plain form submit.
-      if(pageModule==='newspaper'){autoShowNewspaper(kw);}
+      if(pageModule==='newspaper'){autoShowNewspaper(kw, btn.getAttribute('data-kw-id'));}
       else{form.requestSubmit?form.requestSubmit():form.submit();}
     });
   });
   var autoShowTimer=null;
-  function autoShowNewspaper(kw){
-    // Match the clicked keyword against the data already stored and swap the
-    // results in place — no scrape, no page reload. Keeps the current date and
-    // newspaper selection by serialising the search form.
+  function autoShowNewspaper(kw, kwId){
+    // Filter the results to this keyword in place — no page reload. Keep the
+    // current date and newspaper selection by serialising the search form.
     var p=new URLSearchParams(form?new FormData(form):location.search);
     if(kw){p.set('q',kw);}else{p.delete('q');}
     p.set('go','1');
     p.set('module','newspaper');
     history.replaceState(null,'','?'+p.toString());
-    refreshResults(true);
+    refreshResults(true);  // show whatever is already matched, at once
+    // Then match this keyword against the stored article + e-paper text, so
+    // results appear even for a keyword that was never scanned (e.g. it exists
+    // in 110 articles but had no mentions yet). The poll loop streams the new
+    // hits in; kick it now so it doesn't wait out the idle interval.
+    if(kwId){
+      fetch('/api/keywords/'+encodeURIComponent(kwId)+'/match',{method:'POST'})
+        .then(function(){ clearTimeout(pollTimer); pollTimer=setTimeout(poll,700); })
+        .catch(function(){});
+    }
   }
   function autoShowYoutube(){
     // Selecting a keyword shows its matches straight away — no Show results
@@ -1943,7 +1951,7 @@ def home(request: Request, db: Session = Depends(get_db)):
         )
         return (
             f'<span class="kw-chip{on}{busy}">'
-            f'<button type="button" class="kw-pick" '
+            f'<button type="button" class="kw-pick" data-kw-id="{k.id}" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'{play}'
             f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
@@ -2645,6 +2653,19 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
         "date": datetime.now(_PKT).date().isoformat(),
     })
     return RedirectResponse(f"{home}?{q}", status_code=303)
+
+
+@app.post("/api/keywords/{kid}/match")
+def api_match_keyword(kid: int, db: Session = Depends(get_db)):
+    """Match one keyword against already-stored article + e-paper text and return
+    at once. Fired when a newspaper keyword is clicked so results reflect the
+    stored data even for a keyword that was never scanned. No redirect — the
+    page refreshes the results fragment itself."""
+    kw = db.get(Keyword, kid)
+    if not kw or (kw.module or "newspaper") == "youtube":
+        raise HTTPException(404, "keyword not found")
+    _start_keyword_scan(kw)
+    return {"started": True, "keyword": kw.text}
 
 
 @app.post("/ui/keywords/{kid}/scan")
