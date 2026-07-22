@@ -434,6 +434,37 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #lbhint{position:fixed;bottom:.75rem;left:50%;transform:translateX(-50%);z-index:102;color:#ccc;
   font-size:.74rem;font-weight:600;background:rgba(0,0,0,.5);padding:.28rem .8rem;border-radius:999px;pointer-events:none}
 @media (max-width:700px){#lbhint{display:none}.top-inner{border-radius:18px}.live{display:none}}
+
+/* --- Mobile / small screens --- */
+@media (max-width:760px){
+  .wrap,.top-inner{max-width:100%}
+  .top{padding:.5rem .55rem .3rem}
+  .top-inner{gap:.4rem;padding:.4rem .5rem;flex-wrap:wrap}
+  .spacer{display:none}
+  .brand small{display:none}
+  .live-wrap{display:none}
+  #scanbtn{margin-left:auto}
+  .page{padding:1rem .7rem 2.4rem}
+  .panel{padding:1.05rem .85rem}
+  .hero{margin:.3rem 0 1rem}
+  .grid{grid-template-columns:1fr;gap:.85rem}
+  .papers{grid-template-columns:1fr 1fr}
+  .yt-status{grid-template-columns:1fr 1fr}
+  #yt-period-modal .period-grid{grid-template-columns:1fr}
+  .field input[type=date],.field input[type=text]{max-width:100%}
+  .live-detail{display:none}
+  /* wide content must scroll inside itself, never the page body */
+  .grid,.papers,.kw-tags{max-width:100%}
+  img{max-width:100%}
+}
+@media (max-width:430px){
+  .mod-nav a{padding:.3rem .58rem;font-size:.75rem}
+  .papers{grid-template-columns:1fr}
+  .hero h1{font-size:1.5rem}
+  .hero p{font-size:.88rem}
+  .det .body{padding:.8rem .85rem}
+  .brand .mark{width:30px;height:30px}
+}
 """
 
 _FONTS = (
