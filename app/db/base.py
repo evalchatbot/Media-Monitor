@@ -5,12 +5,15 @@ switching is a `DATABASE_URL` change plus an Alembic migration.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -74,9 +77,37 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite(models)
     _ensure_columns()
+    _ensure_text_search_index()
     from app.youtube.seed import ensure_seed_channels
 
     ensure_seed_channels()
+
+
+def _ensure_text_search_index() -> None:
+    """Trigram indexes so the per-keyword instant search over cached article
+    text is sub-second instead of a full sequential scan. Postgres only; the
+    expression matches app.newspaper.pipeline._articles_containing exactly, so
+    the planner can actually use it. Best-effort: never block startup on it."""
+    if engine.dialect.name != "postgresql":
+        return
+    from app.core.keywords import _UR_CHAR_MAP
+
+    ur_from = "".join(_UR_CHAR_MAP.keys())
+    ur_to = "".join(_UR_CHAR_MAP.values())
+    stmts = [
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        f"CREATE INDEX IF NOT EXISTS ix_article_body_trgm ON article_cache "
+        f"USING gin (translate(lower(body), '{ur_from}', '{ur_to}') gin_trgm_ops)",
+        f"CREATE INDEX IF NOT EXISTS ix_article_title_trgm ON article_cache "
+        f"USING gin (translate(lower(title), '{ur_from}', '{ur_to}') gin_trgm_ops)",
+    ]
+    for sql in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(sql)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("text-search index step skipped: %s", exc)
+            return
 
 
 def _ensure_columns() -> None:

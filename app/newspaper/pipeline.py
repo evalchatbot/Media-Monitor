@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from config import settings
@@ -151,6 +151,95 @@ def _load_corpus(session) -> list:
     return rows
 
 
+def _articles_containing(session, keywords: list[tuple[str, str]]) -> list | None:
+    """Candidate articles fetched with a server-side containment test.
+
+    Loading all ~10k bodies from a remote Postgres to grep them in Python costs
+    ~18s and grows with the archive. This pushes a cheap LIKE per keyword into
+    SQL so only articles that could match come back — the whole point of the
+    per-keyword instant search being fast.
+
+    Tests a single token per keyword, never the whole phrase (a phrase may be
+    split by a newline that LIKE won't cross). False positives are fine — the
+    exact matcher still runs on whatever returns. Returns None when it cannot
+    narrow safely (non-Postgres, or a too-generic keyword), so the caller uses
+    the full corpus instead.
+    """
+    from app.core.keywords import _UR_CHAR_MAP, normalize
+
+    try:
+        if session.get_bind().dialect.name != "postgresql":
+            return None
+    except Exception:
+        return None
+
+    from sqlalchemy import func as _f
+    from sqlalchemy import literal_column
+
+    # The Arabic->Urdu fold, as SQL LITERALS so the expression matches the
+    # functional trigram index exactly — with bound params the planner cannot
+    # use the index and the query falls back to a full sequential scan.
+    ur_from = literal_column("'" + "".join(_UR_CHAR_MAP.keys()) + "'")
+    ur_to = literal_column("'" + "".join(_UR_CHAR_MAP.values()) + "'")
+
+    def _folded(col):
+        # Always fold, even for English: English text has none of these code
+        # points so it is a no-op, and one index then serves both languages.
+        return _f.translate(_f.lower(col), ur_from, ur_to)
+
+    # One keyword contributes an AND over ALL its tokens (each token in the body
+    # or the title). Requiring every word is far more selective than the single
+    # longest word — "child abuse" then returns the handful of articles with
+    # both words, not the thousands with "child" — which keeps the trigram
+    # bitmap scan small and correct. Keywords OR together.
+    per_keyword = []
+    for kw_text, lang in keywords:
+        toks = [t for t in normalize(kw_text, lang).split() if len(t) >= 2]
+        if not toks:
+            return None  # too generic to narrow safely — use the full corpus
+        # Prefer tokens of 4+ chars: a 3-char token is a single trigram matched
+        # by a huge slice of the index ("خان" alone is enormous), which is slow
+        # and barely selective. Keep the longest token as a floor so a keyword
+        # made only of short words still narrows something.
+        strong = [t for t in toks if len(t) >= 4] or [max(toks, key=len)]
+        token_clauses = [
+            or_(_folded(ArticleCache.body).like(f"%{t}%"),
+                _folded(ArticleCache.title).like(f"%{t}%"))
+            for t in strong
+        ]
+        per_keyword.append(and_(*token_clauses))
+    if not per_keyword:
+        return None
+
+    where = (
+        ArticleCache.module == "newspaper",
+        ArticleCache.fetched_at >= result_policy.search_cutoff(),
+        or_(*per_keyword),
+    )
+    # Two steps so the slow part — pulling article BODIES across the Pacific —
+    # is bounded. Step 1 selects only id + date (no ORDER BY, so the trigram
+    # bitmap index is used); rows are tiny. Step 2 fetches full bodies for just
+    # the newest few hundred. Ordering last in SQL or a body-carrying LIMIT both
+    # defeated the index and dragged the query to seconds.
+    id_rows = session.execute(
+        select(ArticleCache.external_id, ArticleCache.fetched_at).where(*where)
+    ).all()
+    if not id_rows:
+        return []
+    id_rows.sort(key=lambda r: r.fetched_at or datetime.min, reverse=True)
+    cap = max(300, settings.keyword_result_limit * 12 * max(len(keywords), 1))
+    wanted = [r.external_id for r in id_rows[:cap]]
+
+    rows = session.execute(
+        select(ArticleCache.external_id, ArticleCache.source, ArticleCache.section,
+               ArticleCache.title, ArticleCache.url, ArticleCache.body,
+               ArticleCache.fetched_at)
+        .where(ArticleCache.module == "newspaper", ArticleCache.external_id.in_(wanted))
+    ).all()
+    rows.sort(key=lambda r: r.fetched_at or datetime.min, reverse=True)
+    return rows
+
+
 def warm_quick_corpus() -> None:
     """Pre-load the corpus (called in a background thread at app startup so the
     first ⚡ Quick Scan is as fast as every later one). DB-only; thread-safe."""
@@ -184,7 +273,14 @@ def run_quick_match(keyword_ids: list[int] | None = None, _retry: bool = True) -
         # 25 older results; enforce_limits() then keeps the newest 25 globally.
         counts = {(k[0] or "").casefold(): 0 for k in keywords}
 
-        articles = _load_corpus(session)
+        # Targeted add (specific keyword_ids): pull only articles that could
+        # contain the term, straight from Postgres. Falls back to the full
+        # in-process corpus for a broad all-keywords sweep or on SQLite.
+        articles = None
+        if keyword_ids:
+            articles = _articles_containing(session, keywords)
+        if articles is None:
+            articles = _load_corpus(session)
         existing = {
             m.external_id: m
             for m in session.execute(
