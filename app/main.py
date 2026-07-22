@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
-from config import settings
+from config import BASE_DIR, settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, YouTubeChannel
 from app.core import keyword_scan_queue, result_policy
@@ -47,6 +47,35 @@ logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s 
 logger = logging.getLogger(__name__)
 
 _PKT = timezone(timedelta(hours=5))
+
+
+def _build_version() -> str:
+    """Short id of the running code, to tell what a host actually deployed.
+
+    Railway sets RAILWAY_GIT_COMMIT_SHA to the deployed commit; fall back to the
+    local git HEAD in dev. "unknown" if neither is available.
+    """
+    import os
+
+    sha = (
+        os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+        or os.environ.get("GIT_COMMIT")
+        or ""
+    ).strip()
+    if not sha:
+        try:
+            import subprocess
+
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=str(BASE_DIR),
+                stderr=subprocess.DEVNULL, timeout=3,
+            ).decode().strip()
+        except Exception:
+            sha = ""
+    return sha[:7] if sha else "unknown"
+
+
+BUILD_VERSION = _build_version()
 
 
 @asynccontextmanager
@@ -153,6 +182,7 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
 .more-btn:hover{background:var(--blue-mist)}
 .more-btn:disabled{opacity:.6;cursor:default}
 .more-count{font-size:.75rem;color:var(--muted)}
+.build-tag{font-size:.6rem;color:var(--faint);letter-spacing:.03em;opacity:.6}
 #results{transition:opacity .12s ease}
 .brand .mark{width:34px;height:34px;border-radius:11px;
   background:linear-gradient(145deg,var(--blue) 0%,var(--blue-deep) 100%);color:#fff;
@@ -948,6 +978,7 @@ def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
   <span class="live-wrap" style="display:flex;flex-direction:column;align-items:flex-end;gap:.15rem">
     <span class="live" id="live-state">{state}</span>
     <span class="live-detail" id="live-detail"></span>
+    <span class="build-tag" title="Deployed build">build {html.escape(BUILD_VERSION)}</span>
   </span>
   {scan_btn}
 </div></div>
@@ -2824,6 +2855,12 @@ def list_epaper_pages(date: str | None = None, db: Session = Depends(get_db)):
          "page": r.page_no, "ocr_status": r.ocr_status, "viewer_url": r.viewer_url}
         for r in rows
     ]
+
+
+@app.get("/api/version")
+def app_version():
+    """What code this host is actually running — for confirming a deploy."""
+    return {"version": BUILD_VERSION}
 
 
 @app.get("/api/scan/status")
