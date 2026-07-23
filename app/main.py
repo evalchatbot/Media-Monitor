@@ -394,22 +394,27 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #yt-ch-slots li:last-child{border-bottom:0}
 #yt-ch-slots .slot-meta{color:var(--faint);font-size:.76rem;font-weight:500;margin-top:.15rem;line-height:1.35}
 
-#yt-period-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
+#yt-period-modal,#yt-live-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
   padding:1rem;background:rgba(44,58,72,.45);backdrop-filter:blur(6px)}
-#yt-period-modal.open{display:flex}
-#yt-period-modal .box{width:min(520px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
+#yt-period-modal.open,#yt-live-modal.open{display:flex}
+#yt-period-modal .box,#yt-live-modal .box{width:min(520px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
   border:1px solid var(--line);border-radius:var(--r);padding:1.35rem 1.4rem;box-shadow:var(--shadow)}
-#yt-period-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
-#yt-period-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem;line-height:1.45}
-#yt-period-modal .period-grid{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .75rem;margin-bottom:.75rem}
-#yt-period-modal label{font-size:.78rem;font-weight:600;color:var(--muted);display:block;margin-bottom:.25rem}
-#yt-period-modal input[type=date],#yt-period-modal input[type=time]{width:100%;padding:.55rem .75rem;
+#yt-period-modal h3,#yt-live-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
+#yt-period-modal .sub,#yt-live-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem;line-height:1.45}
+#yt-period-modal .period-grid,#yt-live-modal .period-grid{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .75rem;margin-bottom:.75rem}
+#yt-period-modal label,#yt-live-modal label{font-size:.78rem;font-weight:600;color:var(--muted);display:block;margin-bottom:.25rem}
+#yt-period-modal input[type=date],#yt-period-modal input[type=time],#yt-live-modal input[type=text]{width:100%;padding:.55rem .75rem;
   border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9}
-#yt-period-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
+#yt-period-modal .row-btns,#yt-live-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
 #yt-period-modal #yt-period-result{margin-top:.75rem;padding:.75rem .9rem;border-radius:var(--r-sm);font-size:.88rem;
   font-weight:600;line-height:1.45;display:none}
 #yt-period-modal #yt-period-result.show{display:block}
 #yt-period-modal #yt-period-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
+#yt-live-list .live-pick{display:block;padding:.5rem .6rem;margin:.3rem 0;border:1px solid var(--line);
+  border-radius:var(--r-sm);background:#fffdf9;font-size:.85rem;line-height:1.4;cursor:pointer}
+#yt-live-list .live-pick:hover{border-color:var(--blue-mist);background:var(--blue-soft)}
+#yt-live-list input[type=radio]{margin-right:.35rem}
+#yt-live-results .hitrow{margin:.25rem 0}
 
 .ch-bar{margin:.65rem 0 .35rem}
 .ch-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem}
@@ -450,7 +455,7 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   .grid{grid-template-columns:1fr;gap:.85rem}
   .papers{grid-template-columns:1fr 1fr}
   .yt-status{grid-template-columns:1fr 1fr}
-  #yt-period-modal .period-grid{grid-template-columns:1fr}
+  #yt-period-modal .period-grid,#yt-live-modal .period-grid{grid-template-columns:1fr}
   .field input[type=date],.field input[type=text]{max-width:100%}
   .live-detail{display:none}
   /* wide content must scroll inside itself, never the page body */
@@ -693,6 +698,109 @@ _JS = """
       periodForm.requestSubmit?periodForm.requestSubmit():periodForm.submit();
     });
   }
+
+  /* Live streams — its own flow: list what's live, pick a window, transcribe
+     and match just that. Results render only inside this panel. */
+  (function(){
+    var openBtn=document.getElementById('yt-live-open'),
+        modal=document.getElementById('yt-live-modal');
+    if(!openBtn||!modal)return;
+    var closeBtn=document.getElementById('yt-live-close'),
+        list=document.getElementById('yt-live-list'),
+        winBox=document.getElementById('yt-live-window'),
+        fromI=document.getElementById('yt-live-from'),
+        toI=document.getElementById('yt-live-to'),
+        runBtn=document.getElementById('yt-live-run'),
+        statusEl=document.getElementById('yt-live-status'),
+        resultsEl=document.getElementById('yt-live-results');
+    var picked=null,pollT=null;
+    function esc(s){return (s||'').replace(/[<>&"]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
+    function fmt(s){s=Math.max(0,Math.floor(s||0));var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+      return h?(h+':'+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')):(m+':'+String(x).padStart(2,'0'));}
+    function parseTs(v){
+      v=(v||'').trim(); if(!v)return NaN;
+      var p=v.split(':').map(Number); if(p.some(isNaN))return NaN;
+      if(p.length===3)return p[0]*3600+p[1]*60+p[2];
+      if(p.length===2)return p[0]*60+p[1];
+      return p[0];
+    }
+    function open(){modal.classList.add('open');resultsEl.innerHTML='';statusEl.textContent='';load();}
+    function close(){modal.classList.remove('open');if(pollT)clearTimeout(pollT);}
+    openBtn.addEventListener('click',open);
+    if(closeBtn)closeBtn.addEventListener('click',close);
+    modal.addEventListener('click',function(e){if(e.target===modal)close();});
+    document.addEventListener('keydown',function(e){
+      if(e.key==='Escape'&&modal.classList.contains('open'))close();
+    });
+    function load(){
+      list.innerHTML='<span class="hint">Checking channels…</span>';
+      winBox.style.display='none';runBtn.style.display='none';picked=null;
+      fetch('/api/youtube/live').then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(x){
+        if(!x.ok){list.innerHTML='<div class="empty" style="padding:.8rem">'+esc(x.j.detail||'Could not check.')+'</div>';return;}
+        var st=(x.j&&x.j.streams)||[];
+        if(!st.length){list.innerHTML='<div class="empty" style="padding:.8rem">No live streams on your channels right now.</div>';return;}
+        list.innerHTML=st.map(function(s,i){
+          return '<label class="live-pick"><input type="radio" name="yt-live-pick" value="'+i+'">'
+            +'<b>'+esc(s.channel)+'</b> — '+esc((s.title||'').slice(0,80))
+            +' <span class="hint">live for '+fmt(s.elapsed_seconds)
+            +(s.viewers?(' · '+esc(String(s.viewers))+' watching'):'')+'</span></label>';
+        }).join('');
+        list.querySelectorAll('input[name=yt-live-pick]').forEach(function(r){
+          r.addEventListener('change',function(){
+            picked=st[parseInt(r.value,10)];
+            resultsEl.innerHTML='';winBox.style.display='none';runBtn.style.display='none';
+            statusEl.innerHTML='<span class="spin"></span> checking how much of the stream is rewindable…';
+            // Streams restart: the true DVR length comes from the stream itself,
+            // not the Data API's start time.
+            fetch('/api/youtube/live/timeline/'+encodeURIComponent(picked.video_id))
+            .then(function(r2){return r2.json().then(function(j){return {ok:r2.ok,j:j};});})
+            .then(function(x){
+              if(!x.ok){statusEl.textContent=esc(x.j.detail||'Could not read the stream timeline.');return;}
+              picked.head_seconds=x.j.head_seconds||0;
+              statusEl.textContent='Rewind available: '+fmt(picked.head_seconds)+' — pick a window inside that.';
+              fromI.value=fmt(Math.max(0,picked.head_seconds-600));toI.value=fmt(picked.head_seconds);
+              winBox.style.display='block';runBtn.style.display='inline-flex';
+            }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
+          });
+        });
+      }).catch(function(){list.innerHTML='<div class="empty" style="padding:.8rem">Could not check live streams.</div>';});
+    }
+    if(runBtn)runBtn.addEventListener('click',function(){
+      if(!picked){statusEl.textContent='Pick a stream first.';return;}
+      var a=parseTs(fromI.value),b=parseTs(toI.value);
+      if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Enter a window like 1:20:00 to 1:30:00.';return;}
+      resultsEl.innerHTML='';statusEl.textContent='Starting…';runBtn.disabled=true;
+      fetch('/api/youtube/live/run',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b})})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(x){
+        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;return;}
+        poll(x.j.job);
+      }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;});
+    });
+    function poll(id){
+      fetch('/api/youtube/live/jobs/'+encodeURIComponent(id))
+      .then(function(r){return r.json();}).then(function(j){
+        if(j.state==='done'){runBtn.disabled=false;statusEl.textContent='';render(j);return;}
+        if(j.state==='error'){runBtn.disabled=false;statusEl.textContent=esc(j.error||'Failed.');return;}
+        statusEl.innerHTML='<span class="spin"></span> '+esc(j.state)+(j.detail?(' — '+esc(j.detail)):'');
+        pollT=setTimeout(function(){poll(id);},2000);
+      }).catch(function(){pollT=setTimeout(function(){poll(id);},3000);});
+    }
+    function render(j){
+      var m=j.matches||{},kws=Object.keys(m);
+      if(!kws.length){
+        resultsEl.innerHTML='<div class="empty" style="padding:.8rem">No watchlist keyword was spoken in that window.</div>';
+        return;
+      }
+      resultsEl.innerHTML='<div class="hits">'+kws.map(function(k){
+        return '<div class="hitrow"><span class="hitkw">'+esc(k)+'</span>'+m[k].map(function(h){
+          return '<a class="jump" target="_blank" rel="noopener" href="'+esc(h.url)+'">'+fmt(h.start)+'</a>';
+        }).join('')+'</div>';
+      }).join('')+'</div>';
+    }
+  })();
 
   var wasScanning=__SCANNING__;
   var wasQueue=__QUEUE__;
@@ -2223,6 +2331,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
         <div class="actions">
           <button type="button" id="yt-period-open">Custom scan…</button>
+          <button type="button" id="yt-live-open" class="ghost">Live streams</button>
           <a class="btn ghost" href="/youtube">Reset</a>
         </div>
       </form>
@@ -2255,6 +2364,30 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           </div>
           <div id="yt-period-result"></div>
         </form>
+      </div>
+    </div>
+    <div id="yt-live-modal" role="dialog" aria-modal="true" aria-labelledby="yt-live-title">
+      <div class="box">
+        <h3 id="yt-live-title">Live streams</h3>
+        <p class="sub">Streams live right now on your channels. Pick one, choose a window of its
+        timeline, and that portion is transcribed and matched against the watchlist.
+        Separate from bulletins and custom scans — results appear only here.</p>
+        <div id="yt-live-list"><span class="hint">Checking channels…</span></div>
+        <div id="yt-live-window" style="display:none">
+          <div class="period-grid" style="margin-top:.65rem">
+            <div><label for="yt-live-from">From (h:mm:ss into the stream)</label>
+              <input type="text" id="yt-live-from" placeholder="1:20:00" autocomplete="off"></div>
+            <div><label for="yt-live-to">To</label>
+              <input type="text" id="yt-live-to" placeholder="1:30:00" autocomplete="off"></div>
+          </div>
+          <p class="hint" style="margin:.1rem 0 .6rem">Up to 30 minutes per run. Defaults to the last 10 minutes.</p>
+        </div>
+        <div class="row-btns">
+          <button type="button" id="yt-live-run" style="display:none">Transcribe &amp; match</button>
+          <button type="button" class="ghost" id="yt-live-close">Close</button>
+        </div>
+        <div id="yt-live-status" class="hint" style="margin-top:.55rem"></div>
+        <div id="yt-live-results" style="margin-top:.55rem"></div>
       </div>
     </div>
     <div id="yt-ch-modal" role="dialog" aria-modal="true" aria-labelledby="yt-ch-title">
@@ -2665,6 +2798,57 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
         "date": datetime.now(_PKT).date().isoformat(),
     })
     return RedirectResponse(f"{home}?{q}", status_code=303)
+
+
+@app.get("/api/youtube/live")
+def api_live_streams(db: Session = Depends(get_db)):
+    """Streams live right now on the active channels — for the Live panel."""
+    from app.youtube import livestream
+
+    try:
+        return {"streams": livestream.list_live(db)}
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/youtube/live/timeline/{video_id}")
+def api_live_timeline(video_id: str):
+    """True addressable DVR length for a live stream (streams restart, so the
+    Data API's start time can be a whole session stale)."""
+    from app.youtube import livestream
+
+    try:
+        return livestream.stream_timeline(video_id)
+    except livestream.LiveError as exc:
+        raise HTTPException(400, str(exc))
+
+
+class _LiveRunIn(BaseModel):
+    video_id: str = Field(min_length=5, max_length=32)
+    start_seconds: int = Field(ge=0)
+    end_seconds: int = Field(gt=0)
+
+
+@app.post("/api/youtube/live/run")
+def api_live_run(inp: _LiveRunIn):
+    """Transcribe+match one window of a live stream (background job)."""
+    from app.youtube import livestream
+
+    try:
+        job_id = livestream.start_job(inp.video_id, inp.start_seconds, inp.end_seconds)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"job": job_id}
+
+
+@app.get("/api/youtube/live/jobs/{job_id}")
+def api_live_job(job_id: str):
+    from app.youtube import livestream
+
+    st = livestream.job_status(job_id)
+    if st is None:
+        raise HTTPException(404, "job not found")
+    return st
 
 
 @app.post("/api/keywords/{kid}/match")
