@@ -415,6 +415,10 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #yt-live-list .live-pick:hover{border-color:var(--blue-mist);background:var(--blue-soft)}
 #yt-live-list input[type=radio]{margin-right:.35rem}
 #yt-live-results .hitrow{margin:.25rem 0}
+.live-slider{margin:.45rem 0}
+.live-slider label{display:block;font-size:.78rem;font-weight:600;color:var(--muted);margin-bottom:.2rem}
+.live-slider b{color:var(--blue-deep);font-weight:700}
+.live-slider input[type=range]{width:100%;accent-color:var(--blue-deep);height:22px}
 
 .ch-bar{margin:.65rem 0 .35rem}
 .ch-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem}
@@ -713,16 +717,34 @@ _JS = """
         runBtn=document.getElementById('yt-live-run'),
         statusEl=document.getElementById('yt-live-status'),
         resultsEl=document.getElementById('yt-live-results');
-    var picked=null,pollT=null;
+    var picked=null,pollT=null,probeAt=0,headSecs=0;
+    var fromLbl=document.getElementById('yt-live-from-label'),
+        toLbl=document.getElementById('yt-live-to-label'),
+        spanEl=document.getElementById('yt-live-span'),
+        winInfo=document.getElementById('yt-live-window-info');
     function esc(s){return (s||'').replace(/[<>&"]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
     function fmt(s){s=Math.max(0,Math.floor(s||0));var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
       return h?(h+':'+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')):(m+':'+String(x).padStart(2,'0'));}
-    function parseTs(v){
-      v=(v||'').trim(); if(!v)return NaN;
-      var p=v.split(':').map(Number); if(p.some(isNaN))return NaN;
-      if(p.length===3)return p[0]*3600+p[1]*60+p[2];
-      if(p.length===2)return p[0]*60+p[1];
-      return p[0];
+    function wallDate(off){
+      // slider offset -> real wall-clock moment: the stream head was "now" at
+      // probe time, so offset o happened (headSecs-o) seconds before that.
+      return new Date(probeAt-(headSecs-off)*1000);
+    }
+    function wallFmt(off){
+      return wallDate(off).toLocaleString('en-GB',{timeZone:'Asia/Karachi',
+        day:'2-digit',month:'short',hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true});
+    }
+    function syncLabels(){
+      var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
+      if(fromLbl)fromLbl.textContent=wallFmt(a)+'  ('+fmt(a)+' into stream)';
+      if(toLbl)toLbl.textContent=wallFmt(b)+'  ('+fmt(b)+' into stream)';
+      if(winInfo){
+        var w=b-a;
+        winInfo.textContent=w>0
+          ? ('Selected window: '+fmt(w)+(w>1800?' — too long, 30:00 is the max per run':''))
+          : 'The To handle must be after the From handle.';
+        winInfo.style.color=(w<=0||w>1800)?'var(--warn)':'';
+      }
     }
     function open(){modal.classList.add('open');resultsEl.innerHTML='';statusEl.textContent='';load();}
     function close(){modal.classList.remove('open');if(pollT)clearTimeout(pollT);}
@@ -757,19 +779,33 @@ _JS = """
             .then(function(r2){return r2.json().then(function(j){return {ok:r2.ok,j:j};});})
             .then(function(x){
               if(!x.ok){statusEl.textContent=esc(x.j.detail||'Could not read the stream timeline.');return;}
-              picked.head_seconds=x.j.head_seconds||0;
-              statusEl.textContent='Rewind available: '+fmt(picked.head_seconds)+' — pick a window inside that.';
-              fromI.value=fmt(Math.max(0,picked.head_seconds-600));toI.value=fmt(picked.head_seconds);
+              headSecs=x.j.head_seconds||0;probeAt=Date.now();
+              statusEl.textContent='';
+              if(spanEl)spanEl.innerHTML='Stream timeline: <b>'+esc(wallFmt(0))+'</b> → <b>'+esc(wallFmt(headSecs))+'</b> (Pakistan time) · slide both handles to choose what to transcribe.';
+              fromI.min=0;fromI.max=headSecs;fromI.step=5;fromI.value=Math.max(0,headSecs-600);
+              toI.min=0;toI.max=headSecs;toI.step=5;toI.value=headSecs;
+              syncLabels();
               winBox.style.display='block';runBtn.style.display='inline-flex';
             }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
           });
         });
       }).catch(function(){list.innerHTML='<div class="empty" style="padding:.8rem">Could not check live streams.</div>';});
     }
+    // Sliding one handle past the other drags the other along, so the window
+    // always stays valid; labels re-render with real dates as you slide.
+    if(fromI)fromI.addEventListener('input',function(){
+      if(parseInt(fromI.value,10)>=parseInt(toI.value,10)){toI.value=Math.min(parseInt(fromI.value,10)+5,parseInt(toI.max,10));}
+      syncLabels();
+    });
+    if(toI)toI.addEventListener('input',function(){
+      if(parseInt(toI.value,10)<=parseInt(fromI.value,10)){fromI.value=Math.max(parseInt(toI.value,10)-5,0);}
+      syncLabels();
+    });
     if(runBtn)runBtn.addEventListener('click',function(){
       if(!picked){statusEl.textContent='Pick a stream first.';return;}
-      var a=parseTs(fromI.value),b=parseTs(toI.value);
-      if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Enter a window like 1:20:00 to 1:30:00.';return;}
+      var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
+      if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Slide the handles to choose a window first.';return;}
+      if(b-a>1800){statusEl.textContent='That window is over 30 minutes — shrink it.';return;}
       resultsEl.innerHTML='';statusEl.textContent='Starting…';runBtn.disabled=true;
       fetch('/api/youtube/live/run',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b})})
@@ -2374,13 +2410,16 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         Separate from bulletins and custom scans — results appear only here.</p>
         <div id="yt-live-list"><span class="hint">Checking channels…</span></div>
         <div id="yt-live-window" style="display:none">
-          <div class="period-grid" style="margin-top:.65rem">
-            <div><label for="yt-live-from">From (h:mm:ss into the stream)</label>
-              <input type="text" id="yt-live-from" placeholder="1:20:00" autocomplete="off"></div>
-            <div><label for="yt-live-to">To</label>
-              <input type="text" id="yt-live-to" placeholder="1:30:00" autocomplete="off"></div>
+          <p class="hint" id="yt-live-span" style="margin:.55rem 0 .45rem"></p>
+          <div class="live-slider">
+            <label>From&nbsp; <b id="yt-live-from-label"></b></label>
+            <input type="range" id="yt-live-from" min="0" max="600" step="5" value="0">
           </div>
-          <p class="hint" style="margin:.1rem 0 .6rem">Up to 30 minutes per run. Defaults to the last 10 minutes.</p>
+          <div class="live-slider">
+            <label>To&nbsp; <b id="yt-live-to-label"></b></label>
+            <input type="range" id="yt-live-to" min="0" max="600" step="5" value="600">
+          </div>
+          <p class="hint" id="yt-live-window-info" style="margin:.15rem 0 .6rem"></p>
         </div>
         <div class="row-btns">
           <button type="button" id="yt-live-run" style="display:none">Transcribe &amp; match</button>
