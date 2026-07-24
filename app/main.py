@@ -161,6 +161,13 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
 .mod-nav a:hover{color:var(--blue-deep);background:var(--blue-soft)}
 .mod-nav a.on{color:#fff;background:var(--blue-deep);border-color:var(--blue-deep)}
 .yt-status{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.5rem;margin:0 0 1rem}
+.yt-tabs{display:flex;gap:.35rem;margin:1rem 0 0;flex-wrap:wrap}
+.yt-tab{padding:.5rem 1rem;border-radius:999px 999px 0 0;border:1px solid var(--line);border-bottom:none;
+  background:var(--surface);color:var(--muted);font-weight:700;font-size:.85rem;cursor:pointer}
+.yt-tab:hover{color:var(--blue-deep)}
+.yt-tab.on{background:linear-gradient(180deg,#fffdf9,#faf4ea);color:var(--blue-deep);border-color:var(--line)}
+.yt-panel{margin-top:0}
+.yt-panel .panel{border-top-left-radius:0}
 .yt-status .cell{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);
   padding:.65rem .75rem;font-size:.8rem}
 .yt-status .cell b{display:block;font-size:.88rem;color:var(--ink);margin-bottom:.2rem}
@@ -706,19 +713,19 @@ _JS = """
   /* Live streams — its own flow: list what's live, pick a window, transcribe
      and match just that. Results render only inside this panel. */
   (function(){
-    var openBtn=document.getElementById('yt-live-open'),
-        modal=document.getElementById('yt-live-modal');
-    if(!openBtn||!modal)return;
-    var closeBtn=document.getElementById('yt-live-close'),
-        list=document.getElementById('yt-live-list'),
-        winBox=document.getElementById('yt-live-window'),
+    var list=document.getElementById('yt-live-list');
+    if(!list)return;   // not the YouTube page
+    var winBox=document.getElementById('yt-live-window'),
         fromI=document.getElementById('yt-live-from'),
         toI=document.getElementById('yt-live-to'),
         runBtn=document.getElementById('yt-live-run'),
-        tickerBtn=document.getElementById('yt-live-ticker'),
+        heading=document.getElementById('yt-live-heading'),
         statusEl=document.getElementById('yt-live-status'),
         resultsEl=document.getElementById('yt-live-results');
-    var picked=null,pollT=null,probeAt=0,headSecs=0;
+    var picked=null,pollT=null,probeAt=0,headSecs=0,loaded=false;
+    // 'Live stream' and 'Live ticker' tabs share this picker; only the run
+    // endpoint and labels differ.
+    var mode={endpoint:'/api/youtube/live/run',maxMin:30};
     var fromLbl=document.getElementById('yt-live-from-label'),
         toLbl=document.getElementById('yt-live-to-label'),
         spanEl=document.getElementById('yt-live-span'),
@@ -747,14 +754,23 @@ _JS = """
         winInfo.style.color=(w<=0||w>1800)?'var(--warn)':'';
       }
     }
-    function open(){modal.classList.add('open');resultsEl.innerHTML='';statusEl.textContent='';load();}
-    function close(){modal.classList.remove('open');if(pollT)clearTimeout(pollT);}
-    openBtn.addEventListener('click',open);
-    if(closeBtn)closeBtn.addEventListener('click',close);
-    modal.addEventListener('click',function(e){if(e.target===modal)close();});
-    document.addEventListener('keydown',function(e){
-      if(e.key==='Escape'&&modal.classList.contains('open'))close();
-    });
+    function setMode(kind){
+      if(kind==='ticker'){
+        mode={endpoint:'/api/youtube/live/ticker',maxMin:8};
+        if(heading)heading.textContent='Live ticker — read the on-screen Urdu ticker';
+        runBtn.textContent='Read Urdu ticker & match';
+      }else{
+        mode={endpoint:'/api/youtube/live/run',maxMin:30};
+        if(heading)heading.textContent='Live stream — read audio';
+        runBtn.textContent='Transcribe audio & match';
+      }
+      resultsEl.innerHTML='';statusEl.textContent='';
+    }
+    // Called by the tab switcher when the Live stream / Live ticker tab opens.
+    window.__ytLiveActivate=function(kind){
+      setMode(kind);
+      if(!loaded){loaded=true;load();}
+    };
     function load(){
       list.innerHTML='<span class="hint">Checking channels…</span>';
       winBox.style.display='none';runBtn.style.display='none';picked=null;
@@ -787,7 +803,6 @@ _JS = """
               toI.min=0;toI.max=headSecs;toI.step=5;toI.value=headSecs;
               syncLabels();
               winBox.style.display='block';runBtn.style.display='inline-flex';
-              if(tickerBtn)tickerBtn.style.display='inline-flex';
             }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
           });
         });
@@ -809,22 +824,21 @@ _JS = """
       if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Slide the handles to choose a window first.';return;}
       if(b-a>maxMin*60){statusEl.textContent='That window is over '+maxMin+' minutes — shrink it.';return;}
       resultsEl.innerHTML='';statusEl.textContent='Starting…';
-      runBtn.disabled=true;if(tickerBtn)tickerBtn.disabled=true;
+      runBtn.disabled=true;
       fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b})})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
       .then(function(x){
-        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;return;}
+        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;return;}
         poll(x.j.job);
-      }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;});
+      }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;});
     }
-    if(runBtn)runBtn.addEventListener('click',function(){launch('/api/youtube/live/run',30);});
-    if(tickerBtn)tickerBtn.addEventListener('click',function(){launch('/api/youtube/live/ticker',8);});
+    if(runBtn)runBtn.addEventListener('click',function(){launch(mode.endpoint,mode.maxMin);});
     function poll(id){
       fetch('/api/youtube/live/jobs/'+encodeURIComponent(id))
       .then(function(r){return r.json();}).then(function(j){
-        if(j.state==='done'){runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;statusEl.textContent='';render(j);return;}
-        if(j.state==='error'){runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;statusEl.textContent=esc(j.error||'Failed.');return;}
+        if(j.state==='done'){runBtn.disabled=false;statusEl.textContent='';render(j);return;}
+        if(j.state==='error'){runBtn.disabled=false;statusEl.textContent=esc(j.error||'Failed.');return;}
         statusEl.innerHTML='<span class="spin"></span> '+esc(j.state)+(j.detail?(' — '+esc(j.detail)):'');
         pollT=setTimeout(function(){poll(id);},2000);
       }).catch(function(){pollT=setTimeout(function(){poll(id);},3000);});
@@ -832,7 +846,7 @@ _JS = """
     function render(j){
       var m=j.matches||{},kws=Object.keys(m);
       if(!kws.length){
-        resultsEl.innerHTML='<div class="empty" style="padding:.8rem">No watchlist keyword was spoken in that window.</div>';
+        resultsEl.innerHTML='<div class="empty" style="padding:.8rem">No watchlist keyword matched in that window.</div>';
         return;
       }
       resultsEl.innerHTML='<div class="hits">'+kws.map(function(k){
@@ -841,6 +855,28 @@ _JS = """
         }).join('')+'</div>';
       }).join('')+'</div>';
     }
+  })();
+
+  /* YouTube tabs: Daily bulletins | Live stream | Live ticker. Keywords sit
+     above the tabs and are shared across all three (same watchlist). */
+  (function(){
+    var tabs=document.querySelectorAll('.yt-tab');
+    if(!tabs.length)return;
+    var panels={
+      bulletins:document.getElementById('yt-tab-bulletins'),
+      live:document.getElementById('yt-tab-live'),
+      ticker:document.getElementById('yt-tab-live')  // shares the live panel
+    };
+    function show(name){
+      tabs.forEach(function(t){t.classList.toggle('on',t.getAttribute('data-tab')===name);});
+      document.getElementById('yt-tab-bulletins').style.display=(name==='bulletins')?'':'none';
+      document.getElementById('yt-tab-live').style.display=(name==='bulletins')?'none':'';
+      if(name==='live'&&window.__ytLiveActivate)window.__ytLiveActivate('audio');
+      if(name==='ticker'&&window.__ytLiveActivate)window.__ytLiveActivate('ticker');
+    }
+    tabs.forEach(function(t){
+      t.addEventListener('click',function(){show(t.getAttribute('data-tab'));});
+    });
   })();
 
   var wasScanning=__SCANNING__;
@@ -2358,26 +2394,59 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
-      <div class="field">
-        <label>Today's bulletin auto-scan</label>
-        <p class="hint" style="margin:.25rem 0 .5rem">Scheduled scans pick up each channel's daily bulletin slots automatically.</p>
-        {status_html}
+      <div class="yt-tabs" role="tablist">
+        <button type="button" class="yt-tab on" data-tab="bulletins">Daily bulletins</button>
+        <button type="button" class="yt-tab" data-tab="live">Live stream</button>
+        <button type="button" class="yt-tab" data-tab="ticker">Live ticker</button>
       </div>
-      <form method="get" action="/youtube" id="yt-search">
-        <div id="yt-kw-hidden"></div>
-        <input type="hidden" name="q" id="q" value="">
-        <input type="hidden" name="go" value="1">
-        <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
-        <input type="hidden" name="start" id="yt-period-start" value="{html.escape(p_start_iso)}">
-        <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
-        <div class="actions">
-          <button type="button" id="yt-period-open">Custom scan…</button>
-          <button type="button" id="yt-live-open" class="ghost">Live streams</button>
-          <a class="btn ghost" href="/youtube">Reset</a>
-        </div>
-      </form>
     </div>
-    {results_html}
+    <div id="yt-tab-bulletins" class="yt-panel">
+      <div class="panel">
+        <div class="field">
+          <label>Today's bulletin auto-scan</label>
+          <p class="hint" style="margin:.25rem 0 .5rem">Scheduled scans pick up each channel's daily bulletin slots automatically.</p>
+          {status_html}
+        </div>
+        <form method="get" action="/youtube" id="yt-search">
+          <div id="yt-kw-hidden"></div>
+          <input type="hidden" name="q" id="q" value="">
+          <input type="hidden" name="go" value="1">
+          <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
+          <input type="hidden" name="start" id="yt-period-start" value="{html.escape(p_start_iso)}">
+          <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
+          <div class="actions">
+            <button type="button" id="yt-period-open">Custom scan…</button>
+            <a class="btn ghost" href="/youtube">Reset</a>
+          </div>
+        </form>
+      </div>
+      {results_html}
+    </div>
+    <div id="yt-tab-live" class="yt-panel" style="display:none">
+      <div class="panel">
+        <h2 style="margin-top:0" id="yt-live-heading">Live stream — read audio</h2>
+        <p class="sub" id="yt-live-sub" style="color:var(--muted);font-size:.9rem;margin:.1rem 0 .9rem">Streams live right now on your channels. Pick one, choose a window of its timeline,
+        and that portion is transcribed and matched against the same watchlist. Separate from bulletins — results appear only here.</p>
+        <div id="yt-live-list"><span class="hint">Open this tab to check what's live…</span></div>
+        <div id="yt-live-window" style="display:none">
+          <p class="hint" id="yt-live-span" style="margin:.55rem 0 .45rem"></p>
+          <div class="live-slider">
+            <label>From&nbsp; <b id="yt-live-from-label"></b></label>
+            <input type="range" id="yt-live-from" min="0" max="600" step="5" value="0">
+          </div>
+          <div class="live-slider">
+            <label>To&nbsp; <b id="yt-live-to-label"></b></label>
+            <input type="range" id="yt-live-to" min="0" max="600" step="5" value="600">
+          </div>
+          <p class="hint" id="yt-live-window-info" style="margin:.15rem 0 .6rem"></p>
+        </div>
+        <div class="row-btns">
+          <button type="button" id="yt-live-run" style="display:none">Transcribe audio &amp; match</button>
+        </div>
+        <div id="yt-live-status" class="hint" style="margin-top:.55rem"></div>
+        <div id="yt-live-results" style="margin-top:.55rem"></div>
+      </div>
+    </div>
     <div id="yt-period-modal" role="dialog" aria-modal="true" aria-labelledby="yt-period-title">
       <div class="box">
         <h3 id="yt-period-title">Custom scan period</h3>
@@ -2405,34 +2474,6 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           </div>
           <div id="yt-period-result"></div>
         </form>
-      </div>
-    </div>
-    <div id="yt-live-modal" role="dialog" aria-modal="true" aria-labelledby="yt-live-title">
-      <div class="box">
-        <h3 id="yt-live-title">Live streams</h3>
-        <p class="sub">Streams live right now on your channels. Pick one, choose a window of its
-        timeline, and that portion is transcribed and matched against the watchlist.
-        Separate from bulletins and custom scans — results appear only here.</p>
-        <div id="yt-live-list"><span class="hint">Checking channels…</span></div>
-        <div id="yt-live-window" style="display:none">
-          <p class="hint" id="yt-live-span" style="margin:.55rem 0 .45rem"></p>
-          <div class="live-slider">
-            <label>From&nbsp; <b id="yt-live-from-label"></b></label>
-            <input type="range" id="yt-live-from" min="0" max="600" step="5" value="0">
-          </div>
-          <div class="live-slider">
-            <label>To&nbsp; <b id="yt-live-to-label"></b></label>
-            <input type="range" id="yt-live-to" min="0" max="600" step="5" value="600">
-          </div>
-          <p class="hint" id="yt-live-window-info" style="margin:.15rem 0 .6rem"></p>
-        </div>
-        <div class="row-btns">
-          <button type="button" id="yt-live-run" style="display:none">Transcribe audio &amp; match</button>
-          <button type="button" id="yt-live-ticker" class="ghost" style="display:none">Read Urdu ticker &amp; match</button>
-          <button type="button" class="ghost" id="yt-live-close">Close</button>
-        </div>
-        <div id="yt-live-status" class="hint" style="margin-top:.55rem"></div>
-        <div id="yt-live-results" style="margin-top:.55rem"></div>
       </div>
     </div>
     <div id="yt-ch-modal" role="dialog" aria-modal="true" aria-labelledby="yt-ch-title">
