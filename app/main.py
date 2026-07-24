@@ -422,6 +422,11 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #yt-live-list .live-pick:hover{border-color:var(--blue-mist);background:var(--blue-soft)}
 #yt-live-list input[type=radio]{margin-right:.35rem}
 #yt-live-results .hitrow{margin:.25rem 0}
+.ticker-list{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:var(--r-sm);padding:.35rem .5rem;background:#fffdf9}
+.ticker-row{display:flex;gap:.55rem;align-items:flex-start;padding:.28rem 0;border-bottom:1px solid var(--line)}
+.ticker-row:last-child{border-bottom:none}
+.ticker-row span{font-size:.9rem;line-height:1.5;color:var(--ink)}
+.ticker-row .jump{margin-top:0;flex:none}
 .live-slider{margin:.45rem 0}
 .live-slider label{display:block;font-size:.78rem;font-weight:600;color:var(--muted);margin-bottom:.2rem}
 .live-slider b{color:var(--blue-deep);font-weight:700}
@@ -722,10 +727,10 @@ _JS = """
         heading=document.getElementById('yt-live-heading'),
         statusEl=document.getElementById('yt-live-status'),
         resultsEl=document.getElementById('yt-live-results');
-    var picked=null,pollT=null,probeAt=0,headSecs=0,loaded=false;
+    var picked=null,pollT=null,probeAt=0,headSecs=0,loadedMode=null;
     // 'Live stream' and 'Live ticker' tabs share this picker; only the run
-    // endpoint and labels differ.
-    var mode={endpoint:'/api/youtube/live/run',maxMin:30};
+    // endpoint, labels and source list differ.
+    var mode={kind:'audio',endpoint:'/api/youtube/live/run',maxMin:30};
     var fromLbl=document.getElementById('yt-live-from-label'),
         toLbl=document.getElementById('yt-live-to-label'),
         spanEl=document.getElementById('yt-live-span'),
@@ -744,69 +749,98 @@ _JS = """
     }
     function syncLabels(){
       var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
-      if(fromLbl)fromLbl.textContent=wallFmt(a)+'  ('+fmt(a)+' into stream)';
-      if(toLbl)toLbl.textContent=wallFmt(b)+'  ('+fmt(b)+' into stream)';
+      var rec=picked&&picked.kind==='recorded';
+      if(fromLbl)fromLbl.textContent=rec?(fmt(a)+' into the bulletin'):(wallFmt(a)+'  ('+fmt(a)+' into stream)');
+      if(toLbl)toLbl.textContent=rec?(fmt(b)+' into the bulletin'):(wallFmt(b)+'  ('+fmt(b)+' into stream)');
       if(winInfo){
-        var w=b-a;
+        var w=b-a,maxW=mode.maxMin*60;
         winInfo.textContent=w>0
-          ? ('Selected window: '+fmt(w)+(w>1800?' — too long, 30:00 is the max per run':''))
+          ? ('Selected window: '+fmt(w)+(w>maxW?(' — too long, '+mode.maxMin+':00 is the max'):''))
           : 'The To handle must be after the From handle.';
-        winInfo.style.color=(w<=0||w>1800)?'var(--warn)':'';
+        winInfo.style.color=(w<=0||w>maxW)?'var(--warn)':'';
       }
     }
+    var dateBar=document.getElementById('yt-live-datebar'),
+        dateInput=document.getElementById('yt-live-date');
+    if(dateInput&&!dateInput.value){var _n=new Date();
+      dateInput.value=new Date(_n.getTime()-_n.getTimezoneOffset()*60000).toISOString().slice(0,10);}
     function setMode(kind){
       if(kind==='ticker'){
-        mode={endpoint:'/api/youtube/live/ticker',maxMin:8};
-        if(heading)heading.textContent='Live ticker — read the on-screen Urdu ticker';
+        mode={kind:'ticker',endpoint:'/api/youtube/live/ticker',maxMin:15};
+        if(heading)heading.textContent='Live ticker — read the on-screen Urdu ticker (live streams or a bulletin)';
         runBtn.textContent='Read Urdu ticker & match';
       }else{
-        mode={endpoint:'/api/youtube/live/run',maxMin:30};
+        mode={kind:'audio',endpoint:'/api/youtube/live/run',maxMin:30};
         if(heading)heading.textContent='Live stream — read audio';
         runBtn.textContent='Transcribe audio & match';
       }
-      resultsEl.innerHTML='';statusEl.textContent='';
+      if(dateBar)dateBar.style.display=(kind==='ticker')?'':'none';
+      resultsEl.innerHTML='';statusEl.textContent='';winBox.style.display='none';runBtn.style.display='none';
     }
     // Called by the tab switcher when the Live stream / Live ticker tab opens.
     window.__ytLiveActivate=function(kind){
       setMode(kind);
-      if(!loaded){loaded=true;load();}
+      if(loadedMode!==kind){loadedMode=kind;load();}
     };
-    function load(){
-      list.innerHTML='<span class="hint">Checking channels…</span>';
-      winBox.style.display='none';runBtn.style.display='none';picked=null;
-      fetch('/api/youtube/live').then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+    if(dateInput)dateInput.addEventListener('change',load);
+    function renderList(items){
+      if(!items.length){
+        list.innerHTML='<div class="empty" style="padding:.8rem">'
+          +(mode.kind==='ticker'?'No live streams and no bulletins for that date.':'No live streams on your channels right now.')+'</div>';
+        return;
+      }
+      list.innerHTML=items.map(function(s,i){
+        var meta = s.kind==='recorded'
+          ? '<span class="hint">bulletin · '+esc(s.slot||'')+(s.duration_seconds?(' · '+fmt(s.duration_seconds)+' long'):'')+'</span>'
+          : '<span class="hint">🔴 LIVE · '+fmt(s.elapsed_seconds)+(s.viewers?(' · '+esc(String(s.viewers))+' watching'):'')+'</span>';
+        return '<label class="live-pick"><input type="radio" name="yt-live-pick" value="'+i+'">'
+          +'<b>'+esc(s.channel)+'</b> — '+esc((s.title||'').slice(0,72))+' '+meta+'</label>';
+      }).join('');
+      list.querySelectorAll('input[name=yt-live-pick]').forEach(function(r){
+        r.addEventListener('change',function(){onPick(items[parseInt(r.value,10)]);});
+      });
+    }
+    function onPick(item){
+      picked=item;resultsEl.innerHTML='';winBox.style.display='none';runBtn.style.display='none';
+      if(item.kind==='recorded'){
+        var dur=item.duration_seconds||0;
+        if(!dur){statusEl.textContent='This bulletin has no known length yet — pick another.';return;}
+        headSecs=dur;probeAt=0;statusEl.textContent='';
+        if(spanEl)spanEl.innerHTML='Bulletin length: <b>'+fmt(dur)+'</b> · slide to choose the part to read.';
+        fromI.min=0;fromI.max=dur;fromI.step=5;fromI.value=0;
+        toI.min=0;toI.max=dur;toI.step=5;toI.value=Math.min(dur,600);
+        syncLabels();winBox.style.display='block';runBtn.style.display='inline-flex';
+        return;
+      }
+      // Live: probe the true DVR length (streams restart, Data API start can be stale).
+      statusEl.innerHTML='<span class="spin"></span> checking how much of the stream is rewindable…';
+      fetch('/api/youtube/live/timeline/'+encodeURIComponent(item.video_id))
+      .then(function(r2){return r2.json().then(function(j){return {ok:r2.ok,j:j};});})
       .then(function(x){
-        if(!x.ok){list.innerHTML='<div class="empty" style="padding:.8rem">'+esc(x.j.detail||'Could not check.')+'</div>';return;}
-        var st=(x.j&&x.j.streams)||[];
-        if(!st.length){list.innerHTML='<div class="empty" style="padding:.8rem">No live streams on your channels right now.</div>';return;}
-        list.innerHTML=st.map(function(s,i){
-          return '<label class="live-pick"><input type="radio" name="yt-live-pick" value="'+i+'">'
-            +'<b>'+esc(s.channel)+'</b> — '+esc((s.title||'').slice(0,80))
-            +' <span class="hint">live for '+fmt(s.elapsed_seconds)
-            +(s.viewers?(' · '+esc(String(s.viewers))+' watching'):'')+'</span></label>';
-        }).join('');
-        list.querySelectorAll('input[name=yt-live-pick]').forEach(function(r){
-          r.addEventListener('change',function(){
-            picked=st[parseInt(r.value,10)];
-            resultsEl.innerHTML='';winBox.style.display='none';runBtn.style.display='none';
-            statusEl.innerHTML='<span class="spin"></span> checking how much of the stream is rewindable…';
-            // Streams restart: the true DVR length comes from the stream itself,
-            // not the Data API's start time.
-            fetch('/api/youtube/live/timeline/'+encodeURIComponent(picked.video_id))
-            .then(function(r2){return r2.json().then(function(j){return {ok:r2.ok,j:j};});})
-            .then(function(x){
-              if(!x.ok){statusEl.textContent=esc(x.j.detail||'Could not read the stream timeline.');return;}
-              headSecs=x.j.head_seconds||0;probeAt=Date.now();
-              statusEl.textContent='';
-              if(spanEl)spanEl.innerHTML='Stream timeline: <b>'+esc(wallFmt(0))+'</b> → <b>'+esc(wallFmt(headSecs))+'</b> (Pakistan time) · slide both handles to choose what to transcribe.';
-              fromI.min=0;fromI.max=headSecs;fromI.step=5;fromI.value=Math.max(0,headSecs-600);
-              toI.min=0;toI.max=headSecs;toI.step=5;toI.value=headSecs;
-              syncLabels();
-              winBox.style.display='block';runBtn.style.display='inline-flex';
-            }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
-          });
-        });
-      }).catch(function(){list.innerHTML='<div class="empty" style="padding:.8rem">Could not check live streams.</div>';});
+        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Could not read the stream timeline.');return;}
+        headSecs=x.j.head_seconds||0;probeAt=Date.now();statusEl.textContent='';
+        if(spanEl)spanEl.innerHTML='Stream timeline: <b>'+esc(wallFmt(0))+'</b> → <b>'+esc(wallFmt(headSecs))+'</b> (Pakistan time) · slide both handles.';
+        fromI.min=0;fromI.max=headSecs;fromI.step=5;fromI.value=Math.max(0,headSecs-600);
+        toI.min=0;toI.max=headSecs;toI.step=5;toI.value=headSecs;
+        syncLabels();winBox.style.display='block';runBtn.style.display='inline-flex';
+      }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
+    }
+    function load(){
+      picked=null;winBox.style.display='none';runBtn.style.display='none';resultsEl.innerHTML='';
+      list.innerHTML='<span class="hint">Checking…</span>';
+      if(mode.kind==='ticker'){
+        var d=(dateInput&&dateInput.value)||'';
+        fetch('/api/youtube/ticker-sources'+(d?('?date='+encodeURIComponent(d)):''))
+        .then(function(r){return r.json();}).then(function(j){
+          renderList([].concat(j.live||[],j.bulletins||[]));
+        }).catch(function(){list.innerHTML='<div class="empty" style="padding:.8rem">Could not load sources.</div>';});
+      }else{
+        fetch('/api/youtube/live').then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+        .then(function(x){
+          if(!x.ok){list.innerHTML='<div class="empty" style="padding:.8rem">'+esc(x.j.detail||'Could not check.')+'</div>';return;}
+          renderList(((x.j&&x.j.streams)||[]).map(function(s){s.kind='live';return s;}));
+        }).catch(function(){list.innerHTML='<div class="empty" style="padding:.8rem">Could not check live streams.</div>';});
+      }
     }
     // Sliding one handle past the other drags the other along, so the window
     // always stays valid; labels re-render with real dates as you slide.
@@ -818,22 +852,23 @@ _JS = """
       if(parseInt(toI.value,10)<=parseInt(fromI.value,10)){fromI.value=Math.max(parseInt(toI.value,10)-5,0);}
       syncLabels();
     });
-    function launch(endpoint, maxMin){
-      if(!picked){statusEl.textContent='Pick a stream first.';return;}
+    function launch(){
+      if(!picked){statusEl.textContent='Pick a source first.';return;}
       var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
       if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Slide the handles to choose a window first.';return;}
-      if(b-a>maxMin*60){statusEl.textContent='That window is over '+maxMin+' minutes — shrink it.';return;}
+      if(b-a>mode.maxMin*60){statusEl.textContent='That window is over '+mode.maxMin+' minutes — shrink it.';return;}
       resultsEl.innerHTML='';statusEl.textContent='Starting…';
       runBtn.disabled=true;
-      fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b})})
+      fetch(mode.endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b,
+          is_live:(picked.kind!=='recorded')})})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
       .then(function(x){
         if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;return;}
         poll(x.j.job);
       }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;});
     }
-    if(runBtn)runBtn.addEventListener('click',function(){launch(mode.endpoint,mode.maxMin);});
+    if(runBtn)runBtn.addEventListener('click',launch);
     function poll(id){
       fetch('/api/youtube/live/jobs/'+encodeURIComponent(id))
       .then(function(r){return r.json();}).then(function(j){
@@ -844,16 +879,27 @@ _JS = """
       }).catch(function(){pollT=setTimeout(function(){poll(id);},3000);});
     }
     function render(j){
-      var m=j.matches||{},kws=Object.keys(m);
-      if(!kws.length){
-        resultsEl.innerHTML='<div class="empty" style="padding:.8rem">No watchlist keyword matched in that window.</div>';
-        return;
-      }
-      resultsEl.innerHTML='<div class="hits">'+kws.map(function(k){
-        return '<div class="hitrow"><span class="hitkw">'+esc(k)+'</span>'+m[k].map(function(h){
-          return '<a class="jump" target="_blank" rel="noopener" href="'+esc(h.url)+'">'+fmt(h.start)+'</a>';
+      var m=j.matches||{},kws=Object.keys(m),ticker=j.ticker||[],html='';
+      if(kws.length){
+        html+='<div class="cap" style="margin:.2rem 0 .3rem">Keyword matches</div><div class="hits">'+kws.map(function(k){
+          return '<div class="hitrow"><span class="hitkw">'+esc(k)+'</span>'+m[k].map(function(h){
+            return '<a class="jump" target="_blank" rel="noopener" href="'+esc(h.url)+'">'+fmt(h.start)+'</a>';
+          }).join('')+'</div>';
         }).join('')+'</div>';
-      }).join('')+'</div>';
+      }
+      if(ticker.length){
+        // The whole ticker read, earliest first; each time links to the moment.
+        html+='<div class="cap" style="margin:.7rem 0 .3rem">Ticker — '+ticker.length+' lines, earliest first</div>'
+          +'<div class="ticker-list">'+ticker.map(function(row){
+            return '<div class="ticker-row"><a class="jump" target="_blank" rel="noopener" href="'+esc(row.url)+'">'+fmt(row.start)+'</a>'
+              +'<span dir="rtl">'+esc(row.text)+'</span></div>';
+          }).join('')+'</div>';
+      }
+      if(!html){
+        html='<div class="empty" style="padding:.8rem">Nothing readable in that window'
+          +(kws.length?'':' — no watchlist keyword matched either')+'.</div>';
+      }
+      resultsEl.innerHTML=html;
     }
   })();
 
@@ -2427,7 +2473,12 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <h2 style="margin-top:0" id="yt-live-heading">Live stream — read audio</h2>
         <p class="sub" id="yt-live-sub" style="color:var(--muted);font-size:.9rem;margin:.1rem 0 .9rem">Streams live right now on your channels. Pick one, choose a window of its timeline,
         and that portion is transcribed and matched against the same watchlist. Separate from bulletins — results appear only here.</p>
-        <div id="yt-live-list"><span class="hint">Open this tab to check what's live…</span></div>
+        <div id="yt-live-datebar" style="display:none;margin:.1rem 0 .7rem">
+          <label style="font-size:.8rem;font-weight:600;color:var(--muted);margin-right:.45rem">Bulletin date</label>
+          <input type="date" id="yt-live-date" style="padding:.45rem .7rem;border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9">
+          <span class="hint" style="margin-left:.5rem">today's live streams + this day's bulletins</span>
+        </div>
+        <div id="yt-live-list"><span class="hint">Open this tab to check what's available…</span></div>
         <div id="yt-live-window" style="display:none">
           <p class="hint" id="yt-live-span" style="margin:.55rem 0 .45rem"></p>
           <div class="live-slider">
@@ -2897,6 +2948,24 @@ def api_live_streams(db: Session = Depends(get_db)):
         raise HTTPException(400, str(exc))
 
 
+@app.get("/api/youtube/ticker-sources")
+def api_ticker_sources(date: str = "", db: Session = Depends(get_db)):
+    """Live streams now + that day's bulletins — sources for the ticker tab."""
+    from app.youtube import livestream
+
+    day = (date or datetime.now(_PKT).date().isoformat()).strip()
+    live = []
+    if day == datetime.now(_PKT).date().isoformat():
+        try:
+            live = livestream.list_live(db)
+            for s in live:
+                s["kind"] = "live"
+        except RuntimeError:
+            live = []
+    bulletins = livestream.list_bulletins_for_date(db, day)
+    return {"date": day, "live": live, "bulletins": bulletins}
+
+
 @app.get("/api/youtube/live/timeline/{video_id}")
 def api_live_timeline(video_id: str):
     """True addressable DVR length for a live stream (streams restart, so the
@@ -2913,6 +2982,7 @@ class _LiveRunIn(BaseModel):
     video_id: str = Field(min_length=5, max_length=32)
     start_seconds: int = Field(ge=0)
     end_seconds: int = Field(gt=0)
+    is_live: bool = True
 
 
 @app.post("/api/youtube/live/run")
@@ -2933,7 +3003,8 @@ def api_live_ticker(inp: _LiveRunIn):
     from app.youtube import livestream
 
     try:
-        job_id = livestream.start_ticker_job(inp.video_id, inp.start_seconds, inp.end_seconds)
+        job_id = livestream.start_ticker_job(
+            inp.video_id, inp.start_seconds, inp.end_seconds, is_live=inp.is_live)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"job": job_id}

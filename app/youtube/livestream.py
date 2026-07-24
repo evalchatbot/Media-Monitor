@@ -388,15 +388,16 @@ def _mmss(seconds: int) -> str:
 # Ticker OCR (visual) — read the scrolling Urdu ticker, match the watchlist
 # ---------------------------------------------------------------------------
 
-# Windows are short on purpose: OCR is one Gemini call per changed frame, and a
-# free-tier key rate-limits fast. 8 min at ~1 changed frame/3s stays usable.
-TICKER_WINDOW_MAX_S = 8 * 60
-_OCR_MIN_GAP_S = 3          # never OCR more often than this (bounds cost)
-_MAX_OCR_PER_JOB = 120      # hard ceiling per run
+# Download every frame first, then OCR — several ticker strips stitched into one
+# Gemini call, so a scrolling ticker needs ~1 call per _TICKER_BATCH frames
+# instead of one each. That is what keeps it inside a free-tier rate limit.
+TICKER_WINDOW_MAX_S = 15 * 60
+_TICKER_BATCH = 8           # ticker strips stitched into a single OCR call
+_MAX_OCR_CALLS = 120        # hard ceiling of Gemini calls per run
 _DEDUP_WINDOW_S = 20        # same keyword seen again within this = same event
 
 
-def start_ticker_job(video_id: str, start_s: int, end_s: int) -> str:
+def start_ticker_job(video_id: str, start_s: int, end_s: int, is_live: bool = True) -> str:
     start_s, end_s = int(start_s), int(end_s)
     if end_s - start_s < MIN_WINDOW_S:
         raise ValueError("window too short — pick at least 10 seconds")
@@ -417,19 +418,23 @@ def start_ticker_job(video_id: str, start_s: int, end_s: int) -> str:
             _jobs.pop(min(_jobs, key=lambda k: _jobs[k]["created_at"]), None)
 
     threading.Thread(
-        target=_run_ticker_job, args=(job_id, video_id, start_s, end_s),
+        target=_run_ticker_job, args=(job_id, video_id, start_s, end_s, is_live),
         name=f"yt-ticker-{job_id}", daemon=True,
     ).start()
     return job_id
 
 
-def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int) -> None:
+def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int,
+                    is_live: bool = True) -> None:
     tmp: Path | None = None
     try:
         _set(job_id, state="downloading",
-             detail=f"pulling video {_mmss(start_s)}–{_mmss(end_s)} from the stream")
+             detail=f"pulling video {_mmss(start_s)}–{_mmss(end_s)}…")
         try:
-            frames, tmp, offset_s = _extract_ticker_frames(video_id, start_s, end_s)
+            if is_live:
+                frames, tmp, offset_s = _extract_ticker_frames(video_id, start_s, end_s)
+            else:
+                frames, tmp, offset_s = _extract_recorded_frames(video_id, start_s, end_s)
         except LiveError as exc:
             _set(job_id, state="error", error=str(exc))
             return
@@ -461,59 +466,252 @@ def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int) -> Non
 
         from app.core.keywords import find_matches
 
-        # Walk frames once/second. Skip a frame whose ticker crop is unchanged
-        # from the last OCR'd one (paging tickers, freeze frames); otherwise OCR
-        # at most every _OCR_MIN_GAP_S so a scrolling ticker can't run up cost.
+        # 1) Crop every frame's ticker band and drop frames identical to the
+        #    previous kept one (freeze frames, paging tickers). This is all
+        #    already downloaded, so it is fast and local.
+        _set(job_id, state="reading", detail="scanning frames…")
+        kept: list[tuple[int, object]] = []
         last_hash = None
-        last_ocr_t = -999
-        ocr_count = 0
-        seen_ts: dict[str, float] = {}   # keyword.casefold() -> last stream-time hit
-        matches: dict[str, list] = {}
-        total = len(frames)
-        for idx, (t_rel, frame_path) in enumerate(frames):
-            t_stream = t_rel + offset_s
+        for t_rel, frame_path in frames:
             crop = _crop_ticker(frame_path)
             if crop is None:
                 continue
             h = _crop_hash(crop)
             if last_hash is not None and _hash_close(h, last_hash):
                 continue
-            if t_stream - last_ocr_t < _OCR_MIN_GAP_S:
-                last_hash = h
-                continue
-            if ocr_count >= _MAX_OCR_PER_JOB:
-                _set(job_id, detail=f"reached the {_MAX_OCR_PER_JOB}-frame cap — shorten the window for full coverage")
-                break
-
-            _set(job_id, state="reading",
-                 detail=f"reading ticker · frame {idx + 1}/{total} · {ocr_count} OCR calls")
-            text = _gemini_ocr(crop)
             last_hash = h
-            last_ocr_t = t_stream
-            ocr_count += 1
-            if not text:
-                continue
+            kept.append((t_rel + offset_s, crop))
 
-            for m in find_matches(text, keywords):
+        # 2) OCR in batches: stitch _TICKER_BATCH strips into one image, one call.
+        entries: list[tuple[int, str]] = []   # (stream_time, ticker_text)
+        n_batches = min(-(-len(kept) // _TICKER_BATCH), _MAX_OCR_CALLS)
+        for bi in range(n_batches):
+            batch = kept[bi * _TICKER_BATCH:(bi + 1) * _TICKER_BATCH]
+            _set(job_id, detail=f"reading ticker · batch {bi + 1}/{n_batches}")
+            texts = _gemini_ocr_batch([c for _, c in batch])
+            for (t, _), txt in zip(batch, texts):
+                if txt and txt.strip():
+                    entries.append((int(t), txt.strip()))
+        if n_batches * _TICKER_BATCH < len(kept):
+            _set(job_id, detail="hit the OCR cap — shorten the window for full coverage")
+
+        # 3) Merge consecutive near-identical reads (a line scrolls across many
+        #    frames) into one entry, keeping the earliest time.
+        ticker = _merge_ticker(entries)
+
+        # 4) Match the watchlist across the chronological ticker text.
+        seen_ts: dict[str, int] = {}
+        matches: dict[str, list] = {}
+        for t, txt in ticker:
+            for m in find_matches(txt, keywords):
                 fold = m.keyword.casefold()
                 prev = seen_ts.get(fold)
-                if prev is not None and t_stream - prev < _DEDUP_WINDOW_S:
-                    seen_ts[fold] = t_stream   # extend the same event
+                if prev is not None and t - prev < _DEDUP_WINDOW_S:
+                    seen_ts[fold] = t
                     continue
-                seen_ts[fold] = t_stream
+                seen_ts[fold] = t
                 matches.setdefault(m.keyword, []).append({
-                    "start": int(t_stream),
-                    "excerpt": text[:200],
-                    "url": f"https://www.youtube.com/watch?v={video_id}&t={int(t_stream)}s",
+                    "start": t, "excerpt": txt[:200],
+                    "url": f"https://www.youtube.com/watch?v={video_id}&t={t}s",
                 })
 
-        _set(job_id, state="done", detail="", matches=matches, ocr_calls=ocr_count)
+        _set(job_id, state="done", detail="", matches=matches,
+             ticker=[{"start": t, "text": txt,
+                      "url": f"https://www.youtube.com/watch?v={video_id}&t={t}s"}
+                     for t, txt in ticker],
+             frames=len(kept), ocr_calls=n_batches)
     except Exception as exc:
         logger.exception("ticker job %s failed", job_id)
         _set(job_id, state="error", error=str(exc)[:300])
     finally:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def list_bulletins_for_date(session, date_str: str) -> list[dict]:
+    """Bulletins with a resolved video on a given day — pickable ticker sources."""
+    from sqlalchemy import select
+
+    from app.db.models import BulletinSlot, YouTubeBulletin, YouTubeChannel
+
+    rows = session.execute(
+        select(YouTubeBulletin, YouTubeChannel, BulletinSlot)
+        .join(YouTubeChannel, YouTubeChannel.id == YouTubeBulletin.channel_db_id)
+        .join(BulletinSlot, BulletinSlot.id == YouTubeBulletin.slot_id)
+        .where(
+            YouTubeBulletin.slot_date == date_str,
+            YouTubeBulletin.video_id.is_not(None),
+        )
+        .order_by(BulletinSlot.local_time)
+    ).all()
+    out: list[dict] = []
+    for b, ch, slot in rows:
+        out.append({
+            "kind": "recorded",
+            "channel": ch.name,
+            "video_id": b.video_id,
+            "title": b.title or f"{ch.name} · {slot.label or slot.local_time}",
+            "slot": slot.label or slot.local_time,
+            "duration_seconds": int(b.duration_seconds or 0),
+        })
+    return out
+
+
+def _extract_recorded_frames(
+    video_id: str, start_s: int, end_s: int
+) -> tuple[list[tuple[int, Path]], Path, int]:
+    """Download a recorded bulletin (480p) and pull one frame per second in the
+    chosen window. Bulletins are short, so the whole file is fetched then the
+    window is cut locally — reliable, and no live-DVR fragment juggling."""
+    import subprocess
+
+    try:
+        import yt_dlp
+    except ImportError:
+        raise LiveError("yt-dlp is not installed on the server")
+    if shutil.which("ffmpeg") is None:
+        raise LiveError("ffmpeg is not available on the server")
+
+    tmp = Path(tempfile.mkdtemp(prefix="yt-rec-"))
+    opts = {
+        "format": "best[height<=480][acodec!=none][vcodec!=none]/best[height<=480]/best",
+        "outtmpl": str(tmp / "vid.%(ext)s"),
+        "quiet": True, "no_warnings": True, "noprogress": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+    except Exception as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise LiveError(f"couldn't download the bulletin video: {str(exc)[:120]}")
+
+    files = sorted(tmp.glob("vid.*"), key=lambda p: p.stat().st_size, reverse=True)
+    if not files or files[0].stat().st_size == 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise LiveError("no video was downloaded for that bulletin")
+
+    fdir = tmp / "frames"
+    fdir.mkdir()
+    subprocess.run(
+        ["ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+         "-ss", str(int(start_s)), "-to", str(int(end_s)),
+         "-i", str(files[0]), "-vf", "fps=1", "-q:v", "4", str(fdir / "f_%04d.jpg")],
+        capture_output=True, timeout=300,
+    )
+    frames = [(i, p) for i, p in enumerate(sorted(fdir.glob("f_*.jpg")))]
+    if not frames:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise LiveError("couldn't extract frames from that window")
+    return frames, tmp, int(start_s)
+
+
+def _merge_ticker(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Collapse consecutive reads of the same scrolling line into one entry.
+
+    A ticker line is on screen for many seconds, so successive OCR reads overlap
+    heavily; keep the longest wording at the earliest time it appeared.
+    """
+    out: list[list] = []
+    for t, txt in entries:
+        n = _norm_ticker(txt)
+        if not n:
+            continue
+        if out:
+            pn = _norm_ticker(out[-1][1])
+            if pn and (pn in n or n in pn or _overlap(pn, n) >= 0.6):
+                if len(n) > len(pn):        # richer wording, keep earliest time
+                    out[-1][1] = txt
+                continue
+        out.append([t, txt])
+    return [(t, txt) for t, txt in out]
+
+
+def _norm_ticker(s: str) -> str:
+    import re
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _overlap(a: str, b: str) -> float:
+    """Word-level Jaccard overlap — cheap sameness score for two ticker reads."""
+    wa, wb = set(a.split()), set(b.split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _gemini_ocr_batch(crops: list) -> list[str]:
+    """OCR several ticker strips in ONE Gemini call by stacking them.
+
+    Returns one string per input crop (padded with '' on a short/failed read).
+    """
+    if not crops:
+        return []
+    try:
+        from PIL import Image
+    except ImportError:
+        return [""] * len(crops)
+
+    width = max(c.width for c in crops)
+    sep = 8
+    strips = [
+        c if c.width == width else c.resize((width, max(1, round(c.height * width / c.width))))
+        for c in crops
+    ]
+    total_h = sum(s.height for s in strips) + sep * (len(strips) - 1)
+    montage = Image.new("RGB", (width, total_h), (0, 0, 0))
+    y = 0
+    for s in strips:
+        montage.paste(s, (0, y))
+        y += s.height + sep
+
+    import base64
+    import io
+    import json as _json
+    import time as _time
+
+    buf = io.BytesIO()
+    montage.save(buf, format="JPEG", quality=88)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    n = len(crops)
+    model = settings.gemini_model or "gemini-flash-latest"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = (
+        f"This image stacks {n} separate Urdu news-ticker strips top to bottom, "
+        f"each separated by a black gap. Transcribe each strip's Urdu text "
+        f"verbatim. Reply ONLY with a JSON array of exactly {n} strings, in "
+        f"top-to-bottom order; use an empty string for any strip you cannot read. "
+        f"No translation, no extra text."
+    )
+    body = {
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+        ]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 1200,
+                             "responseMimeType": "application/json"},
+    }
+    for attempt in range(5):
+        try:
+            r = httpx.post(url, params={"key": settings.gemini_api_key}, json=body, timeout=90)
+        except Exception:
+            _time.sleep(2)
+            continue
+        if r.status_code == 200:
+            try:
+                raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                arr = _json.loads(raw)
+                if isinstance(arr, list):
+                    arr = [str(x or "") for x in arr]
+                    return (arr + [""] * n)[:n]
+            except Exception:
+                return [""] * n
+            return [""] * n
+        if r.status_code in (429, 503):
+            _time.sleep(3 * (attempt + 1))   # rate-limited / overloaded
+            continue
+        logger.info("ticker batch OCR HTTP %s: %s", r.status_code, r.text[:120])
+        return [""] * n
+    return [""] * n
 
 
 def _extract_ticker_frames(
