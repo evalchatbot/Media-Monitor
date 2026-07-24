@@ -42,6 +42,26 @@ def test_overlap_scores():
     assert ls._overlap("وزیراعظم دورہ", "اسٹاک مارکیٹ") == 0.0
 
 
+def test_ticker_cutouts_saved_and_mapped(tmp_path, monkeypatch):
+    """Every ticker line with a captured strip gets a JPEG under
+    storage_dir/ticker/<job>/ and a /media URL; a line with no strip has none,
+    so the UI can show a picture beside each result to verify the OCR."""
+    from PIL import Image
+
+    monkeypatch.setattr(ls.settings, "storage_dir", tmp_path, raising=False)
+    kept = [(10, Image.new("RGB", (200, 40), "white")),
+            (25, Image.new("RGB", (200, 40), "white"))]
+    ticker = [(10, "خبر ایک"), (25, "خبر دو"), (99, "line with no captured strip")]
+
+    out = ls._save_ticker_cutouts("job123", ticker, kept)
+
+    assert set(out.keys()) == {10, 25}, "only lines with a captured strip get an image"
+    assert out[10] == "/media/ticker/job123/10.jpg"
+    assert (tmp_path / "ticker" / "job123" / "10.jpg").exists()
+    assert (tmp_path / "ticker" / "job123" / "25.jpg").exists()
+    assert 99 not in out, "a line without a strip must not claim an image"
+
+
 def test_batch_ocr_returns_one_string_per_crop_on_failure(monkeypatch):
     """A failed/rate-limited call must still return the right-length list so the
     per-frame timestamp alignment never desyncs."""

@@ -422,10 +422,14 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #yt-live-list .live-pick:hover{border-color:var(--blue-mist);background:var(--blue-soft)}
 #yt-live-list input[type=radio]{margin-right:.35rem}
 #yt-live-results .hitrow{margin:.25rem 0}
-.ticker-list{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:var(--r-sm);padding:.35rem .5rem;background:#fffdf9}
-.ticker-row{display:flex;gap:.55rem;align-items:flex-start;padding:.28rem 0;border-bottom:1px solid var(--line)}
+.ticker-list{max-height:560px;overflow:auto;border:1px solid var(--line);border-radius:var(--r-sm);padding:.35rem .5rem;background:#fffdf9}
+.ticker-row{display:flex;gap:.55rem;align-items:flex-start;padding:.45rem 0;border-bottom:1px solid var(--line)}
 .ticker-row:last-child{border-bottom:none}
 .ticker-row span{font-size:.9rem;line-height:1.5;color:var(--ink)}
+.ticker-body{display:flex;flex-direction:column;gap:.3rem;min-width:0;flex:1}
+.ticker-cut{display:block;max-width:100%;height:auto;border:1px solid var(--line);border-radius:4px;background:#000}
+.hitcuts{display:flex;flex-direction:column;gap:.45rem;flex:1 1 100%;margin-top:.15rem}
+.hitcut{display:flex;gap:.5rem;align-items:flex-start}
 .ticker-row .jump{margin-top:0;flex:none}
 .live-slider{margin:.45rem 0}
 .live-slider label{display:block;font-size:.78rem;font-weight:600;color:var(--muted);margin-bottom:.2rem}
@@ -880,19 +884,20 @@ _JS = """
     }
     function render(j){
       var m=j.matches||{},kws=Object.keys(m),ticker=j.ticker||[],html='';
+      function cut(src){return src?('<img class="ticker-cut" loading="lazy" src="'+esc(src)+'" alt="ticker cutout">'):'';}
       if(kws.length){
-        html+='<div class="cap" style="margin:.2rem 0 .3rem">Keyword matches</div><div class="hits">'+kws.map(function(k){
-          return '<div class="hitrow"><span class="hitkw">'+esc(k)+'</span>'+m[k].map(function(h){
-            return '<a class="jump" target="_blank" rel="noopener" href="'+esc(h.url)+'">'+fmt(h.start)+'</a>';
-          }).join('')+'</div>';
+        html+='<div class="cap" style="margin:.2rem 0 .3rem">Keyword matches — each with its ticker cutout to verify</div><div class="hits">'+kws.map(function(k){
+          return '<div class="hitrow"><span class="hitkw">'+esc(k)+'</span><div class="hitcuts">'+m[k].map(function(h){
+            return '<div class="hitcut"><a class="jump" target="_blank" rel="noopener" href="'+esc(h.url)+'">'+fmt(h.start)+'</a>'+cut(h.img)+'</div>';
+          }).join('')+'</div></div>';
         }).join('')+'</div>';
       }
       if(ticker.length){
-        // The whole ticker read, earliest first; each time links to the moment.
+        // The whole ticker read, earliest first; each line shows its own cutout.
         html+='<div class="cap" style="margin:.7rem 0 .3rem">Ticker — '+ticker.length+' lines, earliest first</div>'
           +'<div class="ticker-list">'+ticker.map(function(row){
             return '<div class="ticker-row"><a class="jump" target="_blank" rel="noopener" href="'+esc(row.url)+'">'+fmt(row.start)+'</a>'
-              +'<span dir="rtl">'+esc(row.text)+'</span></div>';
+              +'<div class="ticker-body">'+cut(row.img)+'<span dir="rtl">'+esc(row.text)+'</span></div></div>';
           }).join('')+'</div>';
       }
       if(!html){

@@ -424,8 +424,53 @@ def start_ticker_job(video_id: str, start_s: int, end_s: int, is_live: bool = Tr
     return job_id
 
 
+def _ticker_cut_dir(job_id: str) -> Path:
+    return settings.storage_dir / "ticker" / job_id
+
+
+def _save_ticker_cutouts(job_id: str, ticker, kept) -> dict[int, str]:
+    """Write a JPEG of each ticker line's strip under storage_dir/ticker/<job>/
+    and return {stream_time: /media URL}. Best-effort — a line whose image can't
+    be written just comes back without a picture."""
+    crop_by_time = {int(t): crop for t, crop in kept}
+    out: dict[int, str] = {}
+    img_dir = _ticker_cut_dir(job_id)
+    try:
+        img_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return out
+    for t, _txt in ticker:
+        crop = crop_by_time.get(int(t))
+        if crop is None:
+            continue
+        try:
+            crop.save(img_dir / f"{int(t)}.jpg", format="JPEG", quality=85)
+            out[int(t)] = f"/media/ticker/{job_id}/{int(t)}.jpg"
+        except Exception:
+            continue
+    return out
+
+
+def _gc_ticker_cutouts(max_age_s: int = 24 * 3600) -> None:
+    """Ticker jobs live only in memory, so their cutout folders would pile up.
+    Drop any older than a day at the start of each run."""
+    import time as _time
+
+    base = settings.storage_dir / "ticker"
+    if not base.exists():
+        return
+    cutoff = _time.time() - max_age_s
+    for d in base.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            continue
+
+
 def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int,
                     is_live: bool = True) -> None:
+    _gc_ticker_cutouts()
     tmp: Path | None = None
     try:
         _set(job_id, state="downloading",
@@ -499,6 +544,11 @@ def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int,
         #    frames) into one entry, keeping the earliest time.
         ticker = _merge_ticker(entries)
 
+        # Save the strip image behind every ticker line so each result can be
+        # eyeballed against the OCR — Nastaliq reading is ~85-90%, so a picture
+        # lets the user confirm a match is real rather than trust the text.
+        img_by_time = _save_ticker_cutouts(job_id, ticker, kept)
+
         # 4) Match the watchlist across the chronological ticker text.
         seen_ts: dict[str, int] = {}
         matches: dict[str, list] = {}
@@ -513,11 +563,13 @@ def _run_ticker_job(job_id: str, video_id: str, start_s: int, end_s: int,
                 matches.setdefault(m.keyword, []).append({
                     "start": t, "excerpt": txt[:200],
                     "url": f"https://www.youtube.com/watch?v={video_id}&t={t}s",
+                    "img": img_by_time.get(t),
                 })
 
         _set(job_id, state="done", detail="", matches=matches,
              ticker=[{"start": t, "text": txt,
-                      "url": f"https://www.youtube.com/watch?v={video_id}&t={t}s"}
+                      "url": f"https://www.youtube.com/watch?v={video_id}&t={t}s",
+                      "img": img_by_time.get(t)}
                      for t, txt in ticker],
              frames=len(kept), ocr_calls=n_batches)
     except Exception as exc:
