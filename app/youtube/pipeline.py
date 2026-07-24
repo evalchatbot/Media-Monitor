@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer
 
@@ -633,6 +633,116 @@ def _uploads_for_bulletin_day(ch, b) -> list:
     return same_day or window
 
 
+# --- Transcription claim ---------------------------------------------------
+# Transcription is the paid step (Groq Whisper, billed per audio-hour). Nothing
+# in-process stops two *separate* processes — a redeploy that restarts mid-scan,
+# or a stray second instance — from transcribing the same video at once and
+# throwing all but one result away on the unique-constraint collision. The claim
+# below turns the transcripts.video_id unique row into a cross-process lock: a
+# row whose transcriber is _CLAIM_MARKER is an in-flight claim, and its
+# created_at is when it was taken so a crashed worker's claim goes stale and can
+# be reclaimed instead of blocking forever.
+_CLAIM_MARKER = "transcribing"
+_CLAIM_STALE_S = 20 * 60
+
+
+def _is_fresh_claim(tr: Transcript | None) -> bool:
+    """A claim currently held by a live worker (taken < _CLAIM_STALE_S ago)."""
+    if tr is None or (tr.transcriber or "").lower() != _CLAIM_MARKER:
+        return False
+    started = tr.created_at
+    if started is None:
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - started).total_seconds() < _CLAIM_STALE_S
+
+
+def _needs_transcription(tr: Transcript | None) -> bool:
+    """True when there is no usable real transcript and no live worker making
+    one: tr is missing, a metadata stub, or a dead (stale) claim."""
+    if tr is None:
+        return True
+    if (tr.transcriber or "").lower() == _CLAIM_MARKER:
+        return not _is_fresh_claim(tr)   # stale claim → reclaimable
+    return _is_metadata_only(tr)         # stub → upgrade; real transcript → no
+
+
+def _claim_transcription(
+    session, video_id: str, existing: Transcript | None
+) -> Transcript | None:
+    """Become the sole transcriber of video_id, or return None to signal that
+    another worker got there first (caller must then skip the Groq call).
+
+    Cross-process safe: the video_id unique constraint serialises the INSERT, and
+    the conditional UPDATE's rowcount decides the winner for a stub/stale claim.
+    """
+    now = datetime.now(timezone.utc)
+    if existing is None:
+        claim = Transcript(
+            video_id=video_id, transcriber=_CLAIM_MARKER,
+            model="", text="", segments=[], created_at=now,
+        )
+        session.add(claim)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()           # another worker inserted first
+            return None
+        return claim
+    # A metadata stub or a stale claim: take it iff it is not a fresh claim held
+    # elsewhere. Evaluating staleness inside the WHERE keeps it atomic under row
+    # locking, so two workers racing a stale claim can't both win.
+    stale_before = now - timedelta(seconds=_CLAIM_STALE_S)
+    won = session.execute(
+        update(Transcript)
+        .where(Transcript.id == existing.id)
+        .where(
+            or_(
+                func.lower(Transcript.transcriber) != _CLAIM_MARKER,
+                Transcript.created_at < stale_before,
+            )
+        )
+        .values(transcriber=_CLAIM_MARKER, created_at=now)
+    ).rowcount
+    session.commit()
+    if won != 1:
+        return None
+    return session.execute(
+        select(Transcript).where(Transcript.video_id == video_id)
+    ).scalar_one_or_none()
+
+
+def _finalize_transcript(
+    session, tr: Transcript, *, v, ch, text, segments, meta, bulletin_id,
+    is_live: bool = False,
+) -> None:
+    """Fill a claimed row with the finished transcript, releasing the claim."""
+    tr.bulletin_id = bulletin_id
+    tr.channel_id = ch.channel_id
+    tr.source = ch.name
+    tr.title = v.title
+    tr.url = v.url
+    tr.language = meta.get("language") or "ur"
+    tr.text = text
+    tr.segments = segments
+    tr.duration_seconds = v.duration_seconds
+    tr.is_live = is_live
+    tr.transcriber = "groq" if meta.get("model") not in (None, "metadata") else "metadata"
+    tr.model = meta.get("model") or ""
+    tr.confidence = meta.get("confidence") or {}
+
+
+def _release_claim(session, tr: Transcript | None) -> None:
+    """Transcription produced nothing usable — drop the empty claim row so a
+    later scan retries, rather than leaving a phantom transcript in the table."""
+    if tr is None:
+        return
+    if not (tr.text or tr.segments):
+        session.delete(tr)
+        session.commit()
+
+
 def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, force: bool) -> None:
     b.discovery_status = "discovering"
     b.attempts = (b.attempts or 0) + 1
@@ -690,13 +800,28 @@ def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, forc
     session.commit()
     summary["discovered"] += 1
 
-    # Existing real transcript? skip Groq. Metadata stubs get upgraded.
+    # Transcription is the paid step; guard it with a cross-process claim so a
+    # redeploy mid-scan or a stray second instance never pays Groq twice for the
+    # same video (see _claim_transcription).
     tr = session.execute(
         select(Transcript).where(Transcript.video_id == v.video_id)
     ).scalar_one_or_none()
-    upgrade_metadata = _is_metadata_only(tr)
 
-    if (tr is None or upgrade_metadata) and not settings.youtube_metadata_only:
+    if _is_fresh_claim(tr):
+        # Another worker is transcribing this right now. Leave it for a later
+        # scan to match once the transcript lands; don't pay for it again.
+        b.discovery_status = "transcribing"
+        session.commit()
+        return
+
+    if _needs_transcription(tr) and not settings.youtube_metadata_only:
+        claimed = _claim_transcription(session, v.video_id, existing=tr)
+        if claimed is None:
+            # Lost the race to another worker — skip the Groq call entirely.
+            b.discovery_status = "transcribing"
+            session.commit()
+            return
+        tr = claimed
         b.discovery_status = "transcribing"
         b.transcription_status = "running"
         session.commit()
@@ -729,48 +854,15 @@ def _process_bulletin(session, notifier, b, ch, slot, keywords, summary, *, forc
                 media_source.cleanup_asset(asset)
 
         if text or segments:
-            if upgrade_metadata and tr is not None:
-                tr.bulletin_id = b.id
-                tr.channel_id = ch.channel_id
-                tr.source = ch.name
-                tr.title = v.title
-                tr.url = v.url
-                tr.language = meta.get("language") or "ur"
-                tr.text = text
-                tr.segments = segments
-                tr.duration_seconds = v.duration_seconds
-                tr.transcriber = (
-                    "groq" if meta.get("model") not in (None, "metadata") else "metadata"
-                )
-                tr.model = meta.get("model") or ""
-                tr.confidence = meta.get("confidence") or {}
-                _upsert_cache(session, v, ch, text)
-                session.commit()
-            else:
-                tr = Transcript(
-                    video_id=v.video_id,
-                    bulletin_id=b.id,
-                    channel_id=ch.channel_id,
-                    source=ch.name,
-                    title=v.title,
-                    url=v.url,
-                    language=meta.get("language") or "ur",
-                    text=text,
-                    segments=segments,
-                    duration_seconds=v.duration_seconds,
-                    transcriber="groq" if meta.get("model") not in (None, "metadata") else "metadata",
-                    model=meta.get("model") or "",
-                    confidence=meta.get("confidence") or {},
-                )
-                session.add(tr)
-                _upsert_cache(session, v, ch, text)
-                try:
-                    session.commit()
-                except IntegrityError:
-                    session.rollback()
-                    tr = session.execute(
-                        select(Transcript).where(Transcript.video_id == v.video_id)
-                    ).scalar_one_or_none()
+            _finalize_transcript(
+                session, tr, v=v, ch=ch, text=text, segments=segments,
+                meta=meta, bulletin_id=b.id,
+            )
+            _upsert_cache(session, v, ch, text)
+            session.commit()
+        else:
+            _release_claim(session, tr)   # nothing usable — retry on a later scan
+            tr = None
     elif tr is not None:
         b.transcription_status = "done"
 
@@ -874,10 +966,15 @@ def _process_period_video(
     tr = session.execute(
         select(Transcript).where(Transcript.video_id == v.video_id)
     ).scalar_one_or_none()
-    upgrade_metadata = _is_metadata_only(tr)
-    needs_transcribe = tr is None or upgrade_metadata
 
-    if needs_transcribe and not settings.youtube_metadata_only:
+    if _is_fresh_claim(tr):
+        return   # another worker is transcribing this video right now
+
+    if _needs_transcription(tr) and not settings.youtube_metadata_only:
+        claimed = _claim_transcription(session, v.video_id, existing=tr)
+        if claimed is None:
+            return   # lost the race to another worker — skip the paid Groq call
+        tr = claimed
         asset = media_source.acquire_audio(
             video_id=v.video_id,
             video_url=v.url or f"https://www.youtube.com/watch?v={v.video_id}",
@@ -904,50 +1001,15 @@ def _process_period_video(
                 media_source.cleanup_asset(asset)
 
         if text or segments:
-            if upgrade_metadata and tr is not None:
-                tr.bulletin_id = None
-                tr.channel_id = ch.channel_id
-                tr.source = ch.name
-                tr.title = v.title
-                tr.url = v.url
-                tr.language = meta.get("language") or "ur"
-                tr.text = text
-                tr.segments = segments
-                tr.duration_seconds = v.duration_seconds
-                tr.is_live = False
-                tr.transcriber = (
-                    "groq" if meta.get("model") not in (None, "metadata") else "metadata"
-                )
-                tr.model = meta.get("model") or ""
-                tr.confidence = meta.get("confidence") or {}
-                _upsert_cache(session, v, ch, text)
-                session.commit()
-            elif tr is None:
-                tr = Transcript(
-                    video_id=v.video_id,
-                    bulletin_id=None,
-                    channel_id=ch.channel_id,
-                    source=ch.name,
-                    title=v.title,
-                    url=v.url,
-                    language=meta.get("language") or "ur",
-                    text=text,
-                    segments=segments,
-                    duration_seconds=v.duration_seconds,
-                    is_live=False,
-                    transcriber="groq" if meta.get("model") not in (None, "metadata") else "metadata",
-                    model=meta.get("model") or "",
-                    confidence=meta.get("confidence") or {},
-                )
-                session.add(tr)
-                _upsert_cache(session, v, ch, text)
-                try:
-                    session.commit()
-                except IntegrityError:
-                    session.rollback()
-                    tr = session.execute(
-                        select(Transcript).where(Transcript.video_id == v.video_id)
-                    ).scalar_one_or_none()
+            _finalize_transcript(
+                session, tr, v=v, ch=ch, text=text, segments=segments,
+                meta=meta, bulletin_id=None,
+            )
+            _upsert_cache(session, v, ch, text)
+            session.commit()
+        else:
+            _release_claim(session, tr)   # nothing usable — retry on a later scan
+            tr = None
     elif tr is None and settings.youtube_metadata_only:
         text = f"{v.title}\n{v.description}"
         segments = []
@@ -968,11 +1030,10 @@ def _process_period_video(
         session.add(tr)
         _upsert_cache(session, v, ch, text)
         session.commit()
-    elif tr is not None and not force and not upgrade_metadata:
-        pass  # use existing transcript
     elif tr is None:
         summary["failed"] = summary.get("failed", 0) + 1
         return
+    # else: a real transcript already exists — fall through and match it as-is.
 
     if tr is None:
         return
