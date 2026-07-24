@@ -715,6 +715,7 @@ _JS = """
         fromI=document.getElementById('yt-live-from'),
         toI=document.getElementById('yt-live-to'),
         runBtn=document.getElementById('yt-live-run'),
+        tickerBtn=document.getElementById('yt-live-ticker'),
         statusEl=document.getElementById('yt-live-status'),
         resultsEl=document.getElementById('yt-live-results');
     var picked=null,pollT=null,probeAt=0,headSecs=0;
@@ -786,6 +787,7 @@ _JS = """
               toI.min=0;toI.max=headSecs;toI.step=5;toI.value=headSecs;
               syncLabels();
               winBox.style.display='block';runBtn.style.display='inline-flex';
+              if(tickerBtn)tickerBtn.style.display='inline-flex';
             }).catch(function(){statusEl.textContent='Could not read the stream timeline.';});
           });
         });
@@ -801,25 +803,28 @@ _JS = """
       if(parseInt(toI.value,10)<=parseInt(fromI.value,10)){fromI.value=Math.max(parseInt(toI.value,10)-5,0);}
       syncLabels();
     });
-    if(runBtn)runBtn.addEventListener('click',function(){
+    function launch(endpoint, maxMin){
       if(!picked){statusEl.textContent='Pick a stream first.';return;}
       var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
       if(isNaN(a)||isNaN(b)||b<=a){statusEl.textContent='Slide the handles to choose a window first.';return;}
-      if(b-a>1800){statusEl.textContent='That window is over 30 minutes — shrink it.';return;}
-      resultsEl.innerHTML='';statusEl.textContent='Starting…';runBtn.disabled=true;
-      fetch('/api/youtube/live/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      if(b-a>maxMin*60){statusEl.textContent='That window is over '+maxMin+' minutes — shrink it.';return;}
+      resultsEl.innerHTML='';statusEl.textContent='Starting…';
+      runBtn.disabled=true;if(tickerBtn)tickerBtn.disabled=true;
+      fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({video_id:picked.video_id,start_seconds:a,end_seconds:b})})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
       .then(function(x){
-        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;return;}
+        if(!x.ok){statusEl.textContent=esc(x.j.detail||'Failed to start.');runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;return;}
         poll(x.j.job);
-      }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;});
-    });
+      }).catch(function(){statusEl.textContent='Failed to start.';runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;});
+    }
+    if(runBtn)runBtn.addEventListener('click',function(){launch('/api/youtube/live/run',30);});
+    if(tickerBtn)tickerBtn.addEventListener('click',function(){launch('/api/youtube/live/ticker',8);});
     function poll(id){
       fetch('/api/youtube/live/jobs/'+encodeURIComponent(id))
       .then(function(r){return r.json();}).then(function(j){
-        if(j.state==='done'){runBtn.disabled=false;statusEl.textContent='';render(j);return;}
-        if(j.state==='error'){runBtn.disabled=false;statusEl.textContent=esc(j.error||'Failed.');return;}
+        if(j.state==='done'){runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;statusEl.textContent='';render(j);return;}
+        if(j.state==='error'){runBtn.disabled=false;if(tickerBtn)tickerBtn.disabled=false;statusEl.textContent=esc(j.error||'Failed.');return;}
         statusEl.innerHTML='<span class="spin"></span> '+esc(j.state)+(j.detail?(' — '+esc(j.detail)):'');
         pollT=setTimeout(function(){poll(id);},2000);
       }).catch(function(){pollT=setTimeout(function(){poll(id);},3000);});
@@ -2422,7 +2427,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <p class="hint" id="yt-live-window-info" style="margin:.15rem 0 .6rem"></p>
         </div>
         <div class="row-btns">
-          <button type="button" id="yt-live-run" style="display:none">Transcribe &amp; match</button>
+          <button type="button" id="yt-live-run" style="display:none">Transcribe audio &amp; match</button>
+          <button type="button" id="yt-live-ticker" class="ghost" style="display:none">Read Urdu ticker &amp; match</button>
           <button type="button" class="ghost" id="yt-live-close">Close</button>
         </div>
         <div id="yt-live-status" class="hint" style="margin-top:.55rem"></div>
@@ -2875,6 +2881,18 @@ def api_live_run(inp: _LiveRunIn):
 
     try:
         job_id = livestream.start_job(inp.video_id, inp.start_seconds, inp.end_seconds)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"job": job_id}
+
+
+@app.post("/api/youtube/live/ticker")
+def api_live_ticker(inp: _LiveRunIn):
+    """Read the Urdu ticker over a live-stream window and match the watchlist."""
+    from app.youtube import livestream
+
+    try:
+        job_id = livestream.start_ticker_job(inp.video_id, inp.start_seconds, inp.end_seconds)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"job": job_id}

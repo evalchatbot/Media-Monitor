@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     # as Google rotates models (dated versions get 404'd for new keys).
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
+    # Live-ticker OCR crop (fraction of frame height/width). The main Urdu
+    # ticker sits in the lower third; the right edge is trimmed to drop the
+    # channel logo. Tunable per deployment if a channel's ticker sits elsewhere.
+    ticker_crop_top: float = 0.72
+    ticker_crop_bottom: float = 0.92
+    ticker_crop_right: float = 0.90
     # Anthropic (used when no Groq key is set).
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"   # current latest; override via LLM_MODEL
