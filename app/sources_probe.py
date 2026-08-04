@@ -51,6 +51,46 @@ def remove_custom_source(name: str) -> bool:
     return True
 
 
+# --- Removed (hidden) papers ------------------------------------------------
+# Built-in newspaper/e-paper sources live in code, so "removing" one is a
+# persisted hide: it drops out of the picker, stops being scraped, and its
+# stored results are purged. Re-adding the same name un-hides it.
+_HIDDEN_PATH = settings.storage_dir.parent / "hidden_papers.json"
+
+
+def hidden_papers() -> set[str]:
+    """Case-folded display names the user has removed from the newspaper list."""
+    if not _HIDDEN_PATH.exists():
+        return set()
+    try:
+        data = json.loads(_HIDDEN_PATH.read_text(encoding="utf-8"))
+        return {str(x).strip().casefold() for x in data} if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def _write_hidden(names: set[str]) -> None:
+    _HIDDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _HIDDEN_PATH.write_text(json.dumps(sorted(names), indent=2, ensure_ascii=False),
+                            encoding="utf-8")
+
+
+def hide_paper(name: str) -> None:
+    names = hidden_papers()
+    names.add((name or "").strip().casefold())
+    _write_hidden(names)
+
+
+def unhide_paper(name: str) -> None:
+    names = hidden_papers()
+    names.discard((name or "").strip().casefold())
+    _write_hidden(names)
+
+
+def is_hidden(name: str) -> bool:
+    return (name or "").strip().casefold() in hidden_papers()
+
+
 def probe(kind: str, url: str) -> dict:
     """Return {ok, summary, detail, kind, url, ...} for UI display."""
     kind = (kind or "").strip().lower()

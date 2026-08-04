@@ -220,6 +220,74 @@ def _dawn(d: _date, city: str) -> list[EPage]:
     return pages
 
 
+# -------------------------------------------------------------- jehan -------
+_JEHAN_CITIES = ["karachi", "lahore", "islamabad", "multan", "gujranwala"]
+
+
+def _jehan(d: _date, city: str) -> list[EPage]:
+    """Jehan Pakistan (Urdu). Full page scans sit at a constructable URL
+      /epaper/epaper/{city}/{DDMMYY}/p{N}.jpg
+    so we probe page1..N until they run out, like the Jang/Dawn adapters. (The
+    epaper.php index only carries low-res thumbnails.)"""
+    ddmmyy = d.strftime("%d%m%y")
+    tried, order = set(), [(city or "karachi").lower()] + _JEHAN_CITIES
+    for c in order:
+        if c in tried:
+            continue
+        tried.add(c)
+        base = f"https://jehanpakistan.com/epaper/epaper/{c}/{ddmmyy}"
+        if not _probe_image(f"{base}/p1.jpg"):
+            continue
+        index = f"https://jehanpakistan.com/epaper/epaper.php?edition={c}&date={ddmmyy}"
+        pages = []
+        for n in range(1, settings.epaper_max_pages + 1):
+            url = f"{base}/p{n}.jpg"
+            if n > 1 and not _probe_image(url):
+                continue
+            pages.append(EPage(
+                paper="jehanpakistan", source="Jehan Pakistan", city=c,
+                date=d.isoformat(), page_no=n, image_url=url, viewer_url=index,
+            ))
+        if pages:
+            return pages
+    return []
+
+
+# -------------------------------------------------------------- dunya -------
+# e.dunya.com.pk presents a broken TLS chain (missing intermediate), so every
+# request to it skips verification. The edition download in the pipeline does
+# the same for this host.
+_DUNYA_EDITIONS = {"lahore": "LHR", "karachi": "KCH", "islamabad": "ISL",
+                   "gujranwala": "GUJ", "multan": "MUL", "faisalabad": "FAB"}
+
+
+def _dunya(d: _date, city: str) -> list[EPage]:
+    """Dunya (Urdu). The edition at e.dunya.com.pk/index.php?e_name={CODE} lists
+    the day's page scans under /news/{YYYY}/{Month}/{YYYY-MM-DD}/{CODE}/…jpg."""
+    code = _DUNYA_EDITIONS.get((city or "lahore").lower(), "LHR")
+    url = f"https://e.dunya.com.pk/index.php?e_name={code}"
+    try:
+        r = httpx.get(url, headers=_H, timeout=30, follow_redirects=True, verify=False)
+        r.raise_for_status()
+        html = r.text
+    except Exception as exc:
+        logger.warning("dunya: index fetch failed: %s", exc)
+        return []
+    ds = d.isoformat()
+    imgs = re.findall(rf"(/news/\d{{4}}/\w+/{ds}/{code}/[\w/]+?/[\w.-]+\.jpg)", html)
+    seen, pages = set(), []
+    for path in imgs:
+        if path in seen:
+            continue
+        seen.add(path)
+        pages.append(EPage(
+            paper="dunya", source="Dunya", city=code.lower(), date=ds,
+            page_no=len(pages) + 1,
+            image_url="https://e.dunya.com.pk" + path, viewer_url=url,
+        ))
+    return pages
+
+
 SOURCES: dict[str, tuple] = {
     # slug: (display name, language, adapter)
     "dawn": ("Dawn", "en", _dawn),
@@ -228,12 +296,13 @@ SOURCES: dict[str, tuple] = {
     "jang": ("Jang", "ur", _jang),
     "express": ("Express Urdu", "ur", _express),
     "nawaiwaqt": ("Nawa-i-Waqt", "ur", _nawaiwaqt),
+    "jehanpakistan": ("Jehan Pakistan", "ur", _jehan),
+    "dunya": ("Dunya", "ur", _dunya),
 }
 
 # Papers in the monitoring set with no e-paper we can fetch (shown in the UI so
 # the coverage story is explicit rather than silently absent).
 UNSUPPORTED: dict[str, str] = {
-    "dunya": "Dunya — e-paper site has a broken TLS certificate",
     "ary": "ARY News — TV channel, no print edition",
 }
 
@@ -263,6 +332,9 @@ def list_pages(slug: str, d: _date | None = None, city: str | None = None) -> li
 
 
 def enabled_slugs() -> list[str]:
+    from app import sources_probe
+
     only = {s.strip() for s in settings.epaper_papers.split(",") if s.strip()}
-    slugs = list(SOURCES)
+    hidden = sources_probe.hidden_papers()   # display names the user removed
+    slugs = [s for s in SOURCES if SOURCES[s][0].strip().casefold() not in hidden]
     return [s for s in slugs if s in only] if only else slugs

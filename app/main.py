@@ -440,6 +440,13 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 .ch-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem}
 .ch-tag{display:inline-flex;align-items:center;padding:.22rem .65rem;border-radius:999px;font-size:.78rem;
   font-weight:600;background:var(--blue-soft);color:var(--blue-deep);border:1px solid var(--blue-mist)}
+.chip-x{border:none;background:none;cursor:pointer;font-size:1rem;line-height:1;margin-left:.3rem;
+  padding:0 .12rem;color:inherit;opacity:.5;border-radius:999px}
+.chip-x:hover{opacity:1;color:#c0392b}
+.src-x{border:none;background:none;cursor:pointer;font-size:.95rem;line-height:1;margin-left:.15rem;
+  padding:0 .15rem;color:var(--muted);opacity:.55;border-radius:999px}
+.src-x:hover{opacity:1;color:#c0392b}
+.paper-item{display:inline-flex;align-items:center;gap:.1rem}
 
 .spin{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;
   border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
@@ -1179,14 +1186,16 @@ _JS = """
 
 
 def _paper_names() -> list[str]:
-    """Unique publication names shown in the filter (websites + e-papers)."""
+    """Unique publication names shown in the filter (websites + e-papers).
+    Papers the user removed are hidden here so they drop out of the picker."""
     names: list[str] = ["Dawn"]
     names.extend(c.source for c in SITE_CONFIGS)
     names.extend(meta[0] for meta in sources.SOURCES.values())
     names.extend(r["name"] for r in sources_probe.custom_sources() if r.get("name"))
+    hidden = sources_probe.hidden_papers()
     out, seen = [], set()
     for n in names:
-        if n not in seen:
+        if n not in seen and n.strip().casefold() not in hidden:
             seen.add(n)
             out.append(n)
     return out
@@ -1581,6 +1590,29 @@ def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
         db.commit()
     return {"mentions_deleted": deleted, "mentions_updated": 0,
             "files_deleted": files, "visuals_refreshed": 0}
+
+
+def _purge_source_results(db: Session, source_name: str, modules: tuple[str, ...]) -> int:
+    """Delete every stored mention from one source (a newspaper/e-paper name, or
+    a YouTube channel name) plus its now-orphan media — so a removed source's
+    result cards vanish. Mentions link to a source only by its display name."""
+    needle = (source_name or "").strip().casefold()
+    if not needle:
+        return 0
+    deleted = 0
+    for m in db.execute(select(Mention)).scalars().all():
+        if (m.module or "") not in modules:
+            continue
+        if (m.source or "").strip().casefold() != needle:
+            continue
+        paths = {m.screenshot_path, m.full_screenshot_path, *(m.keyword_media or {}).values()}
+        for path in paths:
+            _unlink_orphan_media(db, path, m.id)
+        db.delete(m)
+        deleted += 1
+    if deleted:
+        db.commit()
+    return deleted
 
 
 def _scrub_deleted_keywords(db: Session) -> dict:
@@ -2126,8 +2158,12 @@ def home(request: Request, db: Session = Depends(get_db)):
     for name in papers_all:
         chk = " checked" if name in selected_set else ""
         boxes += (
+            f'<span class="paper-item">'
             f'<label><input type="checkbox" name="paper" value="{html.escape(name)}"{chk}>'
             f"{html.escape(name)}</label>"
+            f'<button type="button" class="src-x" data-name="{html.escape(name)}" '
+            f'onclick="removePaper(this)" title="Remove this paper">&times;</button>'
+            f'</span>'
         )
 
     banner = ""
@@ -2145,7 +2181,13 @@ def home(request: Request, db: Session = Depends(get_db)):
     # Only the keyword queue drives chip/results spinners — scheduled crawls
     # must not leave the UI spinning forever.
     results_scanning = bool(q_st.get("running"))
-    if qp.get("removed"):
+    if qp.get("paper_removed"):
+        banner = (
+            f'<div class="banner ok">Removed <b>{html.escape(qp.get("paper_removed"))}</b> from the '
+            "newspapers. It no longer appears, is no longer scanned, and its stored results were "
+            "cleared. Add it again from “+ Add more” to bring it back.</div>"
+        )
+    elif qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
             "watchlist. Its results remain safely retained for 90 days and return if you add it again."
@@ -2259,6 +2301,16 @@ def home(request: Request, db: Session = Depends(get_db)):
             <button type="button" class="ghost" id="papers-add">+ Add more</button>
           </div>
           <div class="papers">{boxes}</div>
+          <script>
+          function removePaper(btn){{
+            var name=btn.getAttribute('data-name')||'';
+            if(!confirm('Remove '+name+' from newspapers?\\nIt will stop being scanned and its stored results will be cleared.'))return;
+            var body=new URLSearchParams(); body.append('name', name);
+            fetch('/ui/papers/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:body}})
+              .then(function(){{location.href='/?paper_removed='+encodeURIComponent(name);}})
+              .catch(function(){{location.reload();}});
+          }}
+          </script>
         </div>
         <div class="actions">
           <button type="submit">Show results</button>
@@ -2391,6 +2443,11 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             f'<div class="banner ok">Added channel <b>{html.escape(qp.get("channel_added"))}</b> '
             "with auto-detected bulletin slots. Daily bulletin scans run on schedule.</div>"
         )
+    elif qp.get("channel_removed"):
+        banner = (
+            f'<div class="banner ok">Removed channel <b>{html.escape(qp.get("channel_removed"))}</b> '
+            "and its stored results. Re-add it any time to resume scanning.</div>"
+        )
     elif qp.get("scan_started"):
         banner = (
             f'<div class="banner ok">Scanning <b>{html.escape(qp.get("scan_started"))}</b> — '
@@ -2401,7 +2458,12 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         select(YouTubeChannel).where(YouTubeChannel.active.is_(True)).order_by(YouTubeChannel.name)
     ).scalars().all()
     ch_tags = "".join(
-        f'<span class="ch-tag">{html.escape(c.name)}</span>' for c in channels
+        f'<span class="ch-tag">{html.escape(c.name)}'
+        f'<form method="post" action="/ui/youtube/channels/{c.id}/delete" style="display:inline;margin:0" '
+        f'onsubmit="return confirm(\'Remove this channel and its stored results?\')">'
+        f'<button type="submit" class="chip-x" title="Remove channel">&times;</button></form>'
+        f'</span>'
+        for c in channels
     ) or '<span class="hint">No channels yet.</span>'
 
     p_start_iso = period_start.isoformat() if period_start else ""
@@ -2942,6 +3004,33 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
     return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
+@app.post("/ui/papers/delete")
+def ui_delete_paper(name: str = Form(...), db: Session = Depends(get_db)):
+    """Remove a newspaper/e-paper: hide it from the picker, stop scraping it, and
+    purge its stored result cards. Re-adding the same name un-hides it."""
+    name = (name or "").strip()
+    if name:
+        sources_probe.hide_paper(name)
+        sources_probe.remove_custom_source(name)
+        _purge_source_results(db, name, ("newspaper", "epaper"))
+    return RedirectResponse(f"/?{urlencode({'paper_removed': name})}", status_code=303)
+
+
+@app.post("/ui/youtube/channels/{cid}/delete")
+def ui_delete_channel(cid: int, db: Session = Depends(get_db)):
+    """Remove a YouTube channel: deactivate it (hides it from every scan and the
+    picker) and purge its result cards."""
+    ch = db.get(YouTubeChannel, cid)
+    if not ch:
+        return RedirectResponse("/youtube", status_code=303)
+    name = ch.name
+    ch.active = False
+    db.commit()
+    _purge_source_results(db, name, ("youtube",))
+    q = urlencode({"channel_removed": name, "date": datetime.now(_PKT).date().isoformat()})
+    return RedirectResponse(f"/youtube?{q}", status_code=303)
+
+
 @app.get("/api/youtube/live")
 def api_live_streams(db: Session = Depends(get_db)):
     """Streams live right now on the active channels — for the Live panel."""
@@ -3175,6 +3264,7 @@ def api_save_custom_source(body: _CustomSourceIn):
         return {"ok": False, "summary": "Enter a display name before saving."}
     if not body.url.startswith(("http://", "https://")):
         return {"ok": False, "summary": "Need a valid URL to save."}
+    sources_probe.unhide_paper(name)   # re-adding a removed paper un-hides it
     sources_probe.save_custom_source({
         "name": name,
         "kind": body.kind,
@@ -3337,8 +3427,13 @@ def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_d
     existing = db.execute(
         select(YouTubeChannel).where(YouTubeChannel.channel_id == body.channel_id.strip())
     ).scalar_one_or_none()
-    if existing:
+    if existing and existing.active:
         return {"ok": False, "summary": f"“{existing.name}” is already added."}
+    if existing and not existing.active:
+        existing.active = True          # re-adding a removed channel reactivates it
+        db.commit()
+        ensure_due_bulletins(db)
+        return {"ok": True, "summary": f"Re-added “{existing.name}”.", "name": existing.name}
     row = channel_probe.save_channel(
         db,
         channel_id=body.channel_id.strip(),

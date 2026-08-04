@@ -117,10 +117,18 @@ def build_scrapers():
     """All active newspaper scrapers. Dawn keeps its bespoke class; the rest are
     config-driven. NEWSPAPER_SITES (comma-separated slugs) limits which run;
     empty = all."""
+    from app import sources_probe
+
     respect = settings.respect_robots_txt
     only = {s.strip() for s in settings.newspaper_sites.split(",") if s.strip()}
-    scrapers = [DawnScraper(respect_robots=respect)]
-    scrapers += [ConfigurableScraper(cfg, respect_robots=respect) for cfg in SITE_CONFIGS]
+    hidden = sources_probe.hidden_papers()   # display names the user removed
+    scrapers = []
+    if "dawn" not in hidden:
+        scrapers.append(DawnScraper(respect_robots=respect))
+    scrapers += [
+        ConfigurableScraper(cfg, respect_robots=respect)
+        for cfg in SITE_CONFIGS if cfg.source.strip().casefold() not in hidden
+    ]
     if only:
         scrapers = [s for s in scrapers if s.name in only]
     return scrapers

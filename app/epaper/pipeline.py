@@ -102,9 +102,11 @@ def _download(pg: sources.EPage) -> Path | None:
     out = settings.storage_dir / "epaper" / pg.paper / pg.date
     out.mkdir(parents=True, exist_ok=True)
     dest = out / f"{pg.city}_p{pg.page_no:02d}.jpg"
+    # e.dunya.com.pk has a broken TLS chain; its scans need verification off.
+    verify = "e.dunya.com.pk" not in pg.image_url
     try:
         with httpx.stream("GET", pg.image_url, headers=_UA, timeout=60,
-                          follow_redirects=True) as r:
+                          follow_redirects=True, verify=verify) as r:
             r.raise_for_status()
             with open(dest, "wb") as fh:
                 for chunk in r.iter_bytes():
