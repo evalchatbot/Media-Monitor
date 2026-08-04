@@ -1617,8 +1617,25 @@ def _purge_source_results(db: Session, source_name: str, modules: tuple[str, ...
 
 def _scrub_deleted_keywords(db: Session) -> dict:
     """Strip keyword labels that no longer exist in the watchlist; drop empty mentions.
-    Rebuild visuals on rows that keep other keywords so old highlights disappear."""
+    Rebuild visuals on rows that keep other keywords so old highlights disappear.
+
+    This only has work to do when a keyword was DELETED, but it used to run a full
+    `SELECT * FROM mentions` on every home-page load — the main reason the page
+    crawled (and churned the table) as data grew. Skip the scan unless the active
+    keyword set actually changed since the last run."""
+    import hashlib
+
+    empty = {"mentions_deleted": 0, "mentions_updated": 0,
+             "files_deleted": 0, "visuals_refreshed": 0}
     known = _known_keyword_fold(db)
+    fp = hashlib.sha1("|".join(sorted(known)).encode("utf-8")).hexdigest()
+    fp_path = settings.storage_dir.parent / ".kw_scrub_state"
+    try:
+        if fp_path.read_text(encoding="utf-8").strip() == fp:
+            return {**empty, "skipped": True}   # keyword set unchanged → nothing to scrub
+    except Exception:
+        pass
+
     deleted = updated = files = refreshed = 0
     need_web_backfill = False
     rows = db.execute(select(Mention)).scalars().all()
@@ -1652,6 +1669,11 @@ def _scrub_deleted_keywords(db: Session) -> dict:
             backfill_screenshots(limit=40)
         except Exception as exc:
             logger.warning("post-scrub screenshot backfill failed: %s", exc)
+    try:                                    # remember this keyword set so we skip next time
+        fp_path.parent.mkdir(parents=True, exist_ok=True)
+        fp_path.write_text(fp, encoding="utf-8")
+    except Exception:
+        pass
     return {"mentions_deleted": deleted, "mentions_updated": updated,
             "files_deleted": files, "visuals_refreshed": refreshed}
 
