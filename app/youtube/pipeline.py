@@ -1,6 +1,7 @@
 """YouTube bulletin pipeline: discover → classify → transcribe → match → frame."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -56,6 +57,43 @@ def _write_progress(**payload) -> None:
 def _clear_progress() -> None:
     try:
         _PROGRESS_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# --- Re-match gate ---------------------------------------------------------
+# An unattended scan re-matches EVERY already-processed ("ready"/"no_match")
+# bulletin on every run so a newly added keyword reaches old bulletins too.
+# But when the keyword set is unchanged there is nothing new to find, and
+# re-emitting each mention re-adds any (mention, keyword) association the
+# rolling-window policy trimmed moments earlier — an endless per-scan
+# DELETE+INSERT/UPDATE tug-of-war that bloats the mentions table with dead
+# tuples. So gate the re-match on a fingerprint of the active keyword set (the
+# same idea as the home-page keyword scrub): a no-keyword-change auto scan
+# re-matches nothing and therefore writes nothing.
+def _rematch_state_file():
+    # Beside the scrub's own state file; resolved at call time so a test that
+    # points storage_dir at a temp dir is honoured.
+    return settings.storage_dir.parent / ".yt_rematch_state"
+
+
+def _keyword_fingerprint(keywords: list[tuple[str, str]]) -> str:
+    payload = "\n".join(sorted(f"{text}\x1f{lang}" for text, lang in keywords))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _rematch_fingerprint_seen(fp: str) -> bool:
+    try:
+        return _rematch_state_file().read_text(encoding="utf-8").strip() == fp
+    except Exception:
+        return False
+
+
+def _store_rematch_fingerprint(fp: str) -> None:
+    try:
+        path = _rematch_state_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(fp, encoding="utf-8")
     except Exception:
         pass
 
@@ -176,6 +214,13 @@ def run_youtube_scan(
             _clear_progress()
             return summary
 
+        # Only the unattended full scan gates the re-match of already-processed
+        # bulletins; a targeted scan (specific keywords / date / channel, or
+        # forced) always re-matches because the user asked for exactly that.
+        auto_scan = not (channel_ids or keyword_ids or slot_date or slot_times or force)
+        kw_fingerprint = _keyword_fingerprint(keywords)
+        rematch_ready = not (auto_scan and _rematch_fingerprint_seen(kw_fingerprint))
+
         _write_progress(
             phase="starting",
             slot_date=slot_date or "",
@@ -248,8 +293,12 @@ def run_youtube_scan(
                 if _is_metadata_only(existing):
                     upgrade_meta = True  # fall through → download bulletin URL → Groq
                 else:
-                    # Still rematch if new keywords arrived.
-                    if keywords:
+                    # Re-match applies newly added keywords to this already-done
+                    # bulletin. Skip it on an unattended scan whose keyword set is
+                    # unchanged: there is nothing new to find, and re-emitting only
+                    # churns the mentions table against the rolling-window policy
+                    # (see _keyword_fingerprint).
+                    if keywords and rematch_ready:
                         _rematch_bulletin(session, notifier, b, ch, slot, keywords, summary)
                     continue
             if not effective_force and not upgrade_meta and not _is_due(b, slot, ch):
@@ -267,6 +316,12 @@ def run_youtube_scan(
                 b.last_processed_at = datetime.now(timezone.utc)
                 session.commit()
                 summary["failed"] += 1
+
+        # Remember the keyword set this scan matched against so the next
+        # unattended scan can skip re-matching while it stays unchanged. Only
+        # after a full pass — a targeted scan must not move the auto-scan gate.
+        if auto_scan:
+            _store_rematch_fingerprint(kw_fingerprint)
 
         result_policy.enforce_limits(session)
         _clear_progress()
