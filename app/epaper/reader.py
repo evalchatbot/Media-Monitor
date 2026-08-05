@@ -51,10 +51,12 @@ Output the transcription only — no commentary, no translation."""
 
 
 def has_key() -> bool:
-    return bool(settings.groq_api_key or settings.anthropic_api_key)
+    return bool(settings.gemini_api_key or settings.groq_api_key or settings.anthropic_api_key)
 
 
 def provider() -> str:
+    if settings.gemini_api_key:
+        return "gemini"
     if settings.groq_api_key:
         return "groq"
     if settings.anthropic_api_key:
@@ -63,7 +65,13 @@ def provider() -> str:
 
 
 def read_page(image_path: str | Path) -> str:
-    """Return the page's text. Raises on API failure (caller records status)."""
+    """Return the page's text. Raises on API failure (caller records status).
+
+    Gemini is preferred: Groq dropped its Llama-4 vision models, so the Groq path
+    now 404s. Gemini reads Urdu Nastaliq well and is already used for tickers and
+    clippings."""
+    if settings.gemini_api_key:
+        return _read_gemini(Path(image_path))
     if settings.groq_api_key:
         return _read_groq(Path(image_path))
     if settings.anthropic_api_key:
@@ -115,6 +123,46 @@ def _read_groq(image_path: Path) -> str:
         logger.info("e-paper read (groq): %s -> %d chars", image_path.name, len(text))
         return text
     raise RuntimeError(f"groq read failed after retries: {last}")
+
+
+# --------------------------------------------------------------- gemini -----
+def _read_gemini(image_path: Path) -> str:
+    b64, media_type = _encode(image_path)
+    model = settings.gemini_model or "gemini-flash-latest"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "contents": [{"parts": [
+            {"text": _PROMPT},
+            {"inline_data": {"mime_type": media_type, "data": b64}},
+        ]}],
+        # A dense full page can run long; keep the cap high so text isn't cut off
+        # (truncated text = missed keyword matches).
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 16384},
+    }
+    last: Exception | None = None
+    for attempt in range(5):
+        try:
+            r = httpx.post(url, params={"key": settings.gemini_api_key},
+                           json=body, timeout=180)
+        except Exception as exc:
+            last = exc
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code in (429, 500, 502, 503):
+            wait = float(r.headers.get("retry-after") or (3 * (attempt + 1)))
+            logger.info("gemini: %s — retrying in %.0fs", r.status_code, wait)
+            time.sleep(min(wait, 60))
+            continue
+        r.raise_for_status()
+        data = r.json()
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+        except (KeyError, IndexError):
+            text = ""
+        logger.info("e-paper read (gemini): %s -> %d chars", image_path.name, len(text))
+        return text
+    raise RuntimeError(f"gemini read failed after retries: {last}")
 
 
 # ------------------------------------------------------------- anthropic ----
