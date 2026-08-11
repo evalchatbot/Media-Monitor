@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from config import BASE_DIR, settings
 from app.db.base import SessionLocal, init_db
-from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, YouTubeChannel
+from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, NewsSource, YouTubeChannel
 from app.core import keyword_scan_queue, result_policy
 from app.live import jobs as live_jobs, search as live_search
 from app.core.keywords import script_language
@@ -2434,7 +2434,10 @@ def home(request: Request, db: Session = Depends(get_db)):
         date_s = show_date.isoformat()
 
     keyword = (qp.get("q") or qp.get("kw") or "").strip()
-    papers_all = _paper_names()
+    sources_all = db.execute(
+        select(NewsSource).where(NewsSource.active.is_(True)).order_by(NewsSource.name)
+    ).scalars().all()
+    papers_all = [s.name for s in sources_all]
     selected = qp.getlist("paper")
     searched = "go" in qp or bool(keyword) or bool(selected) or ("date" in qp)
 
@@ -2448,17 +2451,22 @@ def home(request: Request, db: Session = Depends(get_db)):
         selected = list(papers_all)
 
     selected_set = set(selected)
-    boxes = ""
-    for name in papers_all:
-        chk = " checked" if name in selected_set else ""
-        boxes += (
-            f'<span class="paper-item">'
-            f'<label><input type="checkbox" name="paper" value="{html.escape(name)}"{chk}>'
-            f"{html.escape(name)}</label>"
-            f'<button type="button" class="src-x" data-paper-del="{html.escape(name, quote=True)}" '
-            f'title="Remove this paper">&times;</button>'
-            f'</span>'
-        )
+    if sources_all:
+        boxes = ""
+        for s in sources_all:
+            chk = " checked" if s.name in selected_set else ""
+            kind = "E-paper" if s.kind == "epaper" else "Website"
+            boxes += (
+                f'<span class="paper-item">'
+                f'<label><input type="checkbox" name="paper" value="{html.escape(s.name)}"{chk}>'
+                f'{html.escape(s.name)} <small class="src-kind">{kind}</small></label>'
+                f'<button type="button" class="src-x" data-paper-del="{html.escape(s.name, quote=True)}" '
+                f'title="Remove this source">&times;</button>'
+                f'</span>'
+            )
+    else:
+        boxes = ('<span class="hint">No newspapers or e-papers yet — click '
+                 "“+ Add more” to add one by its link.</span>")
 
     banner = ""
     q_st = keyword_scan_queue.status()
@@ -3296,13 +3304,12 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db), request: Request 
 @app.post("/ui/papers/delete")
 def ui_delete_paper(name: str = Form(...), db: Session = Depends(get_db),
                     request: Request = None):
-    """Remove a newspaper/e-paper: hide it from the picker so it stops being
-    searched. Live-only, so there are no stored result cards to purge — this is
-    now instant. Re-adding the same name un-hides it."""
+    """Remove a user-added newspaper/e-paper from the DB so it's no longer in the
+    picker or searched. Instant — nothing else to clean up."""
     name = (name or "").strip()
     if name:
-        sources_probe.hide_paper(name)
-        sources_probe.remove_custom_source(name)
+        db.execute(delete(NewsSource).where(func.lower(NewsSource.name) == name.casefold()))
+        db.commit()
     if _wants_json(request):
         return JSONResponse({"ok": True, "name": name})
     return RedirectResponse(f"/?{urlencode({'paper_removed': name})}", status_code=303)
@@ -3489,9 +3496,23 @@ def api_live_search(request: Request,
     if not keywords:
         return JSONResponse(
             {"error": "Type a word to search, or add keywords to your watchlist first."}, 400)
-    sources_set = {p.strip() for p in paper if p and p.strip()} or None
+
+    # Sources are ONLY what the user added (by link). No built-in papers.
+    rows = db.execute(
+        select(NewsSource).where(NewsSource.active.is_(True))
+    ).scalars().all()
+    sel_names = {p.strip().casefold() for p in paper if p and p.strip()}
+    if sel_names:
+        rows = [r for r in rows if (r.name or "").casefold() in sel_names]
+    sources_list = [
+        {"name": r.name, "url": r.url, "kind": r.kind, "language": r.language or "en"}
+        for r in rows
+    ]
+    if not sources_list:
+        return JSONResponse(
+            {"error": "Add a newspaper or e-paper first (＋ Add more) and select it, then search."}, 400)
     jid = live_jobs.run("newspaper", live_search.search_press,
-                        keywords, sources_set, (date or today).strip())
+                        keywords, sources_list, (date or today).strip())
     return {"job": jid, "module": "newspaper"}
 
 
@@ -3741,21 +3762,34 @@ def api_probe_source(body: _ProbeIn):
 
 
 @app.post("/api/custom-sources")
-def api_save_custom_source(body: _CustomSourceIn):
+def api_save_custom_source(body: _CustomSourceIn, db: Session = Depends(get_db)):
+    """Save a user-added newspaper / e-paper to the DB. Its URL is what live
+    search scrapes — there are no built-in papers."""
     name = body.name.strip()
     if not name:
         return {"ok": False, "summary": "Enter a display name before saving."}
     if not body.url.startswith(("http://", "https://")):
-        return {"ok": False, "summary": "Need a valid URL to save."}
-    sources_probe.unhide_paper(name)   # re-adding a removed paper un-hides it
-    sources_probe.save_custom_source({
-        "name": name,
-        "kind": body.kind,
-        "url": body.url,
-        "summary": body.summary,
-        "detail": body.detail,
-    })
-    return {"ok": True, "summary": f"Saved “{name}” to the filter list."}
+        return {"ok": False, "summary": "Need a valid link (http/https) to save."}
+    kind = "epaper" if (body.kind or "").strip().lower() == "epaper" else "newspaper"
+    existing = db.execute(
+        select(NewsSource).where(func.lower(NewsSource.name) == name.casefold())
+    ).scalar_one_or_none()
+    if existing:
+        existing.url = body.url.strip()
+        existing.kind = kind
+        existing.active = True
+        db.commit()
+        row_id = existing.id
+    else:
+        row = NewsSource(name=name, url=body.url.strip(), kind=kind,
+                         language=detect_keyword_language(name))
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        row_id = row.id
+    label = "e-paper" if kind == "epaper" else "newspaper"
+    return {"ok": True, "id": row_id, "name": name, "kind": kind,
+            "summary": f"Saved {label} “{name}”. It will be searched live."}
 
 
 @app.get("/api/keywords")

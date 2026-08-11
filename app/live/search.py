@@ -34,73 +34,68 @@ def _match_labels(haystack: str, keywords: list[tuple[str, str]]) -> list[str]:
     return sorted({m.keyword for m in matches}) if matches else []
 
 
-def _scraper_labels(scraper) -> set[str]:
-    """Every name a scraper can be selected by, casefolded.
-
-    The picker shows a scraper's DISPLAY name (e.g. "Nawa-i-Waqt") but the scraper
-    object is keyed by an internal slug ("nawaiwaqt"). Matching only the slug meant
-    selecting any paper but Dawn scraped nothing. Match both."""
-    labels: set[str] = set()
-    name = (getattr(scraper, "name", "") or "").strip()
-    if name:
-        labels.add(name.casefold())
-    cfg = getattr(scraper, "cfg", None)
-    src = getattr(cfg, "source", "") if cfg is not None else ""
-    if src:
-        labels.add(src.strip().casefold())
-    if name.casefold() == "dawn":
-        labels.add("dawn")
-    return labels
-
-
 def search_press(jid: str, keywords: list[tuple[str, str]],
-                 sources: set[str] | None, date_iso: str | None) -> None:
-    """The newspaper page shows websites + e-papers together, so one click runs
-    both into the same job (websites first — they're fast — then e-papers)."""
-    search_newspaper(jid, keywords, sources)
-    if not jobs.is_cancelled(jid):
-        search_epaper(jid, keywords, sources, date_iso)
+                 sources: list[dict], date_iso: str | None) -> None:
+    """One click over the user's sources. `sources` is a list of
+    {name, url, kind, language} rows the user added — no built-in papers.
+    Websites (fast) first, then e-papers."""
+    news = [s for s in sources if (s.get("kind") or "newspaper") != "epaper"]
+    epapers = [s for s in sources if (s.get("kind") or "") == "epaper"]
+    if news:
+        search_newspaper(jid, keywords, news)
+    if epapers and not jobs.is_cancelled(jid):
+        search_epaper(jid, keywords, epapers, date_iso)
 
 
 # ==========================================================================
-# Newspaper — front-page crawl, fetch bodies, match. No screenshots, no DB.
+# Newspaper — scrape the URL the user added: find article links, read text,
+# match. Generic (no per-site selectors). No screenshots, no DB.
 # ==========================================================================
+def _generic_scraper(src: dict):
+    from app.scrapers.configurable import ConfigurableScraper, SiteConfig
+    name = src.get("name") or src.get("url") or "source"
+    return ConfigurableScraper(SiteConfig(
+        name=name,
+        source=name,
+        base_url=src["url"],
+        sections={"Home": src["url"]},
+        language=src.get("language", "en"),
+        min_title_len=12,
+    ))
+
+
 def search_newspaper(jid: str, keywords: list[tuple[str, str]],
-                     sources: set[str] | None) -> None:
-    from app.scrapers.sites import build_scrapers
-
-    scrapers = build_scrapers()
-    if sources:
-        sel = {s.casefold() for s in sources}
-        scrapers = [s for s in scrapers if _scraper_labels(s) & sel]
-    total = len(scrapers)
+                     sources: list[dict]) -> None:
+    total = len(sources)
     jobs.set_progress(jid, phase="newspapers", total=total, checked=0)
-    if not scrapers:
+    if not sources:
         return
 
     lock = threading.Lock()
     state = {"done": 0, "read": 0, "found": 0}
 
-    def _one(scraper) -> None:
+    def _one(src) -> None:
         if jobs.is_cancelled(jid):
             return
+        scraper = None
         try:
+            scraper = _generic_scraper(src)
             _scrape_one_newspaper(jid, scraper, keywords, lock, state)
         except Exception as exc:
-            logger.warning("live news %s failed: %s", getattr(scraper, "name", "?"), exc)
+            logger.warning("live news %s failed: %s", src.get("name"), exc)
         finally:
-            try:
-                scraper.close()
-            except Exception:
-                pass
+            if scraper is not None:
+                try:
+                    scraper.close()
+                except Exception:
+                    pass
             with lock:
                 state["done"] += 1
                 jobs.set_progress(jid, checked=state["done"])
 
-    # Scrape the selected papers concurrently — each has its own browser, so a
-    # 5-paper search finishes in roughly the time of the slowest one, not the sum.
+    # Each source has its own browser → all scrape at once.
     with ThreadPoolExecutor(max_workers=min(max(total, 1), NEWS_PARALLEL)) as ex:
-        list(ex.map(_one, scrapers))
+        list(ex.map(_one, sources))
 
 
 def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
@@ -150,80 +145,125 @@ def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
 # ==========================================================================
 # E-paper — list today's pages, download to temp, vision-read, match.
 # ==========================================================================
+def _epaper_image_urls(page_url: str) -> list[str]:
+    """Best-effort: render the e-paper URL and collect the page-scan image links."""
+    from urllib.parse import urljoin
+    from bs4 import BeautifulSoup
+    from app.scrapers.base import BaseScraper
+
+    bs = BaseScraper(name="epaper", base_url=page_url)
+    try:
+        html = bs.render(page_url, wait_ms=2800)
+    except Exception as exc:
+        logger.warning("live epaper render failed %s: %s", page_url, exc)
+        return []
+    finally:
+        try:
+            bs.close()
+        except Exception:
+            pass
+    soup = BeautifulSoup(html, "lxml")
+    urls, seen = [], set()
+    for img in soup.select("img[src], img[data-src]"):
+        src = img.get("src") or img.get("data-src") or ""
+        if not src:
+            continue
+        full = urljoin(page_url, src)
+        base = full.split("?")[0].lower()
+        if not base.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        if full not in seen:
+            seen.add(full)
+            urls.append(full)
+    return urls
+
+
+def _download_image(url: str) -> Path | None:
+    """Download an image to an OS temp file (nothing persists). None if it's tiny
+    (a logo/icon, not a page scan) or fails."""
+    import httpx
+    verify = "e.dunya.com.pk" not in url
+    try:
+        with httpx.stream("GET", url, timeout=45, follow_redirects=True, verify=verify,
+                          headers={"User-Agent": "Mozilla/5.0"}) as r:
+            r.raise_for_status()
+            fd = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            size = 0
+            for chunk in r.iter_bytes():
+                fd.write(chunk)
+                size += len(chunk)
+            fd.close()
+            if size < 15000:                 # too small to be a readable page
+                Path(fd.name).unlink(missing_ok=True)
+                return None
+            return Path(fd.name)
+    except Exception:
+        return None
+
+
 def search_epaper(jid: str, keywords: list[tuple[str, str]],
-                  sources: set[str] | None, date_iso: str | None) -> None:
-    from app.epaper import sources as ep_sources
+                  sources: list[dict], date_iso: str | None) -> None:
+    """OCR the page images on each user-added e-paper URL and match. Best-effort:
+    JS-only viewers may expose no <img> tags, in which case nothing is found."""
     from app.epaper.reader import has_key, read_page
-    from app.epaper.pipeline import _download, _snippet
+    from app.epaper.pipeline import _snippet
 
     if not has_key():
-        jobs.set_progress(jid, phase="epaper", current="no vision key")
+        jobs.set_progress(jid, phase="epaper", current="no vision key configured")
         return
 
-    d = None
-    if date_iso:
-        try:
-            d = datetime.strptime(date_iso, "%Y-%m-%d").date()
-        except ValueError:
-            d = None
-
-    slugs = ep_sources.enabled_slugs()
-    if sources:
-        sel = {s.casefold() for s in sources}
-        slugs = [s for s in slugs if ep_sources.SOURCES[s][0].strip().casefold() in sel]
-
-    # Gather pages up front (bounded per paper) for a real progress total.
-    all_pages: list = []
-    for slug in slugs:
+    # (source_name, viewer_url, image_url) — bounded per source.
+    candidates: list[tuple[str, str, str]] = []
+    for src in sources:
         if jobs.is_cancelled(jid):
             break
-        pages = ep_sources.list_pages(slug, d)[:EPAPER_PAGES_PER_PAPER]
-        all_pages.extend(pages)
-    jobs.set_progress(jid, phase="epaper", total=len(all_pages), checked=0)
-    if not all_pages:
+        name = src.get("name") or src["url"]
+        for img in _epaper_image_urls(src["url"])[:EPAPER_PAGES_PER_PAPER]:
+            candidates.append((name, src["url"], img))
+    jobs.set_progress(jid, phase="epaper", total=len(candidates), checked=0)
+    if not candidates:
         return
 
     lock = threading.Lock()
     state = {"done": 0}
 
-    def _one_page(pg) -> None:
+    def _one(item) -> None:
+        name, viewer, img_url = item
         if jobs.is_cancelled(jid):
             return
-        dest = _download(pg)              # temp scan; deleted right after reading
+        tmp = _download_image(img_url)
         try:
-            if dest is not None:
+            if tmp is not None:
                 try:
-                    text = read_page(dest)
+                    text = read_page(tmp)
                 except Exception as exc:
-                    logger.warning("live epaper read failed %s p%s: %s", pg.paper, pg.page_no, exc)
+                    logger.warning("live epaper read failed %s: %s", img_url, exc)
                     text = ""
                 labels = _match_labels(text, keywords)
                 if labels:
                     jobs.add_result(jid, {
                         "module": "epaper",
-                        "source": pg.source,
-                        "title": f"{pg.source} — page {pg.page_no}",
-                        "url": pg.viewer_url,
-                        "section": f"Page {pg.page_no}",
+                        "source": name,
+                        "title": f"{name} — e-paper page",
+                        "url": viewer,
+                        "section": "E-paper",
                         "snippet": _snippet(text, labels),
                         "keywords": labels,
-                        "meta": pg.date,
+                        "meta": "",
                     })
         finally:
-            if dest is not None:
+            if tmp is not None:
                 try:
-                    Path(dest).unlink(missing_ok=True)
+                    Path(tmp).unlink(missing_ok=True)
                 except Exception:
                     pass
             with lock:
                 state["done"] += 1
-                jobs.set_progress(jid, current=f"e-paper page {state['done']}/{len(all_pages)}",
+                jobs.set_progress(jid, current=f"e-paper page {state['done']}/{len(candidates)}",
                                   checked=state["done"])
 
-    # OCR several pages at once — vision calls are network-bound, so a handful in
-    # flight cuts the wall-clock sharply.
     with ThreadPoolExecutor(max_workers=EPAPER_PARALLEL) as ex:
-        list(ex.map(_one_page, all_pages))
+        list(ex.map(_one, candidates))
 
 
 # ==========================================================================

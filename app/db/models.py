@@ -255,6 +255,25 @@ class Transcript(Base):
     __table_args__ = (UniqueConstraint("video_id", name="uq_transcript_video_id"),)
 
 
+class NewsSource(Base):
+    """A newspaper / e-paper the USER added, with the link to scrape live.
+
+    This is the whole source list now — there are no built-in papers. Live search
+    scrapes exactly these URLs and nothing else."""
+
+    __tablename__ = "news_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), default="newspaper", nullable=False)  # newspaper|epaper
+    language: Mapped[str] = mapped_column(String(8), default="en")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("name", name="uq_news_source_name"),)
+
+
 class ScrapeRun(Base):
     """Audit trail of each scrape attempt — powers uptime + blocked-scrape alerts."""
 
