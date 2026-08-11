@@ -59,28 +59,44 @@ def has_key() -> bool:
 
 
 def provider() -> str:
-    if settings.gemini_api_key:
-        return "gemini"
+    # Groq (Qwen vision) is the primary; see read_page().
     if settings.groq_api_key:
         return "groq"
+    if settings.gemini_api_key:
+        return "gemini"
     if settings.anthropic_api_key:
         return "anthropic"
     return "none"
 
 
 def read_page(image_path: str | Path) -> str:
-    """Return the page's text. Raises on API failure (caller records status).
+    """Return the page's text, trying each configured provider and FALLING BACK on
+    failure so one broken key (e.g. an expired Gemini key) can't disable OCR.
 
-    Gemini is preferred: Groq dropped its Llama-4 vision models, so the Groq path
-    now 404s. Gemini reads Urdu Nastaliq well and is already used for tickers and
-    clippings."""
-    if settings.gemini_api_key:
-        return _read_gemini(Path(image_path))
+    Order: Groq (Qwen vision) first — it's the current working model — then Gemini,
+    then Anthropic. Raises only if every provider fails."""
+    path = Path(image_path)
+    providers: list[tuple[str, object]] = []
     if settings.groq_api_key:
-        return _read_groq(Path(image_path))
+        providers.append(("groq", _read_groq))
+    if settings.gemini_api_key:
+        providers.append(("gemini", _read_gemini))
     if settings.anthropic_api_key:
-        return _read_anthropic(Path(image_path))
-    raise RuntimeError("no vision API key configured")
+        providers.append(("anthropic", _read_anthropic))
+    if not providers:
+        raise RuntimeError("no vision API key configured")
+
+    errors = []
+    for name, fn in providers:
+        try:
+            text = fn(path)
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {str(exc)[:120]}")
+            continue
+        if text and text.strip():
+            return text
+        errors.append(f"{name}: returned no text")
+    raise RuntimeError("all vision providers failed — " + "; ".join(errors))
 
 
 # ----------------------------------------------------------------- groq -----
