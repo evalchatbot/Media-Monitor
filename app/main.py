@@ -457,11 +457,27 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   border-radius:999px;animation:lbslide 1.05s cubic-bezier(.4,0,.2,1) infinite}
 @keyframes lbslide{0%{left:-40%}50%{left:30%}100%{left:100%}}
 
-/* Page transition — fade+slide in on load, out on nav click */
-@keyframes pageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-main.page{animation:pageIn .30s cubic-bezier(.4,0,.2,1)}
-main.page.leaving{opacity:0;transform:translateY(-10px);
-  transition:opacity .17s ease,transform .17s ease}
+/* Page transition — a ~1s branded wipe that covers the whole navigation.
+   The panel slides UP to cover the old page, then keeps sliding up on the new
+   page to reveal it — one continuous motion across the load. */
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+main.page{animation:pageIn .4s ease}
+#pt{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:1.1rem;color:#fff;
+  background:linear-gradient(160deg,var(--blue) 0%,var(--blue-deep) 55%,var(--accent) 100%);
+  transform:translateY(100%)}
+#pt .pt-mark{width:66px;height:66px;border-radius:20px;display:flex;align-items:center;
+  justify-content:center;font-size:2rem;background:rgba(255,255,255,.16);
+  box-shadow:0 12px 34px -8px rgba(0,0,0,.4);animation:ptSpin 1.5s cubic-bezier(.5,0,.5,1) infinite}
+#pt .pt-label{font-family:"Fraunces","Manrope",serif;font-size:1.7rem;font-weight:600;
+  letter-spacing:-.02em;opacity:.96}
+#pt .pt-dots{font-size:.8rem;opacity:.75;letter-spacing:.3em;text-transform:uppercase}
+#pt.cover{transform:translateY(0)}
+#pt.in{animation:ptIn .5s cubic-bezier(.55,0,.35,1) forwards}
+#pt.out{animation:ptOut .55s cubic-bezier(.35,0,.25,1) forwards}
+@keyframes ptIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes ptOut{from{transform:translateY(0)}to{transform:translateY(-100%)}}
+@keyframes ptSpin{to{transform:rotate(360deg)}}
 
 /* Live-search progress: a real bar + what's happening + time remaining */
 .live-progress{margin:.15rem 0 1.1rem}
@@ -479,7 +495,8 @@ main.page.leaving{opacity:0;transform:translateY(-10px);
 .live-sub .eta{color:var(--blue-deep);white-space:nowrap}
 
 @media (prefers-reduced-motion:reduce){
-  main.page,main.page.leaving{animation:none;transition:none;transform:none;opacity:1}
+  main.page{animation:none}
+  #pt{display:none!important}
   .live-bar-fill{transition:none}
 }
 
@@ -1055,17 +1072,44 @@ _JS = """
       }});
   });
 
-  /* Smooth transition between Newspaper and YouTube pages: fade the current
-     page out, then navigate (the next page fades itself in via CSS). */
+  /* ~1s branded wipe between Newspaper and YouTube. The overlay slides up to
+     cover the old page, we navigate, then it slides the rest of the way up on
+     the new page to reveal it — one continuous motion across the load. */
+  var reduceMotion=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var pt=document.createElement('div');pt.id='pt';
+  pt.innerHTML='<div class="pt-mark">\\u25ce</div><div class="pt-label"></div>'
+    +'<div class="pt-dots">loading</div>';
+  document.body.appendChild(pt);
+  var ptLabel=pt.querySelector('.pt-label');
+  // Arriving from a transition? cover instantly, then reveal.
+  try{
+    var dest=sessionStorage.getItem('pt-dest');
+    if(dest && !reduceMotion){
+      sessionStorage.removeItem('pt-dest');
+      ptLabel.textContent=dest;
+      pt.classList.add('cover');
+      // Timer, not rAF: rAF is throttled when the tab isn't compositing, which
+      // would leave the overlay stuck covering the page. A timer always fires.
+      setTimeout(function(){
+        pt.classList.remove('cover');pt.classList.add('out');   // slide away to reveal
+        setTimeout(function(){pt.classList.remove('out');},650); // then park it hidden
+      },40);
+    }else{
+      try{sessionStorage.removeItem('pt-dest');}catch(e3){}
+    }
+  }catch(e){}
   document.addEventListener('click',function(e){
     var a=e.target.closest?e.target.closest('.mod-link'):null;
     if(!a||a.classList.contains('on'))return;      // ignore the current page
     var href=a.getAttribute('href');
     if(!href||e.metaKey||e.ctrlKey||e.shiftKey)return;   // let new-tab clicks through
     e.preventDefault();
-    var page=document.getElementById('page');
-    if(page)page.classList.add('leaving');
-    setTimeout(function(){location.href=href;},170);
+    if(reduceMotion){location.href=href;return;}
+    var label=(a.textContent||'').trim();
+    ptLabel.textContent=label;
+    try{sessionStorage.setItem('pt-dest',label);}catch(e2){}
+    pt.classList.add('in');                          // slide up to cover
+    setTimeout(function(){location.href=href;},500); // navigate once covered
   });
 
   var wasScanning=__SCANNING__;
