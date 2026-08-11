@@ -457,6 +457,32 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   border-radius:999px;animation:lbslide 1.05s cubic-bezier(.4,0,.2,1) infinite}
 @keyframes lbslide{0%{left:-40%}50%{left:30%}100%{left:100%}}
 
+/* Page transition — fade+slide in on load, out on nav click */
+@keyframes pageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+main.page{animation:pageIn .30s cubic-bezier(.4,0,.2,1)}
+main.page.leaving{opacity:0;transform:translateY(-10px);
+  transition:opacity .17s ease,transform .17s ease}
+
+/* Live-search progress: a real bar + what's happening + time remaining */
+.live-progress{margin:.15rem 0 1.1rem}
+.live-bar{height:9px;border-radius:999px;background:var(--cream-deep);
+  border:1px solid var(--line);overflow:hidden;position:relative}
+.live-bar-fill{height:100%;border-radius:999px;
+  background:linear-gradient(90deg,var(--blue),var(--blue-deep));
+  transition:width .45s cubic-bezier(.4,0,.2,1);min-width:2%}
+.live-bar.indet .live-bar-fill{position:absolute;width:38%;min-width:0;
+  animation:indet 1.15s ease-in-out infinite}
+@keyframes indet{0%{left:-40%}100%{left:100%}}
+.live-sub{margin-top:.5rem;display:flex;justify-content:space-between;gap:1rem;
+  color:var(--muted);font-size:.82rem;font-weight:600;flex-wrap:wrap}
+.live-sub .now{color:var(--ink)}
+.live-sub .eta{color:var(--blue-deep);white-space:nowrap}
+
+@media (prefers-reduced-motion:reduce){
+  main.page,main.page.leaving{animation:none;transition:none;transform:none;opacity:1}
+  .live-bar-fill{transition:none}
+}
+
 /* Confirm dialog (delete keyword) — reuses the daylight modal look */
 #confirm-modal{position:fixed;inset:0;z-index:130;display:none;align-items:center;justify-content:center;
   background:rgba(20,28,36,.32);backdrop-filter:blur(2px);padding:1rem}
@@ -1029,6 +1055,19 @@ _JS = """
       }});
   });
 
+  /* Smooth transition between Newspaper and YouTube pages: fade the current
+     page out, then navigate (the next page fades itself in via CSS). */
+  document.addEventListener('click',function(e){
+    var a=e.target.closest?e.target.closest('.mod-link'):null;
+    if(!a||a.classList.contains('on'))return;      // ignore the current page
+    var href=a.getAttribute('href');
+    if(!href||e.metaKey||e.ctrlKey||e.shiftKey)return;   // let new-tab clicks through
+    e.preventDefault();
+    var page=document.getElementById('page');
+    if(page)page.classList.add('leaving');
+    setTimeout(function(){location.href=href;},170);
+  });
+
   var wasScanning=__SCANNING__;
   var wasQueue=__QUEUE__;
   var lastResultsSig=(document.getElementById('results')||{}).getAttribute
@@ -1420,29 +1459,11 @@ def _paper_names() -> list[str]:
 
 
 def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
-    news = scan_manager.status()
-    ep = scan_runner.status()
-    yt = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
-    q = keyword_scan_queue.status()
-    queue_items = list(q.get("batch") or []) + list(q.get("pending") or [])
-    yt_queue_on = any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
-    news_queue_on = any((x.get("module") or "newspaper") != "youtube" for x in queue_items)
-    if module == "youtube":
-        scanning = bool(yt.get("running") or yt_queue_on)
-        queue_on = yt_queue_on
-    else:
-        scanning = bool(news["running"] or ep["running"] or news_queue_on)
-        queue_on = news_queue_on
-    # Deliberately does not announce scanning — progress belongs in the results
-    # grid, not the header.
-    state = '<span class="dot live"></span>Live'
-    # Live-only model: no background scans, so no "Scan now". Results come only
-    # from the on-demand "Search live results" button on the page.
-    scan_btn = ""
+    # Live-only model: no background scans, so no status badge and no "Scan now".
     nav = (
         '<nav class="mod-nav">'
-        f'<a href="/" class="{"on" if module == "newspaper" else ""}">Newspaper</a>'
-        f'<a href="/youtube" class="{"on" if module == "youtube" else ""}">YouTube</a>'
+        f'<a href="/" class="mod-link {"on" if module == "newspaper" else ""}">Newspaper</a>'
+        f'<a href="/youtube" class="mod-link {"on" if module == "youtube" else ""}">YouTube</a>'
         '</nav>'
     )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1453,15 +1474,9 @@ def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
     <span><b>Media Monitor</b><small>Press desk</small></span></a>
   {nav}
   <span class="spacer"></span>
-  <span class="live-wrap" style="display:flex;flex-direction:column;align-items:flex-end;gap:.15rem">
-    <span class="live" id="live-state">{state}</span>
-    <span class="live-detail" id="live-detail"></span>
-    <span class="build-tag" title="Deployed build">build {html.escape(BUILD_VERSION)}</span>
-  </span>
-  {scan_btn}
 </div></div>
-<main class="page"><div class="wrap">{body}</div></main>
-<script>{_JS.replace('__SCANNING__', 'true' if scanning else 'false').replace('__QUEUE__', 'true' if queue_on else 'false')}</script>
+<main class="page" id="page"><div class="wrap">{body}</div></main>
+<script>{_JS.replace('__SCANNING__', 'false').replace('__QUEUE__', 'false')}</script>
 </body></html>"""
 
 
@@ -3262,11 +3277,29 @@ def ui_delete_channel(cid: int, db: Session = Depends(get_db),
     return RedirectResponse(f"/youtube?{q}", status_code=303)
 
 
+def _fmt_secs(s: float) -> str:
+    s = int(max(0, round(s)))
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60:02d}s"
+
+
+_PHASE_LABELS = {
+    "starting": "Starting up",
+    "newspapers": "Reading newspaper sites",
+    "epaper": "Reading e-paper pages",
+    "youtube": "Transcribing YouTube",
+    "done": "Done",
+    "error": "Error",
+}
+
+
 def _render_live_results(job) -> str:
     """Render a live-search job's in-memory result cards as the #results section.
 
     Same markup/classes as the stored renderer, minus screenshots (we store no
     media). Streams: called repeatedly while the job runs, results grow."""
+    import time
     results = list(job.results)
     running = job.status == "running"
     spin = ' <span class="spin"></span>' if running else ""
@@ -3304,14 +3337,36 @@ def _render_live_results(job) -> str:
             f'<span class="count">{count} match{"es" if count != 1 else ""}</span></div>')
     sub = ""
     if running:
-        bits = [prog.get("phase") or "searching"]
-        if prog.get("current"):
-            bits.append(prog["current"])
-        checked, total = prog.get("checked"), prog.get("total")
-        if isinstance(checked, int) and isinstance(total, int) and total:
-            bits.append(f"{checked}/{total}")
-        sub = (f'<div class="hint" style="margin:-.35rem 0 .8rem">'
-               f'{html.escape(" · ".join(str(b) for b in bits))}</div>')
+        elapsed = max(0.0, time.time() - getattr(job, "created", time.time()))
+        checked = prog.get("checked") if isinstance(prog.get("checked"), int) else 0
+        total = prog.get("total") if isinstance(prog.get("total"), int) else 0
+        phase_label = _PHASE_LABELS.get(prog.get("phase") or "", prog.get("phase") or "Searching")
+        current = prog.get("current") or ""
+
+        if total:
+            pct = 100 if checked >= total else max(2, int(checked / total * 100))
+            bar_cls = "live-bar"
+        else:
+            pct, bar_cls = 0, "live-bar indet"
+
+        if total and 0 < checked < total and elapsed > 1.5:
+            eta_txt = f"~{_fmt_secs((elapsed / checked) * (total - checked))} left"
+        elif total and checked >= total:
+            eta_txt = "finishing…"
+        else:
+            eta_txt = "estimating time…"
+
+        now_txt = phase_label + (f" · {current}" if current else "")
+        if total:
+            now_txt += f" · {checked}/{total}"
+        sub = (
+            '<div class="live-progress">'
+            f'<div class="{bar_cls}"><div class="live-bar-fill" style="width:{pct}%"></div></div>'
+            '<div class="live-sub">'
+            f'<span class="now">{html.escape(now_txt)}</span>'
+            f'<span class="eta">{html.escape(eta_txt)} · {_fmt_secs(elapsed)} elapsed</span>'
+            '</div></div>'
+        )
     return (f'<section class="results" id="results" data-live="1" '
             f'data-status="{job.status}">{head}{sub}{grid}</section>')
 
