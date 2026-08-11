@@ -261,27 +261,41 @@ def _epaper_image_urls(page_url: str) -> list[str]:
     return urls
 
 
-def _download_image(url: str) -> Path | None:
-    """Download an image to an OS temp file (nothing persists). None if it's tiny
-    (a logo/icon, not a page scan) or fails."""
+def _download_image(url: str) -> tuple[Path | None, str]:
+    """Download an image to an OS temp file (nothing persists).
+
+    Returns (path, "") on success, or (None, reason) so a failure is explainable
+    (HTTP 403, timeout, too-small response, TLS error, …). Browser-like headers +
+    a Referer help with image hosts that block plain clients / hotlinking."""
     import httpx
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    origin = f"{p.scheme}://{p.netloc}"
     verify = "e.dunya.com.pk" not in url
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": origin + "/",
+        "Accept-Language": "en-US,en;q=0.9,ur;q=0.8",
+    }
     try:
         with httpx.stream("GET", url, timeout=45, follow_redirects=True, verify=verify,
-                          headers={"User-Agent": "Mozilla/5.0"}) as r:
-            r.raise_for_status()
+                          headers=headers) as r:
+            if r.status_code >= 400:
+                return None, f"HTTP {r.status_code}"
             fd = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             size = 0
             for chunk in r.iter_bytes():
                 fd.write(chunk)
                 size += len(chunk)
             fd.close()
-            if size < 15000:                 # too small to be a readable page
+            if size < 15000:                 # too small to be a readable page scan
                 Path(fd.name).unlink(missing_ok=True)
-                return None
-            return Path(fd.name)
-    except Exception:
-        return None
+                return None, f"response too small ({size} bytes) — likely a block/error page"
+            return Path(fd.name), ""
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
 def search_epaper(jid: str, keywords: list[tuple[str, str]],
@@ -338,12 +352,12 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
         name, link_url, img_url, page_label = item
         if jobs.is_cancelled(jid):
             return
-        tmp = _download_image(img_url)
+        tmp, dl_reason = _download_image(img_url)
         try:
             if tmp is None:
                 with lock:
                     if not state["first_err"]:
-                        state["first_err"] = f"could not download page image ({img_url[:60]})"
+                        state["first_err"] = f"image download failed — {dl_reason}"
             else:
                 with lock:
                     state["downloaded"] += 1
@@ -392,11 +406,12 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
     job = jobs.get(jid)
     epaper_hits = sum(1 for r in (job.results if job else []) if r.get("module") == "epaper")
     if epaper_hits == 0:
-        if state["ocr_err"] and state["ocr_ok"] == 0:
-            jobs.set_note(jid, f"E-paper OCR failed on all {state['ocr_err']} page(s) — "
+        if state["downloaded"] == 0:
+            jobs.set_note(jid, f"Couldn't download any of the {len(candidates)} e-paper page "
+                               f"images — {state['first_err']}")
+        elif state["ocr_err"] and state["ocr_ok"] == 0:
+            jobs.set_note(jid, f"Downloaded pages but OCR failed on all of them — "
                                f"{state['first_err']}")
-        elif state["downloaded"] == 0:
-            jobs.set_note(jid, f"Couldn't download any e-paper page images — {state['first_err']}")
         elif state["ocr_ok"] and state["ocr_chars"] < 50 * state["ocr_ok"]:
             jobs.set_note(jid, "E-paper pages read but returned almost no text "
                                "(the vision model may not be transcribing).")
