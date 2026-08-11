@@ -938,54 +938,95 @@ _JS = """
 
   /* ---- Styled confirm dialog (delete keyword) ---- */
   var cmodal=document.createElement('div');cmodal.id='confirm-modal';
-  cmodal.innerHTML='<div class="box"><h3>Remove keyword</h3>'
+  cmodal.innerHTML='<div class="box"><h3 id="cm-title">Please confirm</h3>'
     +'<p id="cm-text"></p><div class="row-btns">'
     +'<button type="button" class="ghost" id="cm-cancel">Cancel</button>'
     +'<button type="button" class="danger" id="cm-ok">Remove</button></div></div>';
   document.body.appendChild(cmodal);
-  var cmText=cmodal.querySelector('#cm-text'),cmOk=cmodal.querySelector('#cm-ok'),
-      cmCancel=cmodal.querySelector('#cm-cancel'),pendingDel=null;
-  function closeConfirm(){cmodal.classList.remove('open');pendingDel=null;}
+  var cmTitle=cmodal.querySelector('#cm-title'),cmText=cmodal.querySelector('#cm-text'),
+      cmOk=cmodal.querySelector('#cm-ok'),cmCancel=cmodal.querySelector('#cm-cancel'),cmAction=null;
+  function closeConfirm(){cmodal.classList.remove('open');cmAction=null;}
+  // Generic styled confirm reused by keyword / newspaper / channel removal.
+  function openConfirm(opts){
+    cmTitle.textContent=opts.title||'Please confirm';
+    cmText.innerHTML=opts.html||'';
+    cmOk.textContent=opts.okLabel||'Remove';
+    cmAction=opts.onOk||null;
+    cmodal.classList.add('open');
+  }
+  window.openConfirm=openConfirm;
   cmCancel.addEventListener('click',closeConfirm);
   cmodal.addEventListener('click',function(e){if(e.target===cmodal)closeConfirm();});
   document.addEventListener('keydown',function(e){
     if(e.key==='Escape'&&cmodal.classList.contains('open'))closeConfirm();});
-  cmOk.addEventListener('click',function(){
-    if(!pendingDel)return;
-    var id=pendingDel.id,chip=pendingDel.chip;
-    closeConfirm();
-    if(chip){chip.style.opacity='.4';chip.style.pointerEvents='none';}
-    fetch('/ui/keywords/'+encodeURIComponent(id)+'/delete',
-      {method:'POST',headers:{'Accept':'application/json'}})
-      .then(function(r){return r.json();})
-      .then(function(){
-        var wasOn=chip&&chip.classList.contains('on');
-        if(chip)chip.remove();
-        var tags=document.querySelector('.kw-tags');
-        if(tags&&!tags.querySelector('.kw-chip'))
-          tags.innerHTML='<span class="hint">No keywords yet — add some above.</span>';
-        // Removed the active newspaper filter? fall back to All, in place.
-        if(wasOn&&pageModule==='newspaper'){
-          if(q)q.value='';
-          var allBtn=document.querySelector('.kw-pick.kw-all');if(allBtn)allBtn.classList.add('on');
-          var p=new URLSearchParams(location.search);
-          p.delete('q');p.set('go','1');p.set('module','newspaper');
-          history.replaceState(null,'','?'+p.toString());
-          refreshResults(true);
-        }
-      })
-      .catch(function(){if(chip){chip.style.opacity='';chip.style.pointerEvents='';}});
-  });
-  // Delegated: any × on a chip opens the styled confirm (no browser prompt, no reload).
+  cmOk.addEventListener('click',function(){var fn=cmAction;closeConfirm();if(fn)fn();});
+  function bold(name){var b=document.createElement('b');b.textContent=name||'';return b.outerHTML;}
+
+  // Keyword chip × — styled confirm, AJAX delete, instant DOM removal.
   document.addEventListener('click',function(e){
     var x=e.target.closest?e.target.closest('[data-del-id]'):null;
     if(!x)return;
     e.preventDefault();
-    var text=x.getAttribute('data-del-text')||'this keyword';
-    pendingDel={id:x.getAttribute('data-del-id'),chip:x.closest('.kw-chip')};
-    cmText.innerHTML='Remove <b></b> from the watchlist? Its stored results stay retained for 90 days.';
-    cmText.querySelector('b').textContent=text;
-    cmodal.classList.add('open');
+    var chip=x.closest('.kw-chip'), id=x.getAttribute('data-del-id');
+    openConfirm({title:'Remove keyword',okLabel:'Remove',
+      html:'Remove '+bold(x.getAttribute('data-del-text')||'this keyword')+' from the watchlist?',
+      onOk:function(){
+        if(chip){chip.style.opacity='.4';chip.style.pointerEvents='none';}
+        fetch('/ui/keywords/'+encodeURIComponent(id)+'/delete',
+          {method:'POST',headers:{'Accept':'application/json'}})
+          .then(function(r){return r.json();})
+          .then(function(){
+            var wasOn=chip&&chip.classList.contains('on');
+            if(chip)chip.remove();
+            var tags=document.querySelector('.kw-tags');
+            if(tags&&!tags.querySelector('.kw-chip'))
+              tags.innerHTML='<span class="hint">No keywords yet — add some above.</span>';
+            if(wasOn&&pageModule==='newspaper'&&q)q.value='';
+          })
+          .catch(function(){if(chip){chip.style.opacity='';chip.style.pointerEvents='';}});
+      }});
+  });
+
+  // Newspaper × — styled confirm, AJAX remove, instant DOM removal (no reload).
+  document.addEventListener('click',function(e){
+    var x=e.target.closest?e.target.closest('[data-paper-del]'):null;
+    if(!x)return;
+    e.preventDefault();
+    var name=x.getAttribute('data-paper-del'), item=x.closest('.paper-item');
+    openConfirm({title:'Remove newspaper',okLabel:'Remove',
+      html:'Remove '+bold(name)+' from the list? It will stop being searched.',
+      onOk:function(){
+        if(item)item.style.opacity='.4';
+        var b=new URLSearchParams();b.append('name',name);
+        fetch('/ui/papers/delete',{method:'POST',
+          headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},
+          body:b.toString()})
+          .then(function(){if(item)item.remove();})
+          .catch(function(){if(item)item.style.opacity='';});
+      }});
+  });
+
+  // Channel × — styled confirm, AJAX remove, instant DOM removal (no reload).
+  document.addEventListener('click',function(e){
+    var x=e.target.closest?e.target.closest('[data-ch-del]'):null;
+    if(!x)return;
+    e.preventDefault();
+    var id=x.getAttribute('data-ch-del'), name=x.getAttribute('data-ch-name')||'this channel',
+        tag=x.closest('.ch-tag');
+    openConfirm({title:'Remove channel',okLabel:'Remove',
+      html:'Remove '+bold(name)+' from your channels?',
+      onOk:function(){
+        if(tag)tag.style.opacity='.4';
+        fetch('/ui/youtube/channels/'+encodeURIComponent(id)+'/delete',
+          {method:'POST',headers:{'Accept':'application/json'}})
+          .then(function(){
+            if(tag)tag.remove();
+            var box=document.querySelector('.ch-tags');
+            if(box&&!box.querySelector('.ch-tag'))
+              box.innerHTML='<span class="hint">No channels yet.</span>';
+          })
+          .catch(function(){if(tag)tag.style.opacity='';});
+      }});
   });
 
   var wasScanning=__SCANNING__;
@@ -1244,7 +1285,19 @@ _JS = """
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({name:name,kind:kind,url:lastProbe.url||(document.getElementById('src-url')||{}).value,
           summary:lastProbe.summary,detail:lastProbe.detail||{}})}).then(function(x){return x.json()});
-      if(r.ok)location.reload();
+      if(r.ok){
+        // Insert the paper into the picker in place — no reload.
+        var papers=document.querySelector('.papers');
+        if(papers && !papers.querySelector('input[name=paper][value="'+name.replace(/"/g,'\\\\"')+'"]')){
+          var span=document.createElement('span');span.className='paper-item';
+          span.innerHTML='<label><input type="checkbox" name="paper" value="'+escHtml(name)+'" checked>'
+            +escHtml(name)+'</label>'
+            +'<button type="button" class="src-x" data-paper-del="'+escHtml(name)+'" '
+            +'title="Remove this paper">\\u00d7</button>';
+          papers.appendChild(span);
+        }
+        closeModal();
+      }
       else if(result){result.textContent=r.summary||'Could not save.';result.className='show bad'}
     }catch(err){
       if(result){result.textContent='Save failed.';result.className='show bad'}
@@ -1324,7 +1377,21 @@ _JS = """
         var r=await fetch('/api/youtube/channels',{method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify(body)}).then(function(x){return x.json()});
-        if(r.ok)location.href='/youtube?channel_added='+encodeURIComponent(r.name||'');
+        if(r.ok){
+          // Insert the channel tag in place — no reload.
+          var box=document.querySelector('.ch-tags');
+          if(box){
+            var hint=box.querySelector('.hint');if(hint)hint.remove();
+            if(r.id && !box.querySelector('[data-ch-del="'+r.id+'"]')){
+              var span=document.createElement('span');span.className='ch-tag';
+              span.innerHTML=escHtml(r.name||'')
+                +'<button type="button" class="chip-x" data-ch-del="'+r.id+'" '
+                +'data-ch-name="'+escHtml(r.name||'')+'" title="Remove channel">\\u00d7</button>';
+              box.appendChild(span);
+            }
+          }
+          closeModal();
+        }
         else if(result){result.textContent=r.summary||'Could not add channel.';result.className='show bad'}
       }catch(err){
         if(result){result.textContent='Save failed.';result.className='show bad'}
@@ -2323,8 +2390,8 @@ def home(request: Request, db: Session = Depends(get_db)):
             f'<span class="paper-item">'
             f'<label><input type="checkbox" name="paper" value="{html.escape(name)}"{chk}>'
             f"{html.escape(name)}</label>"
-            f'<button type="button" class="src-x" data-name="{html.escape(name)}" '
-            f'onclick="removePaper(this)" title="Remove this paper">&times;</button>'
+            f'<button type="button" class="src-x" data-paper-del="{html.escape(name, quote=True)}" '
+            f'title="Remove this paper">&times;</button>'
             f'</span>'
         )
 
@@ -2450,16 +2517,6 @@ def home(request: Request, db: Session = Depends(get_db)):
             <button type="button" class="ghost" id="papers-add">+ Add more</button>
           </div>
           <div class="papers">{boxes}</div>
-          <script>
-          function removePaper(btn){{
-            var name=btn.getAttribute('data-name')||'';
-            if(!confirm('Remove '+name+' from newspapers?\\nIt will stop being scanned and its stored results will be cleared.'))return;
-            var body=new URLSearchParams(); body.append('name', name);
-            fetch('/ui/papers/delete',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:body}})
-              .then(function(){{location.href='/?paper_removed='+encodeURIComponent(name);}})
-              .catch(function(){{location.reload();}});
-          }}
-          </script>
         </div>
         <div class="actions">
           <button type="button" id="live-search-btn">Search live results</button>
@@ -2608,9 +2665,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     ).scalars().all()
     ch_tags = "".join(
         f'<span class="ch-tag">{html.escape(c.name)}'
-        f'<form method="post" action="/ui/youtube/channels/{c.id}/delete" style="display:inline;margin:0" '
-        f'onsubmit="return confirm(\'Remove this channel and its stored results?\')">'
-        f'<button type="submit" class="chip-x" title="Remove channel">&times;</button></form>'
+        f'<button type="button" class="chip-x" data-ch-del="{c.id}" '
+        f'data-ch-name="{html.escape(c.name, quote=True)}" title="Remove channel">&times;</button>'
         f'</span>'
         for c in channels
     ) or '<span class="hint">No channels yet.</span>'
@@ -3173,28 +3229,35 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db), request: Request 
 
 
 @app.post("/ui/papers/delete")
-def ui_delete_paper(name: str = Form(...), db: Session = Depends(get_db)):
-    """Remove a newspaper/e-paper: hide it from the picker, stop scraping it, and
-    purge its stored result cards. Re-adding the same name un-hides it."""
+def ui_delete_paper(name: str = Form(...), db: Session = Depends(get_db),
+                    request: Request = None):
+    """Remove a newspaper/e-paper: hide it from the picker so it stops being
+    searched. Live-only, so there are no stored result cards to purge — this is
+    now instant. Re-adding the same name un-hides it."""
     name = (name or "").strip()
     if name:
         sources_probe.hide_paper(name)
         sources_probe.remove_custom_source(name)
-        _purge_source_results(db, name, ("newspaper", "epaper"))
+    if _wants_json(request):
+        return JSONResponse({"ok": True, "name": name})
     return RedirectResponse(f"/?{urlencode({'paper_removed': name})}", status_code=303)
 
 
 @app.post("/ui/youtube/channels/{cid}/delete")
-def ui_delete_channel(cid: int, db: Session = Depends(get_db)):
-    """Remove a YouTube channel: deactivate it (hides it from every scan and the
-    picker) and purge its result cards."""
+def ui_delete_channel(cid: int, db: Session = Depends(get_db),
+                      request: Request = None):
+    """Remove a YouTube channel: deactivate it so it drops out of the picker and
+    live search. No stored result cards to purge — instant."""
     ch = db.get(YouTubeChannel, cid)
     if not ch:
+        if _wants_json(request):
+            return JSONResponse({"ok": True, "id": cid})
         return RedirectResponse("/youtube", status_code=303)
     name = ch.name
     ch.active = False
     db.commit()
-    _purge_source_results(db, name, ("youtube",))
+    if _wants_json(request):
+        return JSONResponse({"ok": True, "id": cid, "name": name})
     q = urlencode({"channel_removed": name, "date": datetime.now(_PKT).date().isoformat()})
     return RedirectResponse(f"/youtube?{q}", status_code=303)
 
@@ -3738,7 +3801,8 @@ def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_d
         existing.active = True          # re-adding a removed channel reactivates it
         db.commit()
         ensure_due_bulletins(db)
-        return {"ok": True, "summary": f"Re-added “{existing.name}”.", "name": existing.name}
+        return {"ok": True, "summary": f"Re-added “{existing.name}”.",
+                "name": existing.name, "id": existing.id}
     row = channel_probe.save_channel(
         db,
         channel_id=body.channel_id.strip(),
