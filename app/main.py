@@ -3410,6 +3410,9 @@ def _render_live_results(job) -> str:
     count = len(results)
     head = (f'<div class="results-head"><h2>Live results{spin}</h2>'
             f'<span class="count">{count} match{"es" if count != 1 else ""}</span></div>')
+    note = getattr(job, "note", "") or ""
+    note_html = (f'<div class="banner warn" style="margin:.2rem 0 1rem">{html.escape(note)}</div>'
+                 if note else "")
     sub = ""
     if running:
         elapsed = max(0.0, time.time() - getattr(job, "created", time.time()))
@@ -3445,7 +3448,7 @@ def _render_live_results(job) -> str:
             '</div></div>'
         )
     return (f'<section class="results" id="results" data-live="1" '
-            f'data-status="{job.status}">{head}{sub}{grid}</section>')
+            f'data-status="{job.status}">{head}{note_html}{sub}{grid}</section>')
 
 
 @app.post("/api/live/search")
@@ -3544,6 +3547,7 @@ def api_live_search_status(job_id: str):
         "progress": job.progress,
         "count": len(job.results),
         "error": job.error,
+        "note": getattr(job, "note", "") or "",
         "html": _render_live_results(job),
     }
 

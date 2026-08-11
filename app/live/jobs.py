@@ -24,7 +24,7 @@ _MAX_JOBS = 40        # hard cap so a long session can't grow memory unbounded
 
 class Job:
     __slots__ = ("id", "module", "status", "progress", "results",
-                 "error", "created", "updated", "cancelled")
+                 "error", "note", "created", "updated", "cancelled")
 
     def __init__(self, jid: str, module: str):
         self.id = jid
@@ -33,6 +33,7 @@ class Job:
         self.progress = {"phase": "starting", "checked": 0, "total": 0, "current": ""}
         self.results: list[dict] = []
         self.error: str | None = None
+        self.note: str = ""              # non-fatal diagnostic (e.g. OCR failed)
         self.created = time.time()
         self.updated = time.time()
         self.cancelled = False
@@ -80,6 +81,13 @@ def set_progress(jid: str, **fields) -> None:
     job = _JOBS.get(jid)
     if job is not None:
         job.progress.update(fields)
+        job.updated = time.time()
+
+
+def set_note(jid: str, note: str) -> None:
+    job = _JOBS.get(jid)
+    if job is not None:
+        job.note = note
         job.updated = time.time()
 
 

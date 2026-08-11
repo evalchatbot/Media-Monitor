@@ -331,7 +331,8 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
         return
 
     lock = threading.Lock()
-    state = {"done": 0}
+    state = {"done": 0, "downloaded": 0, "ocr_ok": 0, "ocr_chars": 0,
+             "ocr_err": 0, "first_err": ""}
 
     def _one(item) -> None:
         name, link_url, img_url, page_label = item
@@ -339,12 +340,25 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
             return
         tmp = _download_image(img_url)
         try:
-            if tmp is not None:
+            if tmp is None:
+                with lock:
+                    if not state["first_err"]:
+                        state["first_err"] = f"could not download page image ({img_url[:60]})"
+            else:
+                with lock:
+                    state["downloaded"] += 1
                 try:
                     text = read_page(tmp)
+                    with lock:
+                        state["ocr_ok"] += 1
+                        state["ocr_chars"] += len(text)
                 except Exception as exc:
                     logger.warning("live epaper read failed %s: %s", img_url, exc)
                     text = ""
+                    with lock:
+                        state["ocr_err"] += 1
+                        if not state["first_err"]:
+                            state["first_err"] = f"OCR error: {type(exc).__name__}: {str(exc)[:160]}"
                 labels = _match_labels(text, keywords)
                 if labels:
                     jobs.add_result(jid, {
@@ -373,6 +387,22 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
 
     with ThreadPoolExecutor(max_workers=EPAPER_PARALLEL) as ex:
         list(ex.map(_one, candidates))
+
+    # Surface WHY e-paper found nothing, so a silent 0 is never a mystery.
+    job = jobs.get(jid)
+    epaper_hits = sum(1 for r in (job.results if job else []) if r.get("module") == "epaper")
+    if epaper_hits == 0:
+        if state["ocr_err"] and state["ocr_ok"] == 0:
+            jobs.set_note(jid, f"E-paper OCR failed on all {state['ocr_err']} page(s) — "
+                               f"{state['first_err']}")
+        elif state["downloaded"] == 0:
+            jobs.set_note(jid, f"Couldn't download any e-paper page images — {state['first_err']}")
+        elif state["ocr_ok"] and state["ocr_chars"] < 50 * state["ocr_ok"]:
+            jobs.set_note(jid, "E-paper pages read but returned almost no text "
+                               "(the vision model may not be transcribing).")
+    logger.info("epaper done: pages=%d downloaded=%d ocr_ok=%d ocr_err=%d chars=%d",
+                len(candidates), state["downloaded"], state["ocr_ok"],
+                state["ocr_err"], state["ocr_chars"])
 
 
 # ==========================================================================
