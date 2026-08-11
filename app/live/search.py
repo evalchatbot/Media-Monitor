@@ -245,7 +245,10 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
                         "module": "epaper",
                         "source": name,
                         "title": f"{name} — e-paper page",
-                        "url": viewer,
+                        # Open the exact page scan the word was read from, not the
+                        # site homepage; the same image is the clickable preview.
+                        "url": img_url,
+                        "image": img_url,
                         "section": "E-paper",
                         "snippet": _snippet(text, labels),
                         "keywords": labels,

@@ -3372,9 +3372,16 @@ def _render_live_results(job) -> str:
         )
         title = html.escape(r.get("title") or "")
         href = html.escape(r.get("url") or "#")
+        img = (r.get("image") or "").strip()
+        if img:
+            # Remote page scan (e-paper): show it as a click-to-zoom preview.
+            e = html.escape(img, quote=True)
+            shot = (f'<div class="shot"><img loading="lazy" class="zoom" src="{e}" '
+                    f'data-full="{e}" alt="page scan"></div>')
+        else:
+            shot = ('<div class="shot missing"><span class="noprev">No preview · live</span></div>')
         cards.append(
-            '<div class="det"><div class="shot missing"><span class="noprev">'
-            'No preview · live</span></div><div class="body">'
+            f'<div class="det">{shot}<div class="body">'
             f'<a class="ttl" href="{href}" target="_blank" rel="noopener">{title}</a>'
             f'{excerpt_html}<div class="meta">{html.escape(meta)}</div>'
             f'<div>{tags}</div></div></div>'
