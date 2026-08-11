@@ -24,8 +24,33 @@ logger = logging.getLogger(__name__)
 # up immediately, so these keep a search responsive and its cost predictable.
 NEWS_BODIES_PER_SITE = 15     # article bodies fetched per publication (speed)
 NEWS_PARALLEL = 4             # newspapers scraped at once (their own browsers)
-EPAPER_PAGES_PER_PAPER = 12   # e-paper pages OCR'd per paper (bounds cost + time)
+EPAPER_PAGES_PER_PAPER = 18   # e-paper pages OCR'd per paper (bounds cost + time)
 EPAPER_PARALLEL = 4           # e-paper pages OCR'd at once
+
+# Known e-paper domains → the app's adapter slug, so a user-added e-paper link is
+# read as the FULL edition (every page) instead of only the front-page thumbnail
+# the landing page happens to expose. Unknown domains fall back to generic image
+# scraping.
+_EPAPER_DOMAIN_SLUG = {
+    "jang.com.pk": "jang",
+    "thenews.com.pk": "thenews",
+    "tribune.com.pk": "tribune",
+    "nawaiwaqt.com.pk": "nawaiwaqt",
+    "express.com.pk": "express",
+    "express.pk": "express",
+    "dunya.com.pk": "dunya",
+    "jehanpakistan.com": "jehanpakistan",
+    "dawn.com": "dawn",
+}
+
+
+def _slug_for_epaper_url(url: str) -> str | None:
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    for dom, slug in _EPAPER_DOMAIN_SLUG.items():
+        if host == dom or host.endswith("." + dom):
+            return slug
+    return None
 YT_VIDEOS_PER_CHANNEL = 5     # uploads transcribed per channel (Groq cost)
 
 
@@ -205,21 +230,52 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
                   sources: list[dict], date_iso: str | None) -> None:
     """OCR the page images on each user-added e-paper URL and match. Best-effort:
     JS-only viewers may expose no <img> tags, in which case nothing is found."""
-    from app.epaper.reader import has_key, read_page
+    from app.epaper import sources as ep_sources
+    from app.epaper.reader import has_key, provider, read_page
     from app.epaper.pipeline import _snippet
 
-    if not has_key():
-        jobs.set_progress(jid, phase="epaper", current="no vision key configured")
+    prov = provider()
+    if not has_key() or prov == "none":
+        jobs.set_progress(jid, phase="epaper",
+                          current="e-paper reading needs a Gemini vision key (not set)")
+        logger.warning("epaper OCR skipped: no vision key")
+        return
+    if prov == "groq":
+        # Groq dropped its vision models, so its OCR endpoint 404s. Say so loudly
+        # instead of silently returning 0 matches.
+        jobs.set_progress(jid, phase="epaper",
+                          current="e-paper reading needs a Gemini key (Groq vision is retired)")
+        logger.warning("epaper OCR skipped: provider=groq has no working vision model")
         return
 
-    # (source_name, viewer_url, image_url) — bounded per source.
-    candidates: list[tuple[str, str, str]] = []
+    d = None
+    if date_iso:
+        try:
+            d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        except ValueError:
+            d = None
+
+    # (source_name, link_url, image_url, page_label) — bounded per source.
+    candidates: list[tuple[str, str, str, str]] = []
     for src in sources:
         if jobs.is_cancelled(jid):
             break
         name = src.get("name") or src["url"]
-        for img in _epaper_image_urls(src["url"])[:EPAPER_PAGES_PER_PAPER]:
-            candidates.append((name, src["url"], img))
+        slug = _slug_for_epaper_url(src["url"])
+        if slug:
+            # Known e-paper → full edition (every page), via the site's adapter.
+            try:
+                pages = ep_sources.list_pages(slug, d)[:EPAPER_PAGES_PER_PAPER]
+            except Exception as exc:
+                logger.warning("live epaper list_pages %s failed: %s", slug, exc)
+                pages = []
+            for pg in pages:
+                candidates.append((name, pg.viewer_url or pg.image_url,
+                                   pg.image_url, f"page {pg.page_no}"))
+        else:
+            # Unknown site → best-effort images on the landing page.
+            for img in _epaper_image_urls(src["url"])[:EPAPER_PAGES_PER_PAPER]:
+                candidates.append((name, img, img, "page"))
     jobs.set_progress(jid, phase="epaper", total=len(candidates), checked=0)
     if not candidates:
         return
@@ -228,7 +284,7 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
     state = {"done": 0}
 
     def _one(item) -> None:
-        name, viewer, img_url = item
+        name, link_url, img_url, page_label = item
         if jobs.is_cancelled(jid):
             return
         tmp = _download_image(img_url)
@@ -244,10 +300,10 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
                     jobs.add_result(jid, {
                         "module": "epaper",
                         "source": name,
-                        "title": f"{name} — e-paper page",
-                        # Open the exact page scan the word was read from, not the
-                        # site homepage; the same image is the clickable preview.
-                        "url": img_url,
+                        "title": f"{name} — {page_label}",
+                        # Open the exact page (the viewer at that page, or the scan
+                        # itself); the scan image is the click-to-zoom preview.
+                        "url": link_url,
                         "image": img_url,
                         "section": "E-paper",
                         "snippet": _snippet(text, labels),
