@@ -59,6 +59,63 @@ def _match_labels(haystack: str, keywords: list[tuple[str, str]]) -> list[str]:
     return sorted({m.keyword for m in matches}) if matches else []
 
 
+_SENTIMENTS = {"Positive", "Negative", "Neutral"}
+
+
+def _batch_sentiment(snippets: list[str]) -> list[str]:
+    """One Groq request → a sentiment (Positive/Negative/Neutral) per snippet."""
+    import json
+    import httpx
+    from config import settings
+
+    n = len(snippets)
+    if not snippets or not settings.groq_api_key:
+        return [""] * n
+    numbered = "\n".join(f"{i + 1}. {(s or '')[:400]}" for i, s in enumerate(snippets))
+    prompt = (
+        "Classify the overall sentiment of each numbered news excerpt as exactly "
+        "one of: Positive, Negative, Neutral. "
+        f'Reply ONLY with JSON {{"sentiments": [...]}} — {n} strings, same order.\n\n'
+        + numbered
+    )
+    try:
+        r = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+            json={
+                "model": settings.groq_text_model,
+                "temperature": 0,
+                "max_tokens": 1200,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        arr = json.loads(r.json()["choices"][0]["message"]["content"] or "{}").get("sentiments") or []
+        out = []
+        for i in range(n):
+            v = str(arr[i]).strip().capitalize() if i < len(arr) else ""
+            out.append(v if v in _SENTIMENTS else "")
+        return out
+    except Exception as exc:
+        logger.warning("batch sentiment failed: %s", exc)
+        return [""] * n
+
+
+def _annotate_sentiment(jid: str) -> None:
+    """Tag every result in the job with a sentiment, in ONE model request."""
+    job = jobs.get(jid)
+    if not job or not job.results:
+        return
+    results = list(job.results)
+    sents = _batch_sentiment([(r.get("snippet") or r.get("title") or "") for r in results])
+    for r, s in zip(results, sents):
+        if s:
+            r["sentiment"] = s
+    jobs.set_progress(jid, current="tagging sentiment")
+
+
 def search_press(jid: str, keywords: list[tuple[str, str]],
                  sources: list[dict], date_iso: str | None) -> None:
     """One click over the user's sources. `sources` is a list of
@@ -70,6 +127,7 @@ def search_press(jid: str, keywords: list[tuple[str, str]],
         search_newspaper(jid, keywords, news)
     if epapers and not jobs.is_cancelled(jid):
         search_epaper(jid, keywords, epapers, date_iso)
+    _annotate_sentiment(jid)          # one request tags every result
 
 
 # ==========================================================================
@@ -234,18 +292,10 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
     from app.epaper.reader import has_key, provider, read_page
     from app.epaper.pipeline import _snippet
 
-    prov = provider()
-    if not has_key() or prov == "none":
+    if not has_key() or provider() == "none":
         jobs.set_progress(jid, phase="epaper",
-                          current="e-paper reading needs a Gemini vision key (not set)")
+                          current="e-paper reading needs a vision API key (not set)")
         logger.warning("epaper OCR skipped: no vision key")
-        return
-    if prov == "groq":
-        # Groq dropped its vision models, so its OCR endpoint 404s. Say so loudly
-        # instead of silently returning 0 matches.
-        jobs.set_progress(jid, phase="epaper",
-                          current="e-paper reading needs a Gemini key (Groq vision is retired)")
-        logger.warning("epaper OCR skipped: provider=groq has no working vision model")
         return
 
     d = None
@@ -401,3 +451,5 @@ def search_youtube(jid: str, keywords: list[tuple[str, str]],
         finally:
             cleanup_asset(asset)     # deletes the temp audio dir
         jobs.set_progress(jid, checked=i + 1)
+
+    _annotate_sentiment(jid)          # one request tags every result

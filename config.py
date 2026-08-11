@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     # Scout is the Llama-4 vision model generally available on Groq accounts.
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    # Vision model for e-paper OCR (Groq's current multimodal model). Llama-4
+    # vision was retired; Qwen replaces it.
+    groq_vision_model: str = "qwen/qwen3.6-27b"
+    # Fast text model for batch sentiment on live results (free tier).
+    groq_text_model: str = "llama-3.1-8b-instant"
     # Optional: Google Gemini for PRECISE press-clipping boxes (grounding is
     # its strength). Free key at https://aistudio.google.com/apikey — when set,
     # the clipper uses Gemini for locate/verify; reading stays on Groq.

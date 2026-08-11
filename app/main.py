@@ -268,6 +268,12 @@ button.ghost:hover{background:var(--blue-soft);border-color:var(--blue);color:va
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
 .tag{display:inline-flex;background:var(--blue-soft);color:var(--blue-deep);border-radius:999px;
   padding:.12rem .5rem;font-size:.72rem;font-weight:700;margin:2px 3px 2px 0;border:1px solid var(--blue-mist)}
+.sent{display:inline-flex;align-items:center;gap:.25rem;border-radius:999px;padding:.12rem .55rem;
+  font-size:.72rem;font-weight:800;margin:2px 5px 2px 0;border:1px solid transparent}
+.sent::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.sent-pos{background:#e7f4ec;color:#2e8b57;border-color:#cbe7d5}
+.sent-neg{background:#fbecea;color:#c0492b;border-color:#f0d2cb}
+.sent-neu{background:#eef1f4;color:#5a6b7a;border-color:#dde3e9}
 .kw-bar{margin-top:.65rem}
 .kw-bar .cap{font-size:.72rem;font-weight:700;color:var(--faint);text-transform:uppercase;
   letter-spacing:.06em;margin-bottom:.4rem}
@@ -3370,6 +3376,11 @@ def _render_live_results(job) -> str:
         meta = " · ".join(
             x for x in [kindmap.get(r.get("module"), ""), r.get("source"), r.get("meta")] if x
         )
+        sent = (r.get("sentiment") or "").strip()
+        sent_html = ""
+        if sent:
+            scls = {"Positive": "sent-pos", "Negative": "sent-neg"}.get(sent, "sent-neu")
+            sent_html = f'<span class="sent {scls}">{html.escape(sent)}</span>'
         title = html.escape(r.get("title") or "")
         href = html.escape(r.get("url") or "#")
         img = (r.get("image") or "").strip()
@@ -3384,7 +3395,7 @@ def _render_live_results(job) -> str:
             f'<div class="det">{shot}<div class="body">'
             f'<a class="ttl" href="{href}" target="_blank" rel="noopener">{title}</a>'
             f'{excerpt_html}<div class="meta">{html.escape(meta)}</div>'
-            f'<div>{tags}</div></div></div>'
+            f'<div>{sent_html}{tags}</div></div></div>'
         )
     prog = job.progress or {}
     if cards:

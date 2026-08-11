@@ -36,6 +36,10 @@ _MAX_EDGE = 1568
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
+
+def _groq_vision_model() -> str:
+    return getattr(settings, "groq_vision_model", None) or settings.groq_model
+
 _PROMPT = """This image is one full page of a Pakistani newspaper's print edition. \
 It may be in English or in Urdu (Nastaliq script).
 
@@ -83,9 +87,13 @@ def read_page(image_path: str | Path) -> str:
 def _read_groq(image_path: Path) -> str:
     b64, media_type = _encode(image_path)
     payload = {
-        "model": settings.groq_model,
+        "model": _groq_vision_model(),
         "temperature": 0,
-        "max_tokens": 6000,
+        "max_tokens": 16000,
+        # Qwen3 is a reasoning model — with thinking ON it burns the entire token
+        # budget "thinking" and never emits the transcription. Turning reasoning
+        # off makes it transcribe directly.
+        "reasoning_effort": "none",
         "messages": [{
             "role": "user",
             "content": [
@@ -119,10 +127,20 @@ def _read_groq(image_path: Path) -> str:
         r.raise_for_status()
         data = r.json()
         text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        text = text.strip()
+        text = _strip_reasoning(text).strip()
         logger.info("e-paper read (groq): %s -> %d chars", image_path.name, len(text))
         return text
     raise RuntimeError(f"groq read failed after retries: {last}")
+
+
+def _strip_reasoning(text: str) -> str:
+    """Drop any <think>…</think> a reasoning model leaks into content."""
+    import re as _re
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.S)
+    # Truncated/unclosed reasoning (model spent the whole budget thinking).
+    if "<think>" in text and "</think>" not in text:
+        return ""
+    return text
 
 
 # --------------------------------------------------------------- gemini -----
