@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, or_, select
@@ -34,13 +34,13 @@ from config import BASE_DIR, settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, YouTubeChannel
 from app.core import keyword_scan_queue, result_policy
+from app.live import jobs as live_jobs, search as live_search
 from app.core.keywords import script_language
 from app.epaper import scan_runner, sources
 from app.newspaper import scan_manager
 from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
 from app.youtube import scan_runner as yt_scan_runner
 from app.scrapers.sites import SITE_CONFIGS
-from app.scheduler import shutdown_scheduler, start_scheduler
 from app import sources_probe
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -80,16 +80,12 @@ BUILD_VERSION = _build_version()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Live-only model: no scheduler, no background scans, no warm-up crawl.
+    # Scraping happens ONLY when the user clicks "Search live results", and
+    # nothing is persisted. init_db still runs so the keyword watchlist (the one
+    # thing we keep) has its table.
     init_db()
-    if settings.scheduler_enabled:
-        start_scheduler()
-    import threading
-
-    from app.newspaper.pipeline import warm_quick_corpus
-
-    threading.Thread(target=warm_quick_corpus, daemon=True).start()
     yield
-    shutdown_scheduler()
 
 
 app = FastAPI(title="Media Monitoring", version="0.3.0", lifespan=lifespan)
@@ -452,6 +448,29 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
   border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
 @keyframes s{to{transform:rotate(360deg)}}
 
+/* Top loading bar — slides in while a live fetch / scan is producing results */
+#loadbar{position:fixed;top:0;left:0;right:0;height:3px;z-index:120;background:transparent;
+  overflow:hidden;opacity:0;transition:opacity .25s;pointer-events:none}
+#loadbar.on{opacity:1}
+#loadbar::before{content:"";position:absolute;top:0;left:-40%;height:100%;width:40%;
+  background:linear-gradient(90deg,transparent,var(--blue-deep),var(--blue));
+  border-radius:999px;animation:lbslide 1.05s cubic-bezier(.4,0,.2,1) infinite}
+@keyframes lbslide{0%{left:-40%}50%{left:30%}100%{left:100%}}
+
+/* Confirm dialog (delete keyword) — reuses the daylight modal look */
+#confirm-modal{position:fixed;inset:0;z-index:130;display:none;align-items:center;justify-content:center;
+  background:rgba(20,28,36,.32);backdrop-filter:blur(2px);padding:1rem}
+#confirm-modal.open{display:flex}
+#confirm-modal .box{width:min(380px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
+  border:1px solid var(--line-strong);border-radius:var(--r);box-shadow:var(--shadow);padding:1.4rem 1.35rem}
+#confirm-modal h3{margin:0 0 .5rem;font-size:1.1rem;color:var(--blue-deep)}
+#confirm-modal p{margin:0 0 1.2rem;color:var(--muted);font-size:.9rem;line-height:1.5}
+#confirm-modal p b{color:var(--ink)}
+#confirm-modal .row-btns{display:flex;gap:.55rem;justify-content:flex-end}
+#confirm-modal button{border-radius:999px;padding:.5rem 1.1rem;font-size:.86rem;font-weight:700;cursor:pointer}
+#confirm-modal .danger{background:#b0452b;color:#fff;border:1px solid #9a3a22}
+#confirm-modal .danger:hover{background:#9a3a22;transform:none}
+
 #lb{position:fixed;inset:0;z-index:100;background:rgba(16,24,32,.92);display:none;opacity:0;transition:opacity .2s}
 #lb.open{display:block;opacity:1}
 #lbscroll{position:absolute;inset:0;overflow:auto;text-align:center}
@@ -578,70 +597,45 @@ _JS = """
   var pageModule=(location.pathname||'').indexOf('/youtube')===0?'youtube':'newspaper';
   var q=document.getElementById('q');
   var form=document.getElementById('search')||document.getElementById('yt-search');
-  document.querySelectorAll('.kw-pick').forEach(function(btn){
-    btn.addEventListener('click',function(){
-      if(!q||!form)return;
-      var kw=btn.getAttribute('data-kw')||'';
-      q.value=kw;
-      document.querySelectorAll('.kw-chip,.kw-pick.kw-all').forEach(function(el){
-        el.classList.remove('on');
-      });
-      var chip=btn.closest('.kw-chip');
-      if(chip)chip.classList.add('on');else btn.classList.add('on');
-      // Newspaper: filter the stored results in place, like the YouTube page —
-      // no full reload. Other modules keep the plain form submit.
-      if(pageModule==='newspaper'){autoShowNewspaper(kw, btn.getAttribute('data-kw-id'));}
-      else{form.requestSubmit?form.requestSubmit():form.submit();}
+  // Delegated so chips added live (after an Add) work without re-binding.
+  document.addEventListener('click',function(ev){
+    var btn=ev.target.closest?ev.target.closest('.kw-pick'):null;
+    if(!btn)return;
+    if(!q||!form)return;
+    var kw=btn.getAttribute('data-kw')||'';
+    q.value=kw;
+    document.querySelectorAll('.kw-chip,.kw-pick.kw-all').forEach(function(el){
+      el.classList.remove('on');
     });
+    var chip=btn.closest('.kw-chip');
+    if(chip)chip.classList.add('on');else btn.classList.add('on');
+    // Newspaper: filter the stored results in place, like the YouTube page —
+    // no full reload. Other modules keep the plain form submit.
+    if(pageModule==='newspaper'){autoShowNewspaper(kw, btn.getAttribute('data-kw-id'));}
+    else{form.requestSubmit?form.requestSubmit():form.submit();}
   });
   var autoShowTimer=null;
   function autoShowNewspaper(kw, kwId){
-    // Filter the results to this keyword in place — no page reload. Keep the
-    // current date and newspaper selection by serialising the search form.
-    var p=new URLSearchParams(form?new FormData(form):location.search);
+    // Live-only: clicking a keyword just sets it as the filter for the next live
+    // search. No DB fetch, no scan — scraping happens on "Search live results".
+    var p=new URLSearchParams(location.search);
     if(kw){p.set('q',kw);}else{p.delete('q');}
-    p.set('go','1');
     p.set('module','newspaper');
     history.replaceState(null,'','?'+p.toString());
-    refreshResults(true);  // show whatever is already matched, at once
-    // Then match this keyword against the stored article + e-paper text, so
-    // results appear even for a keyword that was never scanned (e.g. it exists
-    // in 110 articles but had no mentions yet). The poll loop streams the new
-    // hits in; kick it now so it doesn't wait out the idle interval.
-    if(kwId){
-      fetch('/api/keywords/'+encodeURIComponent(kwId)+'/match',{method:'POST'})
-        .then(function(){ clearTimeout(pollTimer); pollTimer=setTimeout(poll,700); })
-        .catch(function(){});
-    }
   }
   function autoShowYoutube(){
-    // Selecting a keyword shows its matches straight away — no Show results
-    // click, and an in-place fragment swap instead of a full page reload.
-    clearTimeout(autoShowTimer);
-    autoShowTimer=setTimeout(function(){
-      var ids=[];
-      document.querySelectorAll('.kw-chip.sel[data-kw-id]').forEach(function(c){
-        var id=c.getAttribute('data-kw-id'); if(id)ids.push(id);
-      });
-      var p=new URLSearchParams(location.search);
-      p.delete('kw_id'); p.delete('ymax');  // new selection resets pagination
-      ids.forEach(function(id){p.append('kw_id',id)});
-      p.set('module','youtube');
-      if(ids.length){p.set('filter','1');p.set('go','1');}
-      else{p.delete('filter');}
-      history.replaceState(null,'','?'+p.toString());
-      refreshResults(true);
-    },200);  // debounce so selecting several fires one query
+    // Live-only: selection is tracked by the .sel class on chips; the live
+    // search reads it when the button is clicked. No DB fetch here.
   }
   if(pageModule==='youtube'){
-    document.querySelectorAll('.kw-toggle').forEach(function(btn){
-      btn.addEventListener('click',function(e){
-        e.preventDefault();
-        var chip=btn.closest('.kw-chip');
-        if(!chip)return;
-        chip.classList.toggle('sel');
-        autoShowYoutube();
-      });
+    document.addEventListener('click',function(e){
+      var btn=e.target.closest?e.target.closest('.kw-toggle'):null;
+      if(!btn)return;
+      e.preventDefault();
+      var chip=btn.closest('.kw-chip');
+      if(!chip)return;
+      chip.classList.toggle('sel');
+      autoShowYoutube();
     });
     var selAll=document.getElementById('kw-sel-all');
     var selNone=document.getElementById('kw-sel-none');
@@ -937,6 +931,63 @@ _JS = """
     });
   })();
 
+  /* ---- Loading bar ---- */
+  var loadbar=document.createElement('div');loadbar.id='loadbar';document.body.appendChild(loadbar);
+  function showLoad(){loadbar.classList.add('on');}
+  function hideLoad(){loadbar.classList.remove('on');}
+
+  /* ---- Styled confirm dialog (delete keyword) ---- */
+  var cmodal=document.createElement('div');cmodal.id='confirm-modal';
+  cmodal.innerHTML='<div class="box"><h3>Remove keyword</h3>'
+    +'<p id="cm-text"></p><div class="row-btns">'
+    +'<button type="button" class="ghost" id="cm-cancel">Cancel</button>'
+    +'<button type="button" class="danger" id="cm-ok">Remove</button></div></div>';
+  document.body.appendChild(cmodal);
+  var cmText=cmodal.querySelector('#cm-text'),cmOk=cmodal.querySelector('#cm-ok'),
+      cmCancel=cmodal.querySelector('#cm-cancel'),pendingDel=null;
+  function closeConfirm(){cmodal.classList.remove('open');pendingDel=null;}
+  cmCancel.addEventListener('click',closeConfirm);
+  cmodal.addEventListener('click',function(e){if(e.target===cmodal)closeConfirm();});
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'&&cmodal.classList.contains('open'))closeConfirm();});
+  cmOk.addEventListener('click',function(){
+    if(!pendingDel)return;
+    var id=pendingDel.id,chip=pendingDel.chip;
+    closeConfirm();
+    if(chip){chip.style.opacity='.4';chip.style.pointerEvents='none';}
+    fetch('/ui/keywords/'+encodeURIComponent(id)+'/delete',
+      {method:'POST',headers:{'Accept':'application/json'}})
+      .then(function(r){return r.json();})
+      .then(function(){
+        var wasOn=chip&&chip.classList.contains('on');
+        if(chip)chip.remove();
+        var tags=document.querySelector('.kw-tags');
+        if(tags&&!tags.querySelector('.kw-chip'))
+          tags.innerHTML='<span class="hint">No keywords yet — add some above.</span>';
+        // Removed the active newspaper filter? fall back to All, in place.
+        if(wasOn&&pageModule==='newspaper'){
+          if(q)q.value='';
+          var allBtn=document.querySelector('.kw-pick.kw-all');if(allBtn)allBtn.classList.add('on');
+          var p=new URLSearchParams(location.search);
+          p.delete('q');p.set('go','1');p.set('module','newspaper');
+          history.replaceState(null,'','?'+p.toString());
+          refreshResults(true);
+        }
+      })
+      .catch(function(){if(chip){chip.style.opacity='';chip.style.pointerEvents='';}});
+  });
+  // Delegated: any × on a chip opens the styled confirm (no browser prompt, no reload).
+  document.addEventListener('click',function(e){
+    var x=e.target.closest?e.target.closest('[data-del-id]'):null;
+    if(!x)return;
+    e.preventDefault();
+    var text=x.getAttribute('data-del-text')||'this keyword';
+    pendingDel={id:x.getAttribute('data-del-id'),chip:x.closest('.kw-chip')};
+    cmText.innerHTML='Remove <b></b> from the watchlist? Its stored results stay retained for 90 days.';
+    cmText.querySelector('b').textContent=text;
+    cmodal.classList.add('open');
+  });
+
   var wasScanning=__SCANNING__;
   var wasQueue=__QUEUE__;
   var lastResultsSig=(document.getElementById('results')||{}).getAttribute
@@ -986,6 +1037,7 @@ _JS = """
       }
       var b=document.getElementById('scanbtn');
       if(running && b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
+      if(running)showLoad();else hideLoad();
       // Only re-query results while something is producing them; the idle case
       // was re-running the full results query every tick for no change.
       if(running) await refreshResults();
@@ -1000,39 +1052,138 @@ _JS = """
       pollTimer=setTimeout(poll, running?BUSY_MS:IDLE_MS);
     }
   }
-  pollTimer=setTimeout(poll, BUSY_MS);
-  if(document.getElementById('results'))setTimeout(refreshResults,400);
-  // "Show more" lives inside the results fragment, which is swapped out on each
-  // refresh, so bind it by delegation on the document rather than directly.
-  // #yt-more paginates YouTube (ymax); #news-more paginates newspaper (nmax).
-  document.addEventListener('click',function(ev){
-    var more=ev.target.closest?ev.target.closest('.more-btn'):null;
-    if(!more)return;
-    var next=more.getAttribute('data-next');
-    var p=new URLSearchParams(location.search);
-    if(next)p.set(more.id==='news-more'?'nmax':'ymax', next);
-    p.set('module',pageModule);
-    history.replaceState(null,'','?'+p.toString());
-    more.disabled=true;more.textContent='Loading…';
-    refreshResults(true);
-  });
+  // Live-only model: no background poll, no DB auto-refresh. Results come ONLY
+  // from an on-demand live search (below). The old poll()/refreshResults() are
+  // left defined but never started.
+
+  /* ---- Search live results — the ONLY thing that scrapes ---- */
+  function escHtml(s){return (s||'').replace(/[<>&"]/g,function(c){
+    return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
+  function setResults(markup){
+    var el=document.getElementById('results'); if(!el)return;
+    var wrap=document.createElement('div'); wrap.innerHTML=(markup||'').trim();
+    var next=wrap.firstElementChild; if(next)el.replaceWith(next);
+  }
+  var liveJob=null, liveTimer=null;
+  function pollLive(){
+    if(!liveJob)return;
+    fetch('/api/live/search/'+encodeURIComponent(liveJob))
+      .then(function(r){return r.json();})
+      .then(function(j){
+        if(j&&j.html)setResults(j.html);
+        if(j&&j.status==='running'){showLoad();liveTimer=setTimeout(pollLive,1500);}
+        else{hideLoad();}
+      })
+      .catch(function(){liveTimer=setTimeout(pollLive,2500);});
+  }
+  function liveSearch(){
+    var body=new URLSearchParams();
+    body.append('module',pageModule);
+    var d=document.getElementById('date'); if(d&&d.value)body.append('date',d.value);
+    if(pageModule==='youtube'){
+      var sel=document.querySelectorAll('.kw-chip.sel[data-kw-id]');
+      if(!sel.length){
+        setResults('<section class="results" id="results"><div class="results-head">'
+          +'<h2>Live results</h2></div><div class="empty">Select at least one keyword '
+          +'(click the chips) — a live YouTube search downloads and transcribes videos.</div></section>');
+        return;
+      }
+      if(!confirm('Live YouTube search downloads and transcribes recent videos on your '
+        +'channels. This uses paid transcription (Groq) and can take a few minutes. Continue?'))return;
+      sel.forEach(function(c){
+        var id=c.getAttribute('data-kw-id'); if(id)body.append('kw_id',id);
+      });
+    }else{
+      if(q&&q.value)body.append('q',q.value);
+      document.querySelectorAll('input[name=paper]:checked').forEach(function(c){
+        body.append('paper',c.value);
+      });
+    }
+    if(liveJob){fetch('/api/live/search/'+encodeURIComponent(liveJob)+'/cancel',{method:'POST'}).catch(function(){});}
+    clearTimeout(liveTimer);
+    showLoad();
+    setResults('<section class="results" id="results"><div class="results-head">'
+      +'<h2>Live results <span class="spin"></span></h2></div>'
+      +'<div class="empty loading"><span class="spin"></span> Starting live search…</div></section>');
+    fetch('/api/live/search',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},
+      body:body.toString()})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(res){
+        if(!res.ok||!res.j||!res.j.job){
+          hideLoad();
+          setResults('<section class="results" id="results"><div class="results-head">'
+            +'<h2>Live results</h2></div><div class="empty">'
+            +escHtml((res.j&&res.j.error)||'Could not start the live search.')+'</div></section>');
+          return;
+        }
+        liveJob=res.j.job; pollLive();
+      })
+      .catch(function(){hideLoad();});
+  }
+  var liveBtn=document.getElementById('live-search-btn');
+  if(liveBtn)liveBtn.addEventListener('click',liveSearch);
 
   /* One "Add" button: type a keyword (or a comma list), Add — it's saved and
      matched against stored data straight away. */
   (function(){
     var input=document.getElementById('kw-draft-text'),
         lang=document.getElementById('kw-draft-lang'),
-        form=document.getElementById('kw-confirm'),
-        texts=document.getElementById('kw-pending-texts'),
-        langH=document.getElementById('kw-pending-lang'),
+        cfg=document.getElementById('kw-confirm'),
         addBtn=document.getElementById('kw-add-btn');
+    var moduleField=cfg?cfg.querySelector('input[name=module]'):null;
+    var addModule=moduleField&&moduleField.value?moduleField.value:pageModule;
+    function esc(s){return (s||'').replace(/[<>&"]/g,function(c){
+      return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
+    function chipHtml(id,text){
+      var t=esc(text);
+      var del='<button type="button" class="kw-x" data-del-id="'+id+'" data-del-text="'+t
+        +'" title="Remove" aria-label="Remove">\\u00d7</button>';
+      if(addModule==='youtube'){
+        return '<span class="kw-chip" data-kw-id="'+id+'">'
+          +'<button type="button" class="kw-toggle" data-kw="'+t+'">'+t+'</button>'+del+'</span>';
+      }
+      return '<span class="kw-chip" data-kw-id="'+id+'">'
+        +'<button type="button" class="kw-pick" data-kw-id="'+id+'" data-kw="'+t+'">'+t+'</button>'
+        +del+'</span>';
+    }
+    function insertChips(list){
+      var tags=document.querySelector('.kw-tags');
+      if(!tags)return;
+      var hint=tags.querySelector('.hint');if(hint)hint.remove();
+      list.forEach(function(c){
+        if(tags.querySelector('[data-kw-id="'+c.id+'"]'))return;  // already shown
+        var tmp=document.createElement('div');tmp.innerHTML=chipHtml(c.id,c.text);
+        if(tmp.firstChild)tags.appendChild(tmp.firstChild);
+      });
+    }
     function submitAdd(){
-      if(!input||!form||!texts)return;
+      if(!input)return;
       var raw=(input.value||'').trim();
       if(!raw)return;
-      texts.value=raw;                       // endpoint splits on comma/newline
-      if(langH&&lang)langH.value=lang.value||'en';
-      form.requestSubmit?form.requestSubmit():form.submit();
+      var body=new URLSearchParams();
+      body.append('texts',raw);                       // endpoint splits on comma/newline
+      body.append('language',(lang&&lang.value)||'en');
+      body.append('module',addModule);
+      body.append('scan','1');
+      input.disabled=true;
+      if(addBtn){addBtn.disabled=true;addBtn.innerHTML='<span class="spin"></span>';}
+      // Add ONLY saves to the watchlist — no scan, no cost. Scraping happens
+      // later, when the user clicks "Search live results".
+      fetch('/ui/keywords/batch',{method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},
+        body:body.toString()})
+        .then(function(r){return r.json();})
+        .then(function(j){
+          input.disabled=false;input.value='';input.focus();
+          if(addBtn){addBtn.disabled=false;addBtn.textContent='Add';}
+          if(!j||!j.ok)return;
+          insertChips(j.created||[]);
+        })
+        .catch(function(){
+          input.disabled=false;
+          if(addBtn){addBtn.disabled=false;addBtn.textContent='Add';}
+        });
     }
     if(addBtn)addBtn.addEventListener('click',submitAdd);
     if(input)input.addEventListener('keydown',function(e){
@@ -1218,20 +1369,9 @@ def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
     # Deliberately does not announce scanning — progress belongs in the results
     # grid, not the header.
     state = '<span class="dot live"></span>Live'
-    if module == "youtube":
-        scan_btn = (
-            '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
-            if scanning
-            else '<form method="post" action="/ui/scan/youtube" style="margin:0">'
-                 '<button class="ghost" id="scanbtn" type="submit">Scan now</button></form>'
-        )
-    else:
-        scan_btn = (
-            '<button class="ghost" id="scanbtn" disabled><span class="spin"></span> Scanning…</button>'
-            if scanning
-            else '<form method="post" action="/ui/scan" style="margin:0">'
-                 '<button class="ghost" id="scanbtn" type="submit">Scan now</button></form>'
-        )
+    # Live-only model: no background scans, so no "Scan now". Results come only
+    # from the on-demand "Search live results" button on the page.
+    scan_btn = ""
     nav = (
         '<nav class="mod-nav">'
         f'<a href="/" class="{"on" if module == "newspaper" else ""}">Newspaper</a>'
@@ -2253,28 +2393,13 @@ def home(request: Request, db: Session = Depends(get_db)):
 
     def _kw_chip(k: Keyword) -> str:
         on = " on" if kw_l == k.text.casefold() else ""
-        this_busy = (
-            k.id in queued_ids
-            or k.text.casefold() in queued_folds
-        )
-        busy = " busy" if this_busy else ""
-        play = (
-            '<span class="kw-play" title="Scanning" aria-label="Scanning">'
-            '<span class="spin"></span></span>'
-            if this_busy else
-            f'<form class="kw-play-form" method="post" action="/ui/keywords/{k.id}/scan">'
-            f'<button type="submit" class="kw-play" title="Scan this keyword now" '
-            f'aria-label="Scan">▶</button></form>'
-        )
         return (
-            f'<span class="kw-chip{on}{busy}">'
+            f'<span class="kw-chip{on}" data-kw-id="{k.id}">'
             f'<button type="button" class="kw-pick" data-kw-id="{k.id}" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
-            f'{play}'
-            f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the watchlist? Its results stay retained for 90 days.')\">"
-            f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
-            f'×</button></form></span>'
+            f'<button type="button" class="kw-x" data-del-id="{k.id}" '
+            f'data-del-text="{html.escape(k.text, quote=True)}" '
+            f'title="Remove" aria-label="Remove">×</button></span>'
         )
 
     kw_tags = (
@@ -2286,7 +2411,9 @@ def home(request: Request, db: Session = Depends(get_db)):
     {banner}
     <div class="hero">
       <h1>Find coverage</h1>
-      <p>Filter by date, keyword, and newspapers. Scheduled scans keep filling this quietly.</p>
+      <p>Add keywords, pick newspapers, then <b>Search live results</b> — the sites and
+      e-papers are scraped live, right now. Nothing is scanned in the background and
+      nothing is stored.</p>
     </div>
     <div class="panel">
       <h2>Search</h2>
@@ -2306,9 +2433,9 @@ def home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="scan" value="1">
         </form>
-        <p class="hint" style="margin-top:.45rem">Adds the keyword and matches it against everything already stored.</p>
+        <p class="hint" style="margin-top:.45rem">Saves the keyword to your watchlist. No scan, no cost — search runs live when you click below.</p>
         <div class="kw-bar">
-          <div class="cap">Watchlist · click to filter · ▶ scan · × hide</div>
+          <div class="cap">Watchlist · click to filter · × remove</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
@@ -2335,10 +2462,10 @@ def home(request: Request, db: Session = Depends(get_db)):
           </script>
         </div>
         <div class="actions">
-          <button type="submit">Show results</button>
+          <button type="button" id="live-search-btn">Search live results</button>
           <a class="btn ghost" href="/">Reset</a>
         </div>
-        <p class="hint">Jobs and schedules are unchanged — this page only browses what they already found.</p>
+        <p class="hint">Scrapes the selected newspapers and their e-papers live, on demand. Results are shown here and never saved.</p>
       </form>
     </div>
     <div id="src-modal" role="dialog" aria-modal="true" aria-labelledby="src-title">
@@ -2376,6 +2503,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
 
     today = datetime.now(_PKT).date()
     qp = request.query_params
+    date_s = (qp.get("date") or today.isoformat()).strip()
     keyword = (qp.get("q") or "").strip()
     search_requested = bool(qp.get("go"))
     filter_only = bool(qp.get("filter"))
@@ -2441,10 +2569,9 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
             f'<span class="kw-chip{sel}{busy}" data-kw-id="{k.id}">'
             f'<button type="button" class="kw-toggle" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
-            f'<form class="kw-del" method="post" action="/ui/keywords/{k.id}/delete" '
-            f"onsubmit=\"return confirm('Hide “{html.escape(k.text, quote=True)}” from the YouTube watchlist? Results stay retained for 90 days.')\">"
-            f'<button type="submit" class="kw-x" title="Remove" aria-label="Remove">'
-            f'×</button></form></span>'
+            f'<button type="button" class="kw-x" data-del-id="{k.id}" '
+            f'data-del-text="{html.escape(k.text, quote=True)}" '
+            f'title="Remove" aria-label="Remove">×</button></span>'
         )
 
     kw_tags = "".join(_kw_chip(k) for k in active_kws)
@@ -2494,9 +2621,10 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     body = f"""
     {banner}
     <div class="hero">
-      <h1>YouTube bulletins</h1>
-      <p>Daily bulletin slots are scanned automatically on schedule. Use <b>Custom scan</b> to pick a
-      date/time range — every non-live upload in that window is transcribed and matched to your keywords.</p>
+      <h1>YouTube</h1>
+      <p>Select keywords, pick a day, then <b>Search live results</b> — recent uploads on your
+      channels are downloaded and transcribed live and matched to your keywords. Nothing runs in
+      the background and nothing is stored (transcription still costs at click time).</p>
     </div>
     <div class="panel">
       <h2>Keyword search</h2>
@@ -2549,10 +2677,15 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
           <input type="hidden" name="start" id="yt-period-start" value="{html.escape(p_start_iso)}">
           <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
+          <div class="field">
+            <label for="date">Day to search</label>
+            <input type="date" id="date" name="date" value="{html.escape(date_s)}">
+          </div>
           <div class="actions">
-            <button type="button" id="yt-period-open">Custom scan…</button>
+            <button type="button" id="live-search-btn">Search live results</button>
             <a class="btn ghost" href="/youtube">Reset</a>
           </div>
+          <p class="hint">Downloads &amp; transcribes recent uploads on your channels for the selected keywords, live. Results are shown here and never saved.</p>
         </form>
       </div>
       {results_html}
@@ -2927,14 +3060,28 @@ def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
     })
 
 
+def _wants_json(request) -> bool:
+    """True when the caller is the in-page fetch (AJAX), not a plain form post.
+
+    The AJAX flow renders results in place; the plain form post (and direct
+    unit-test calls, which pass no Request) keep the 303-redirect behaviour.
+    """
+    try:
+        return "application/json" in (request.headers.get("accept") or "").lower()
+    except Exception:
+        return False
+
+
 @app.post("/ui/keywords/batch")
-def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
+def ui_batch_keywords(request: Request,
+                      texts: str = Form(...), language: str = Form("en"),
                       module: str = Form("newspaper"),
                       date: str = Form(""),
                       scan: str = Form("1"),
                       db: Session = Depends(get_db)):
     """Create/reactivate many keywords; optionally scan them."""
     module = module if module in ("newspaper", "youtube") else "newspaper"
+    wants_json = _wants_json(request)
     home = "/youtube" if module == "youtube" else "/"
     slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
     do_scan = scan.strip().lower() in ("1", "true", "yes", "on")
@@ -2964,27 +3111,20 @@ def ui_batch_keywords(texts: str = Form(...), language: str = Form("en"),
     if len(created) > 3:
         label += f" +{len(created) - 3}"
 
-    if module == "youtube":
-        # Match the new keyword against transcripts already on disk before the
-        # 15-minute scan comes round. This costs no download and no Groq call,
-        # so it runs for "Add only" as well — gating it behind the scan button
-        # left a saved keyword reading "no results" until some later scan
-        # happened to pick it up.
-        start_instant_youtube_match(ids)
-        q = urlencode({"added": label, "scanning": "1"})
-        return RedirectResponse(f"{home}?{q}", status_code=303)
+    chips = [{"id": k.id, "text": k.text} for k in created]
 
-    if not do_scan:
-        q = urlencode({"added": label, "date": slot_date})
-        return RedirectResponse(f"{home}?{q}", status_code=303)
-
-    keyword_scan_queue.enqueue_many([(k.id, k.text) for k in created], module=module)
-    q = urlencode({
-        "q": first.text,
-        "go": "1",
-        "date": datetime.now(_PKT).date().isoformat(),
-        "scanning": "1",
-    })
+    # Live-only model: adding a keyword ONLY saves it to the watchlist. No scan,
+    # no queue, no download, no Groq, no cost. Scraping happens later, and only
+    # when the user clicks "Search live results".
+    if wants_json:
+        return JSONResponse({
+            "ok": True,
+            "module": module,
+            "created": chips,
+            "first": first.text,
+            "scanning": False,
+        })
+    q = urlencode({"added": label, "date": slot_date})
     return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
@@ -3009,14 +3149,20 @@ def ui_toggle_keyword(kid: int, db: Session = Depends(get_db)):
 
 
 @app.post("/ui/keywords/{kid}/delete")
-def ui_delete_keyword(kid: int, db: Session = Depends(get_db)):
+def ui_delete_keyword(kid: int, db: Session = Depends(get_db), request: Request = None):
+    wants_json = _wants_json(request)
     kw = db.get(Keyword, kid)
     if not kw:
+        if wants_json:
+            return JSONResponse({"ok": True, "id": kid})
         return RedirectResponse("/", status_code=303)
     text = kw.text
     module = kw.module or "newspaper"
     kw.active = False
     db.commit()
+    if wants_json:
+        # AJAX: the page drops the chip from the DOM instantly — no reload.
+        return JSONResponse({"ok": True, "id": kid, "text": text, "module": module})
     home = "/youtube" if module == "youtube" else "/"
     q = urlencode({
         "removed": text,
@@ -3051,6 +3197,143 @@ def ui_delete_channel(cid: int, db: Session = Depends(get_db)):
     _purge_source_results(db, name, ("youtube",))
     q = urlencode({"channel_removed": name, "date": datetime.now(_PKT).date().isoformat()})
     return RedirectResponse(f"/youtube?{q}", status_code=303)
+
+
+def _render_live_results(job) -> str:
+    """Render a live-search job's in-memory result cards as the #results section.
+
+    Same markup/classes as the stored renderer, minus screenshots (we store no
+    media). Streams: called repeatedly while the job runs, results grow."""
+    results = list(job.results)
+    running = job.status == "running"
+    spin = ' <span class="spin"></span>' if running else ""
+    kindmap = {"newspaper": "Web", "epaper": "E-Paper", "youtube": "YouTube"}
+    cards = []
+    for r in results:
+        hl = r.get("keywords") or []
+        excerpt = _highlight_excerpt(r.get("snippet") or "", hl)
+        excerpt_html = f'<div class="excerpt">{excerpt}</div>' if excerpt else ""
+        tags = "".join(f'<span class="tag">{html.escape(k)}</span>' for k in hl)
+        meta = " · ".join(
+            x for x in [kindmap.get(r.get("module"), ""), r.get("source"), r.get("meta")] if x
+        )
+        title = html.escape(r.get("title") or "")
+        href = html.escape(r.get("url") or "#")
+        cards.append(
+            '<div class="det"><div class="shot missing"><span class="noprev">'
+            'No preview · live</span></div><div class="body">'
+            f'<a class="ttl" href="{href}" target="_blank" rel="noopener">{title}</a>'
+            f'{excerpt_html}<div class="meta">{html.escape(meta)}</div>'
+            f'<div>{tags}</div></div></div>'
+        )
+    prog = job.progress or {}
+    if cards:
+        grid = f'<div class="grid">{"".join(cards)}</div>'
+    elif running:
+        grid = ('<div class="empty loading"><span class="spin"></span> '
+                f'Searching live… {html.escape(prog.get("current") or "")}</div>')
+    elif job.error:
+        grid = f'<div class="empty">Live search failed: {html.escape(job.error)}</div>'
+    else:
+        grid = '<div class="empty">No live matches found. Nothing was stored.</div>'
+    count = len(results)
+    head = (f'<div class="results-head"><h2>Live results{spin}</h2>'
+            f'<span class="count">{count} match{"es" if count != 1 else ""}</span></div>')
+    sub = ""
+    if running:
+        bits = [prog.get("phase") or "searching"]
+        if prog.get("current"):
+            bits.append(prog["current"])
+        checked, total = prog.get("checked"), prog.get("total")
+        if isinstance(checked, int) and isinstance(total, int) and total:
+            bits.append(f"{checked}/{total}")
+        sub = (f'<div class="hint" style="margin:-.35rem 0 .8rem">'
+               f'{html.escape(" · ".join(str(b) for b in bits))}</div>')
+    return (f'<section class="results" id="results" data-live="1" '
+            f'data-status="{job.status}">{head}{sub}{grid}</section>')
+
+
+@app.post("/api/live/search")
+def api_live_search(request: Request,
+                    module: str = Form("newspaper"),
+                    q: str = Form(""),
+                    kw_id: list[str] = Form(default=[]),
+                    paper: list[str] = Form(default=[]),
+                    date: str = Form(""),
+                    db: Session = Depends(get_db)):
+    """Start a live scrape/transcribe. Nothing is stored — results live in an
+    in-memory job the browser polls. This is the ONLY thing that scrapes."""
+    module = "youtube" if module == "youtube" else "newspaper"
+    today = datetime.now(_PKT).date().isoformat()
+
+    if module == "youtube":
+        ids = [int(x) for x in kw_id if str(x).isdigit()]
+        # YouTube live search downloads + transcribes (paid). Require an explicit
+        # keyword selection so a click can never accidentally transcribe the whole
+        # watchlist across every channel.
+        if not ids:
+            return JSONResponse(
+                {"error": "Select at least one keyword (click the chips) — a live "
+                          "YouTube search downloads and transcribes videos."}, 400)
+        kq = select(Keyword).where(
+            Keyword.active.is_(True), Keyword.module == "youtube", Keyword.id.in_(ids))
+        rows = db.execute(kq.order_by(Keyword.text)).scalars().all()
+        keywords = [(k.text, k.language or "ur") for k in rows if k.text]
+        if not keywords:
+            return JSONResponse({"error": "Those keywords are no longer on the watchlist."}, 400)
+        channels = [
+            {"channel_id": c.channel_id, "name": c.name, "playlist_id": c.uploads_playlist_id or ""}
+            for c in db.execute(
+                select(YouTubeChannel).where(YouTubeChannel.active.is_(True))
+            ).scalars().all()
+            if c.channel_id
+        ]
+        if not channels:
+            return JSONResponse({"error": "No active YouTube channels to search."}, 400)
+        day = (date or today).strip()
+        try:
+            base = datetime.strptime(day, "%Y-%m-%d").date()
+            after = datetime(base.year, base.month, base.day, tzinfo=_PKT)
+            before = after + timedelta(days=1)
+        except ValueError:
+            before = datetime.now(_PKT)
+            after = before - timedelta(days=1)
+        jid = live_jobs.run("youtube", live_search.search_youtube,
+                            keywords, channels, after.isoformat(), before.isoformat())
+        return {"job": jid, "module": "youtube"}
+
+    # Newspaper page → websites + e-papers.
+    kw = (q or "").strip()
+    kq = select(Keyword).where(Keyword.active.is_(True), Keyword.module == "newspaper")
+    if kw:
+        kq = kq.where(func.lower(Keyword.text) == kw.casefold())
+    rows = db.execute(kq.order_by(Keyword.text)).scalars().all()
+    keywords = [(k.text, k.language or "en") for k in rows if k.text]
+    if not keywords:
+        return JSONResponse({"error": "Add (and keep active) at least one keyword."}, 400)
+    sources_set = {p.strip() for p in paper if p and p.strip()} or None
+    jid = live_jobs.run("newspaper", live_search.search_press,
+                        keywords, sources_set, (date or today).strip())
+    return {"job": jid, "module": "newspaper"}
+
+
+@app.get("/api/live/search/{job_id}")
+def api_live_search_status(job_id: str):
+    job = live_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found or expired")
+    return {
+        "status": job.status,
+        "progress": job.progress,
+        "count": len(job.results),
+        "error": job.error,
+        "html": _render_live_results(job),
+    }
+
+
+@app.post("/api/live/search/{job_id}/cancel")
+def api_live_search_cancel(job_id: str):
+    return {"cancelled": live_jobs.cancel(job_id)}
 
 
 @app.get("/api/youtube/live")

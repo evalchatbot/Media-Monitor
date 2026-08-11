@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Adding a YouTube keyword through the real form triggers the match itself.
+"""Adding a keyword ONLY saves it to the watchlist — it must not scan.
 
-This is the automation, not a helper anyone runs by hand: posting the add form
-must schedule the match against already-stored transcripts, for BOTH buttons on
-the page, without any further action.
+Live-only model: scraping/transcription happens exclusively when the user
+clicks "Search live results". Adding a keyword therefore must not enqueue a
+scan, start an instant match, or launch any subprocess — no background work and
+no cost. The AJAX add returns the created chip(s) with scanning=False.
 """
 from __future__ import annotations
-
-import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,52 +16,65 @@ from app import main as app_main
 
 @pytest.fixture
 def client(monkeypatch):
-    """Exercise the route with the match trigger recorded instead of run."""
-    started: list[list[int]] = []
+    """Record any scan/match trigger so the test can assert none fire."""
+    triggered: list[str] = []
     monkeypatch.setattr(
         app_main, "start_instant_youtube_match",
-        lambda ids: started.append(list(ids)),
+        lambda ids: triggered.append(f"yt_match:{list(ids)}"),
     )
     monkeypatch.setattr(
-        app_main.keyword_scan_queue, "enqueue_many", lambda *a, **k: None
+        app_main.keyword_scan_queue, "enqueue_many",
+        lambda *a, **k: triggered.append("enqueue_many"),
+    )
+    monkeypatch.setattr(
+        app_main.scan_manager, "start_scan",
+        lambda *a, **k: triggered.append("news_scan") or True,
+    )
+    monkeypatch.setattr(
+        app_main.yt_scan_runner, "start_scan",
+        lambda *a, **k: triggered.append("yt_scan") or True,
     )
     with TestClient(app_main.app) as c:
-        yield c, started
+        yield c, triggered
 
 
-def _post(client, texts, scan):
+def _post(client, texts, module="youtube", accept=None):
+    headers = {"Accept": accept} if accept else {}
     return client.post(
         "/ui/keywords/batch",
-        data={"texts": texts, "language": "en", "module": "youtube", "scan": scan},
+        data={"texts": texts, "language": "en", "module": module, "scan": "1"},
+        headers=headers,
         follow_redirects=False,
     )
 
 
-def test_add_to_watchlist_button_triggers_the_match(client):
-    c, started = client
-    r = _post(c, "عمران خان", "1")
+def test_plain_add_saves_without_triggering_any_scan(client):
+    c, triggered = client
+    r = _post(c, "عمران خان")
     assert r.status_code == 303
-    assert started and started[0], "adding a keyword must schedule the match"
+    assert triggered == [], f"adding must not scan/match, but fired: {triggered}"
 
 
-def test_add_only_button_also_triggers_the_match(client):
-    """Matching cached transcripts is free, so it must not need the scan button."""
-    c, started = client
-    r = _post(c, "شہباز شریف", "0")
-    assert r.status_code == 303
-    assert started and started[0], (
-        "'Add only' saved the keyword without ever matching it"
-    )
+def test_ajax_add_returns_chip_and_does_not_scan(client):
+    c, triggered = client
+    r = _post(c, "شہباز شریف", accept="application/json")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["scanning"] is False
+    assert payload["created"] and payload["created"][0]["text"] == "شہباز شریف"
+    assert triggered == [], f"AJAX add must not scan/match, but fired: {triggered}"
 
 
-def test_every_keyword_in_a_batch_is_matched(client):
-    c, started = client
-    _post(c, "جنگ\nآتش بازی\nسیلاب", "1")
-    assert started, "batch add must schedule a match"
-    assert len(started[0]) == 3, "all keywords in the batch, not just the first"
+def test_newspaper_add_also_does_not_scan(client):
+    c, triggered = client
+    r = _post(c, "monsoon", module="newspaper", accept="application/json")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert triggered == [], f"newspaper add must not scan, but fired: {triggered}"
 
 
-def test_blank_submission_schedules_nothing(client):
-    c, started = client
-    _post(c, "   ", "1")
-    assert started == []
+def test_blank_submission_saves_nothing_and_scans_nothing(client):
+    c, triggered = client
+    _post(c, "   ")
+    assert triggered == []
