@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -20,13 +22,35 @@ logger = logging.getLogger(__name__)
 
 # Bounds so one click can't run unbounded. Streaming means partial results show
 # up immediately, so these keep a search responsive and its cost predictable.
-NEWS_BODIES_PER_SITE = 45     # article bodies fetched per publication
+NEWS_BODIES_PER_SITE = 15     # article bodies fetched per publication (speed)
+NEWS_PARALLEL = 4             # newspapers scraped at once (their own browsers)
+EPAPER_PAGES_PER_PAPER = 12   # e-paper pages OCR'd per paper (bounds cost + time)
+EPAPER_PARALLEL = 4           # e-paper pages OCR'd at once
 YT_VIDEOS_PER_CHANNEL = 5     # uploads transcribed per channel (Groq cost)
 
 
 def _match_labels(haystack: str, keywords: list[tuple[str, str]]) -> list[str]:
     matches = find_matches(haystack, keywords)
     return sorted({m.keyword for m in matches}) if matches else []
+
+
+def _scraper_labels(scraper) -> set[str]:
+    """Every name a scraper can be selected by, casefolded.
+
+    The picker shows a scraper's DISPLAY name (e.g. "Nawa-i-Waqt") but the scraper
+    object is keyed by an internal slug ("nawaiwaqt"). Matching only the slug meant
+    selecting any paper but Dawn scraped nothing. Match both."""
+    labels: set[str] = set()
+    name = (getattr(scraper, "name", "") or "").strip()
+    if name:
+        labels.add(name.casefold())
+    cfg = getattr(scraper, "cfg", None)
+    src = getattr(cfg, "source", "") if cfg is not None else ""
+    if src:
+        labels.add(src.strip().casefold())
+    if name.casefold() == "dawn":
+        labels.add("dawn")
+    return labels
 
 
 def search_press(jid: str, keywords: list[tuple[str, str]],
@@ -44,62 +68,83 @@ def search_press(jid: str, keywords: list[tuple[str, str]],
 def search_newspaper(jid: str, keywords: list[tuple[str, str]],
                      sources: set[str] | None) -> None:
     from app.scrapers.sites import build_scrapers
-    from app.newspaper.pipeline import _make_snippet
 
     scrapers = build_scrapers()
     if sources:
         sel = {s.casefold() for s in sources}
-        scrapers = [s for s in scrapers if (s.name or "").casefold() in sel]
-    jobs.set_progress(jid, phase="newspapers", total=len(scrapers), checked=0)
+        scrapers = [s for s in scrapers if _scraper_labels(s) & sel]
+    total = len(scrapers)
+    jobs.set_progress(jid, phase="newspapers", total=total, checked=0)
+    if not scrapers:
+        return
 
-    for i, scraper in enumerate(scrapers):
+    lock = threading.Lock()
+    state = {"done": 0, "read": 0, "found": 0}
+
+    def _one(scraper) -> None:
         if jobs.is_cancelled(jid):
-            break
-        jobs.set_progress(jid, current=scraper.name, checked=i)
+            return
         try:
-            articles = scraper.list_articles()
+            _scrape_one_newspaper(jid, scraper, keywords, lock, state)
         except Exception as exc:
-            logger.warning("live news %s: listing failed: %s", scraper.name, exc)
-            scraper.close()
-            jobs.set_progress(jid, checked=i + 1)
-            continue
-
-        fetched = 0
-        hits = 0
-        try:
-            for art in articles:
-                if jobs.is_cancelled(jid) or fetched >= NEWS_BODIES_PER_SITE:
-                    break
-                # Cheap title check first; otherwise fetch the body (costs a render).
-                if _match_labels(art.title, keywords):
-                    body = ""
-                else:
-                    try:
-                        body = scraper.fetch_body(art) if hasattr(scraper, "fetch_body") else art.body
-                    except Exception:
-                        body = ""
-                    fetched += 1
-                # Live activity so the bar/status never look frozen on a slow paper.
-                jobs.set_progress(
-                    jid, current=f"{scraper.name} — {fetched} read, {hits} found")
-                haystack = f"{art.title}\n{body}"
-                labels = _match_labels(haystack, keywords)
-                if not labels:
-                    continue
-                hits += 1
-                jobs.add_result(jid, {
-                    "module": "newspaper",
-                    "source": art.source,
-                    "title": art.title,
-                    "url": art.url,
-                    "section": art.section,
-                    "snippet": _make_snippet(haystack, labels),
-                    "keywords": labels,
-                    "meta": "",
-                })
+            logger.warning("live news %s failed: %s", getattr(scraper, "name", "?"), exc)
         finally:
-            scraper.close()
-        jobs.set_progress(jid, checked=i + 1)
+            try:
+                scraper.close()
+            except Exception:
+                pass
+            with lock:
+                state["done"] += 1
+                jobs.set_progress(jid, checked=state["done"])
+
+    # Scrape the selected papers concurrently — each has its own browser, so a
+    # 5-paper search finishes in roughly the time of the slowest one, not the sum.
+    with ThreadPoolExecutor(max_workers=min(max(total, 1), NEWS_PARALLEL)) as ex:
+        list(ex.map(_one, scrapers))
+
+
+def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
+    from app.newspaper.pipeline import _make_snippet
+
+    try:
+        articles = scraper.list_articles()
+    except Exception as exc:
+        logger.warning("live news %s: listing failed: %s", scraper.name, exc)
+        return
+
+    fetched = 0
+    for art in articles:
+        if jobs.is_cancelled(jid) or fetched >= NEWS_BODIES_PER_SITE:
+            break
+        # Cheap title check first; otherwise fetch the body (costs a render).
+        if _match_labels(art.title, keywords):
+            body = ""
+        else:
+            try:
+                body = scraper.fetch_body(art) if hasattr(scraper, "fetch_body") else art.body
+            except Exception:
+                body = ""
+            fetched += 1
+        haystack = f"{art.title}\n{body}"
+        labels = _match_labels(haystack, keywords)
+        with lock:
+            state["read"] += 1
+            if labels:
+                state["found"] += 1
+            jobs.set_progress(
+                jid, current=f"{state['read']} read · {state['found']} found")
+        if not labels:
+            continue
+        jobs.add_result(jid, {
+            "module": "newspaper",
+            "source": art.source,
+            "title": art.title,
+            "url": art.url,
+            "section": art.section,
+            "snippet": _make_snippet(haystack, labels),
+            "keywords": labels,
+            "meta": "",
+        })
 
 
 # ==========================================================================
@@ -127,53 +172,58 @@ def search_epaper(jid: str, keywords: list[tuple[str, str]],
         sel = {s.casefold() for s in sources}
         slugs = [s for s in slugs if ep_sources.SOURCES[s][0].strip().casefold() in sel]
 
-    # Count pages up front for a real progress total.
-    editions: list[tuple[str, list]] = []
-    total_pages = 0
+    # Gather pages up front (bounded per paper) for a real progress total.
+    all_pages: list = []
     for slug in slugs:
         if jobs.is_cancelled(jid):
             break
-        pages = ep_sources.list_pages(slug, d)
-        editions.append((slug, pages))
-        total_pages += len(pages)
-    jobs.set_progress(jid, phase="epaper", total=total_pages, checked=0)
+        pages = ep_sources.list_pages(slug, d)[:EPAPER_PAGES_PER_PAPER]
+        all_pages.extend(pages)
+    jobs.set_progress(jid, phase="epaper", total=len(all_pages), checked=0)
+    if not all_pages:
+        return
 
-    checked = 0
-    for slug, pages in editions:
-        display = ep_sources.SOURCES[slug][0]
-        for pg in pages:
-            if jobs.is_cancelled(jid):
-                return
-            jobs.set_progress(jid, current=f"{display} p{pg.page_no}", checked=checked)
-            dest = _download(pg)          # writes a temp scan under storage/epaper/…
-            try:
-                if dest is not None:
-                    try:
-                        text = read_page(dest)
-                    except Exception as exc:
-                        logger.warning("live epaper read failed %s p%s: %s", slug, pg.page_no, exc)
-                        text = ""
-                    labels = _match_labels(text, keywords)
-                    if labels:
-                        jobs.add_result(jid, {
-                            "module": "epaper",
-                            "source": pg.source,
-                            "title": f"{pg.source} — page {pg.page_no}",
-                            "url": pg.viewer_url,
-                            "section": f"Page {pg.page_no}",
-                            "snippet": _snippet(text, labels),
-                            "keywords": labels,
-                            "meta": pg.date,
-                        })
-            finally:
-                # Nothing persists: delete the scan the instant we're done with it.
-                if dest is not None:
-                    try:
-                        Path(dest).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            checked += 1
-            jobs.set_progress(jid, checked=checked)
+    lock = threading.Lock()
+    state = {"done": 0}
+
+    def _one_page(pg) -> None:
+        if jobs.is_cancelled(jid):
+            return
+        dest = _download(pg)              # temp scan; deleted right after reading
+        try:
+            if dest is not None:
+                try:
+                    text = read_page(dest)
+                except Exception as exc:
+                    logger.warning("live epaper read failed %s p%s: %s", pg.paper, pg.page_no, exc)
+                    text = ""
+                labels = _match_labels(text, keywords)
+                if labels:
+                    jobs.add_result(jid, {
+                        "module": "epaper",
+                        "source": pg.source,
+                        "title": f"{pg.source} — page {pg.page_no}",
+                        "url": pg.viewer_url,
+                        "section": f"Page {pg.page_no}",
+                        "snippet": _snippet(text, labels),
+                        "keywords": labels,
+                        "meta": pg.date,
+                    })
+        finally:
+            if dest is not None:
+                try:
+                    Path(dest).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            with lock:
+                state["done"] += 1
+                jobs.set_progress(jid, current=f"e-paper page {state['done']}/{len(all_pages)}",
+                                  checked=state["done"])
+
+    # OCR several pages at once — vision calls are network-bound, so a handful in
+    # flight cuts the wall-clock sharply.
+    with ThreadPoolExecutor(max_workers=EPAPER_PARALLEL) as ex:
+        list(ex.map(_one_page, all_pages))
 
 
 # ==========================================================================
