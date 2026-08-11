@@ -659,12 +659,14 @@ _JS = """
   });
   var autoShowTimer=null;
   function autoShowNewspaper(kw, kwId){
-    // Live-only: clicking a keyword just sets it as the filter for the next live
-    // search. No DB fetch, no scan — scraping happens on "Search live results".
+    // Live-only: clicking a saved keyword fills the search box with that word,
+    // ready for the next live search. No DB fetch, no scan.
     var p=new URLSearchParams(location.search);
     if(kw){p.set('q',kw);}else{p.delete('q');}
     p.set('module','newspaper');
     history.replaceState(null,'','?'+p.toString());
+    var draft=document.getElementById('kw-draft-text');
+    if(draft)draft.value=kw||'';
   }
   function autoShowYoutube(){
     // Live-only: selection is tracked by the .sel class on chips; the live
@@ -1218,7 +1220,11 @@ _JS = """
         var id=c.getAttribute('data-kw-id'); if(id)body.append('kw_id',id);
       });
     }else{
-      if(q&&q.value)body.append('q',q.value);
+      // Search the word typed in the box directly (no need to Add it first);
+      // fall back to a clicked watchlist chip, else the whole watchlist.
+      var draft=document.getElementById('kw-draft-text');
+      var word=(((draft&&draft.value)||'').trim())||(((q&&q.value)||'').trim());
+      if(word)body.append('q',word);
       document.querySelectorAll('input[name=paper]:checked').forEach(function(c){
         body.append('paper',c.value);
       });
@@ -2548,20 +2554,20 @@ def home(request: Request, db: Session = Depends(get_db)):
         <input form="search" type="date" id="date" name="date" value="{html.escape(date_s)}" required>
       </div>
       <div class="field">
-        <label>Add to watchlist</label>
+        <label>Search a word</label>
         <div class="kw-add" id="kw-draft-row">
-          <input id="kw-draft-text" type="text" placeholder="Type a keyword, then Add" maxlength="120">
+          <input id="kw-draft-text" type="text" placeholder="Type a word — then Search live results below" maxlength="120">
           <select id="kw-draft-lang"><option value="en">EN</option><option value="ur">UR</option></select>
-          <button type="button" id="kw-add-btn">Add</button>
+          <button type="button" id="kw-add-btn">Save to watchlist</button>
         </div>
         <form id="kw-confirm" method="post" action="/ui/keywords/batch" style="display:none">
           <input type="hidden" name="texts" id="kw-pending-texts" value="">
           <input type="hidden" name="language" id="kw-pending-lang" value="en">
           <input type="hidden" name="scan" value="1">
         </form>
-        <p class="hint" style="margin-top:.45rem">Saves the keyword to your watchlist. No scan, no cost — search runs live when you click below.</p>
+        <p class="hint" style="margin-top:.45rem">Type a word and hit <b>Search live results</b> to search it right now — nothing is saved. Or <b>Save to watchlist</b> to keep it for later (click a saved word to reuse it).</p>
         <div class="kw-bar">
-          <div class="cap">Watchlist · click to filter · × remove</div>
+          <div class="cap">Watchlist · click to search · × remove</div>
           <div class="kw-tags">{kw_tags or '<span class="hint">No keywords yet — add some above.</span>'}</div>
         </div>
       </div>
@@ -3387,8 +3393,10 @@ def _render_live_results(job) -> str:
         phase_label = _PHASE_LABELS.get(prog.get("phase") or "", prog.get("phase") or "Searching")
         current = prog.get("current") or ""
 
-        if total:
-            pct = 100 if checked >= total else max(2, int(checked / total * 100))
+        # Animate (indeterminate) until at least one unit finishes, so a single
+        # slow source never looks frozen at 0%.
+        if total and checked > 0:
+            pct = 100 if checked >= total else int(checked / total * 100)
             bar_cls = "live-bar"
         else:
             pct, bar_cls = 0, "live-bar indet"
@@ -3466,13 +3474,21 @@ def api_live_search(request: Request,
 
     # Newspaper page → websites + e-papers.
     kw = (q or "").strip()
-    kq = select(Keyword).where(Keyword.active.is_(True), Keyword.module == "newspaper")
     if kw:
-        kq = kq.where(func.lower(Keyword.text) == kw.casefold())
-    rows = db.execute(kq.order_by(Keyword.text)).scalars().all()
-    keywords = [(k.text, k.language or "en") for k in rows if k.text]
+        # Search the typed word directly — it does NOT need to be a saved
+        # keyword. This is what lets you just type a word and search it live.
+        keywords = [(kw, detect_keyword_language(kw))]
+    else:
+        # No word typed: search the whole active watchlist at once.
+        rows = db.execute(
+            select(Keyword).where(
+                Keyword.active.is_(True), Keyword.module == "newspaper"
+            ).order_by(Keyword.text)
+        ).scalars().all()
+        keywords = [(k.text, k.language or "en") for k in rows if k.text]
     if not keywords:
-        return JSONResponse({"error": "Add (and keep active) at least one keyword."}, 400)
+        return JSONResponse(
+            {"error": "Type a word to search, or add keywords to your watchlist first."}, 400)
     sources_set = {p.strip() for p in paper if p and p.strip()} or None
     jid = live_jobs.run("newspaper", live_search.search_press,
                         keywords, sources_set, (date or today).strip())

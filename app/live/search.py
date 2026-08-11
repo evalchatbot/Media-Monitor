@@ -65,6 +65,7 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
             continue
 
         fetched = 0
+        hits = 0
         try:
             for art in articles:
                 if jobs.is_cancelled(jid) or fetched >= NEWS_BODIES_PER_SITE:
@@ -78,10 +79,14 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
                     except Exception:
                         body = ""
                     fetched += 1
+                # Live activity so the bar/status never look frozen on a slow paper.
+                jobs.set_progress(
+                    jid, current=f"{scraper.name} — {fetched} read, {hits} found")
                 haystack = f"{art.title}\n{body}"
                 labels = _match_labels(haystack, keywords)
                 if not labels:
                     continue
+                hits += 1
                 jobs.add_result(jid, {
                     "module": "newspaper",
                     "source": art.source,
