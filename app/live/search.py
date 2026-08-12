@@ -455,6 +455,13 @@ def search_youtube(jid: str, keywords: list[tuple[str, str]],
             candidates.append((ch.get("name") or v.channel_name, v))
 
     jobs.set_progress(jid, phase="youtube", total=len(candidates), checked=0)
+    if not candidates:
+        jobs.set_note(jid, "No non-live uploads found on your channels in the last 24h "
+                           "(live streams are skipped). Try a wider date.")
+        return
+
+    stat = {"audio_ok": 0, "audio_fail": 0, "trans_ok": 0, "trans_chars": 0,
+            "trans_fail": 0, "first_err": ""}
 
     for i, (chan_name, v) in enumerate(candidates):
         if jobs.is_cancelled(jid):
@@ -464,10 +471,19 @@ def search_youtube(jid: str, keywords: list[tuple[str, str]],
         try:
             asset = acquire_audio(video_id=v.video_id, video_url=v.url)
             if asset is None:
+                stat["audio_fail"] += 1
+                if not stat["first_err"]:
+                    stat["first_err"] = "audio download returned nothing (yt-dlp blocked?)"
                 continue
+            stat["audio_ok"] += 1
             text, segments, _meta = transcribe_audio(asset.path, language="ur")
+            stat["trans_chars"] += len(text or "")
             if not text and not segments:
+                stat["trans_fail"] += 1
+                if not stat["first_err"]:
+                    stat["first_err"] = f"transcription returned nothing ({_meta.get('error', 'unknown')})"
                 continue
+            stat["trans_ok"] += 1
             hits = matcher.find_all_hits(text, segments, keywords)
             if not hits:
                 continue
@@ -492,9 +508,29 @@ def search_youtube(jid: str, keywords: list[tuple[str, str]],
                          if first_second is not None else ""),
             })
         except Exception as exc:
+            stat["trans_fail"] += 1
+            if not stat["first_err"]:
+                stat["first_err"] = f"{type(exc).__name__}: {str(exc)[:120]}"
             logger.warning("live yt transcribe failed %s: %s", v.video_id, exc)
         finally:
             cleanup_asset(asset)     # deletes the temp audio dir
         jobs.set_progress(jid, checked=i + 1)
+
+    # Surface WHY YouTube found nothing.
+    job = jobs.get(jid)
+    yt_hits = sum(1 for r in (job.results if job else []) if r.get("module") == "youtube")
+    if yt_hits == 0:
+        if stat["audio_ok"] == 0:
+            jobs.set_note(jid, f"Processed {len(candidates)} video(s) but couldn't get audio for "
+                               f"any — {stat['first_err']}. (YouTube often blocks audio downloads "
+                               "from cloud servers.)")
+        elif stat["trans_ok"] == 0:
+            jobs.set_note(jid, f"Got audio but transcription failed on all "
+                               f"{stat['audio_ok']} video(s) — {stat['first_err']}")
+        else:
+            jobs.set_note(jid, f"Transcribed {stat['trans_ok']} video(s) "
+                               f"({stat['trans_chars']} chars) but your keyword wasn't spoken.")
+    logger.info("youtube done: videos=%d audio_ok=%d trans_ok=%d chars=%d",
+                len(candidates), stat["audio_ok"], stat["trans_ok"], stat["trans_chars"])
 
     _annotate_sentiment(jid)          # one request tags every result
