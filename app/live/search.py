@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 
 # Bounds so one click can't run unbounded. Streaming means partial results show
 # up immediately, so these keep a search responsive and its cost predictable.
-NEWS_BODIES_PER_SITE = 15     # article bodies fetched per publication (speed)
+NEWS_BODIES_PER_SITE = 60     # article bodies fetched per publication
 NEWS_PARALLEL = 4             # newspapers scraped at once (their own browsers)
-EPAPER_PAGES_PER_PAPER = 18   # e-paper pages OCR'd per paper (bounds cost + time)
-EPAPER_PARALLEL = 4           # e-paper pages OCR'd at once
+EPAPER_PAGES_PER_PAPER = 24   # e-paper pages OCR'd per paper (a full edition)
+EPAPER_PARALLEL = 5           # e-paper pages OCR'd at once
 
 # Known e-paper domains → the app's adapter slug, so a user-added e-paper link is
 # read as the FULL edition (every page) instead of only the front-page thumbnail

@@ -29,9 +29,10 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Newsprint is dense; cap the long edge so token cost stays sane while headlines
-# and body text stay legible to the model.
-_MAX_EDGE = 1568
+# Newsprint is dense — at 1568px the small body text was illegible and the model
+# only transcribed headlines. A larger edge keeps the fine print readable so the
+# WHOLE page is transcribed (Qwen accepts images up to 20MB).
+_MAX_EDGE = 2600
 
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -43,15 +44,16 @@ def _groq_vision_model() -> str:
 _PROMPT = """This image is one full page of a Pakistani newspaper's print edition. \
 It may be in English or in Urdu (Nastaliq script).
 
-Transcribe ALL readable text on the page, top to bottom:
+Transcribe EVERY line of text on the page, top to bottom, in FULL — do NOT
+summarise, shorten, or skip any article:
 - every headline and sub-headline
-- article body text
-- photo captions and boxed items
+- the COMPLETE body text of every article and column
+- photo captions, boxed items, tables, tickers, and advert text
 - keep Urdu in Urdu script exactly as printed; keep English in English
 - separate items with blank lines
-- if a region is too blurry to read, skip it silently
 
-Output the transcription only — no commentary, no translation."""
+This is a dense page — the output should be long (usually thousands of
+characters). Output the transcription ONLY, no commentary, no translation."""
 
 
 def has_key() -> bool:
@@ -100,8 +102,12 @@ def read_page(image_path: str | Path) -> str:
 
 
 # ----------------------------------------------------------------- groq -----
-def _read_groq(image_path: Path) -> str:
+def _read_groq(image_path: Path, _strong: bool = False) -> str:
     b64, media_type = _encode(image_path)
+    prompt = _PROMPT if not _strong else (
+        _PROMPT + "\n\nWARNING: your previous attempt was too short. Read the "
+        "ENTIRE page and output every article's full body text — do not stop early."
+    )
     payload = {
         "model": _groq_vision_model(),
         "temperature": 0,
@@ -115,7 +121,7 @@ def _read_groq(image_path: Path) -> str:
             "content": [
                 {"type": "image_url",
                  "image_url": {"url": f"data:{media_type};base64,{b64}"}},
-                {"type": "text", "text": _PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }],
     }
@@ -144,6 +150,12 @@ def _read_groq(image_path: Path) -> str:
         data = r.json()
         text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
         text = _strip_reasoning(text).strip()
+        # A dense page that comes back thin means the model under-transcribed —
+        # try once more with a forceful prompt before accepting it.
+        if len(text) < 500 and not _strong:
+            logger.info("e-paper read (groq): %s thin (%d chars) — retrying strong",
+                        image_path.name, len(text))
+            return _read_groq(image_path, _strong=True)
         logger.info("e-paper read (groq): %s -> %d chars", image_path.name, len(text))
         return text
     raise RuntimeError(f"groq read failed after retries: {last}")
@@ -233,5 +245,5 @@ def _encode(path: Path) -> tuple[str, str]:
     if scale < 1:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=85)
+    img.save(buf, "JPEG", quality=90)
     return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
