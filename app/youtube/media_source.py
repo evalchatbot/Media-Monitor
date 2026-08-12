@@ -194,6 +194,12 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
     }
     # Authenticate so YouTube's "confirm you're not a bot" check on cloud IPs passes.
     _apply_cookies(opts)
+    if not (opts.get("cookiefile") or opts.get("cookiesfrombrowser")):
+        # No cookies: some player clients (tv/mweb/…) can still fetch audio from a
+        # datacenter IP where the default 'web' client is bot-blocked. Best-effort.
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["tv", "mweb", "web_safari", "android", "web"]}
+        }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])

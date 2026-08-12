@@ -36,7 +36,7 @@ groq==0.13.1
 tzdata==2024.2
 
 # --- YouTube bulletin audio (watch URL → local file for Groq Whisper) ---
-yt-dlp>=2024.12.23
+yt-dlp>=2025.01.01
 
 # --- Screenshot footer overlay + e-paper image handling ---
 pillow==11.1.0
