@@ -41,6 +41,61 @@ def _set_error(msg: str) -> None:
     _LAST_ERROR = msg
 
 
+_cookie_file_cache: str | None = None
+
+
+def cookies_configured() -> bool:
+    return bool(
+        (settings.youtube_cookies_file or "").strip()
+        or (settings.youtube_cookies_b64 or "").strip()
+        or (settings.youtube_cookies or "").strip()
+        or (settings.youtube_cookies_from_browser or "").strip()
+    )
+
+
+def _cookies_file() -> str | None:
+    """A path to a cookies.txt for yt-dlp, materialising env-provided content to a
+    temp file once. None if no cookies configured."""
+    global _cookie_file_cache
+    fp = (settings.youtube_cookies_file or "").strip()
+    if fp and Path(fp).exists():
+        return fp
+    if _cookie_file_cache and Path(_cookie_file_cache).exists():
+        return _cookie_file_cache
+    content = ""
+    b64 = (settings.youtube_cookies_b64 or "").strip()
+    if b64:
+        import base64
+        try:
+            content = base64.b64decode(b64).decode("utf-8", "ignore")
+        except Exception as exc:
+            logger.warning("youtube_cookies_b64 decode failed: %s", exc)
+    if not content:
+        content = (settings.youtube_cookies or "").strip()
+    if content:
+        # Netscape cookie files must start with this header line or yt-dlp rejects them.
+        if not content.lstrip().startswith("# HTTP Cookie File") and "\t" in content:
+            content = "# Netscape HTTP Cookie File\n" + content
+        try:
+            p = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+            p.write_text(content, encoding="utf-8")
+            _cookie_file_cache = str(p)
+            return _cookie_file_cache
+        except Exception as exc:
+            logger.warning("could not write youtube cookies file: %s", exc)
+    return None
+
+
+def _apply_cookies(opts: dict) -> None:
+    cf = _cookies_file()
+    if cf:
+        opts["cookiefile"] = cf
+        return
+    cfb = (settings.youtube_cookies_from_browser or "").strip()
+    if cfb:
+        opts["cookiesfrombrowser"] = (cfb,)
+
+
 @dataclass
 class MediaAsset:
     path: Path
@@ -137,6 +192,8 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
         # Avoid brittle extract-audio postprocess; we convert to flac ourselves.
         "prefer_ffmpeg": True,
     }
+    # Authenticate so YouTube's "confirm you're not a bot" check on cloud IPs passes.
+    _apply_cookies(opts)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])

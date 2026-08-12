@@ -521,10 +521,13 @@ def search_youtube(jid: str, keywords: list[tuple[str, str]],
     yt_hits = sum(1 for r in (job.results if job else []) if r.get("module") == "youtube")
     if yt_hits == 0:
         if stat["audio_ok"] == 0:
-            from app.youtube.media_source import last_error
+            from app.youtube.media_source import last_error, cookies_configured
             reason = last_error() or stat["first_err"]
+            hint = ("" if cookies_configured() else
+                    " — set YOUTUBE_COOKIES (a logged-in cookies.txt) so YouTube lets "
+                    "the server download audio")
             jobs.set_note(jid, f"Processed {len(candidates)} video(s) but couldn't get audio for "
-                               f"any — {reason}")
+                               f"any — {reason}{hint}")
         elif stat["trans_ok"] == 0:
             jobs.set_note(jid, f"Got audio but transcription failed on all "
                                f"{stat['audio_ok']} video(s) — {stat['first_err']}")

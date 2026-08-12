@@ -200,6 +200,17 @@ class Settings(BaseSettings):
     # Monthly Groq spend alert threshold (USD). Soft limit used for logging.
     youtube_monthly_cost_alert_usd: float = 40.0
     youtube_metadata_only: bool = False  # True = discover/classify without Groq spend
+    # --- YouTube auth (get past "Sign in to confirm you're not a bot") ---
+    # YouTube blocks audio downloads from datacenter IPs unless yt-dlp is given a
+    # logged-in session's cookies. Provide ONE of these (checked in this order):
+    #   youtube_cookies_file  — path to a Netscape cookies.txt on the server/volume
+    #   youtube_cookies_b64   — base64 of a cookies.txt (best for a Railway env var)
+    #   youtube_cookies       — raw cookies.txt content (multiline env var)
+    #   youtube_cookies_from_browser — e.g. "chrome" (local dev only)
+    youtube_cookies_file: str = ""
+    youtube_cookies_b64: str = ""
+    youtube_cookies: str = ""
+    youtube_cookies_from_browser: str = ""
 
 
 @lru_cache
