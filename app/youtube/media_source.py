@@ -27,6 +27,19 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Last audio-acquisition failure reason, for surfacing WHY a live search got no
+# transcript (yt-dlp bot-block, ffmpeg missing, etc.). Best-effort/diagnostic.
+_LAST_ERROR = ""
+
+
+def last_error() -> str:
+    return _LAST_ERROR
+
+
+def _set_error(msg: str) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = msg
+
 
 @dataclass
 class MediaAsset:
@@ -128,7 +141,9 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])
     except Exception as exc:
+        msg = str(exc).replace("\n", " ")[:200]
         logger.warning("ytdlp audio download failed: %s", exc)
+        _set_error(f"yt-dlp: {msg}")
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     downloaded = next(
@@ -137,6 +152,7 @@ def _download_ytdlp(video_url: str) -> MediaAsset | None:
     )
     if downloaded is None:
         logger.warning("ytdlp produced no file for %s", video_url)
+        _set_error("yt-dlp produced no audio file")
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     flac = _to_flac(downloaded)
@@ -162,6 +178,7 @@ def _to_flac(src: Path) -> Path | None:
     """
     if shutil.which("ffmpeg") is None:
         logger.warning("ffmpeg not on PATH — cannot convert audio for Groq")
+        _set_error("ffmpeg is not installed on the server")
         return None
 
     kbps = max(8, int(settings.youtube_audio_bitrate_kbps or 32))
