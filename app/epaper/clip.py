@@ -435,9 +435,19 @@ def _enhance(path: Path) -> None:
 
     Stretching newsprint creates mushy letters. Keep the scan's own pixels,
     gently separate ink from paper, then a small-radius unsharp so body text
-    reads clearly without halos or plastic look."""
+    reads clearly without halos or plastic look.
+
+    OpenCV gives the best result (CLAHE is local, so it lifts grey newsprint
+    without blowing out headlines) but it is a heavy optional dependency — when
+    it is absent we fall back to a plain PIL pass rather than shipping a flat,
+    hard-to-read clipping.
+    """
     try:
         import cv2
+    except ImportError:
+        _enhance_pil(path)
+        return
+    try:
         from PIL import Image
 
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -460,6 +470,19 @@ def _enhance(path: Path) -> None:
         Image.fromarray(rgb).save(path, quality=96, subsampling=0, optimize=True)
     except Exception as exc:
         logger.warning("clip enhance failed for %s: %s", path, exc)
+
+
+def _enhance_pil(path: Path) -> None:
+    """Contrast + unsharp with Pillow only (used when OpenCV isn't installed)."""
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter
+
+        img = Image.open(path).convert("RGB")
+        img = ImageEnhance.Contrast(img).enhance(1.22)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=110, threshold=3))
+        img.save(path, quality=96, subsampling=0, optimize=True)
+    except Exception as exc:
+        logger.debug("clip enhance (pil) failed for %s: %s", path, exc)
 
 
 def _highlight(path: Path, box: dict) -> None:

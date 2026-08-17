@@ -116,15 +116,31 @@ def _annotate_sentiment(jid: str) -> None:
     jobs.set_progress(jid, current="tagging sentiment")
 
 
+def _target_day(date_iso: str | None):
+    """The edition/publication date being searched (defaults to today, PKT)."""
+    from datetime import timedelta, timezone
+    if date_iso:
+        try:
+            return datetime.strptime(date_iso, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return datetime.now(timezone(timedelta(hours=5))).date()
+
+
 def search_press(jid: str, keywords: list[tuple[str, str]],
                  sources: list[dict], date_iso: str | None) -> None:
     """One click over the user's sources. `sources` is a list of
     {name, url, kind, language} rows the user added — no built-in papers.
-    Websites (fast) first, then e-papers."""
+
+    Websites run first because they return in seconds and give the user
+    something to read while the e-paper editions — the slower, more valuable
+    half — are read page by page.
+    """
+    day = _target_day(date_iso)
     news = [s for s in sources if (s.get("kind") or "newspaper") != "epaper"]
     epapers = [s for s in sources if (s.get("kind") or "") == "epaper"]
     if news:
-        search_newspaper(jid, keywords, news)
+        search_newspaper(jid, keywords, news, day)
     if epapers and not jobs.is_cancelled(jid):
         search_epaper(jid, keywords, epapers, date_iso)
     _annotate_sentiment(jid)          # one request tags every result
@@ -148,14 +164,16 @@ def _generic_scraper(src: dict):
 
 
 def search_newspaper(jid: str, keywords: list[tuple[str, str]],
-                     sources: list[dict]) -> None:
+                     sources: list[dict], day=None) -> None:
     total = len(sources)
     jobs.set_progress(jid, phase="newspapers", total=total, checked=0)
     if not sources:
         return
+    if day is None:
+        day = _target_day(None)
 
     lock = threading.Lock()
-    state = {"done": 0, "read": 0, "found": 0}
+    state = {"done": 0, "read": 0, "found": 0, "stale": 0}
 
     def _one(src) -> None:
         if jobs.is_cancelled(jid):
@@ -163,7 +181,7 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
         scraper = None
         try:
             scraper = _generic_scraper(src)
-            _scrape_one_newspaper(jid, scraper, keywords, lock, state)
+            _scrape_one_newspaper(jid, scraper, keywords, lock, state, day)
         except Exception as exc:
             logger.warning("live news %s failed: %s", src.get("name"), exc)
         finally:
@@ -179,10 +197,13 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
     # Each source has its own browser → all scrape at once.
     with ThreadPoolExecutor(max_workers=min(max(total, 1), NEWS_PARALLEL)) as ex:
         list(ex.map(_one, sources))
+    if state["stale"]:
+        logger.info("live news: skipped %d article(s) not published on %s",
+                    state["stale"], day)
 
 
-def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
-    from app.newspaper.pipeline import _make_snippet
+def _scrape_one_newspaper(jid, scraper, keywords, lock, state, day) -> None:
+    from app.epaper.livescan import snippet as _make_snippet
 
     try:
         articles = scraper.list_articles()
@@ -194,15 +215,23 @@ def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
     for art in articles:
         if jobs.is_cancelled(jid) or fetched >= NEWS_BODIES_PER_SITE:
             break
-        # Cheap title check first; otherwise fetch the body (costs a render).
+        # One render yields both the body and the publication date, so filtering
+        # to the requested day costs nothing extra.
+        published = None
         if _match_labels(art.title, keywords):
-            body = ""
-        else:
-            try:
-                body = scraper.fetch_body(art) if hasattr(scraper, "fetch_body") else art.body
-            except Exception:
-                body = ""
+            # Title already matches — still fetch, so we can date-check it and
+            # show a real excerpt rather than just the headline.
+            body, published = _fetch(scraper, art)
             fetched += 1
+        else:
+            body, published = _fetch(scraper, art)
+            fetched += 1
+        # Unknown date is kept: many sites publish none, and dropping those
+        # would silently blind the search rather than narrow it.
+        if published is not None and published != day:
+            with lock:
+                state["stale"] += 1
+            continue
         haystack = f"{art.title}\n{body}"
         labels = _match_labels(haystack, keywords)
         with lock:
@@ -221,203 +250,89 @@ def _scrape_one_newspaper(jid, scraper, keywords, lock, state) -> None:
             "section": art.section,
             "snippet": _make_snippet(haystack, labels),
             "keywords": labels,
-            "meta": "",
+            "meta": published.strftime("%d %b") if published else "",
         })
 
 
-# ==========================================================================
-# E-paper — list today's pages, download to temp, vision-read, match.
-# ==========================================================================
-def _epaper_image_urls(page_url: str) -> list[str]:
-    """Best-effort: render the e-paper URL and collect the page-scan image links."""
-    from urllib.parse import urljoin
-    from bs4 import BeautifulSoup
-    from app.scrapers.base import BaseScraper
-
-    bs = BaseScraper(name="epaper", base_url=page_url)
+def _fetch(scraper, art) -> tuple[str, object]:
+    """(body, published_date|None) for one article, never raising."""
     try:
-        html = bs.render(page_url, wait_ms=2800)
-    except Exception as exc:
-        logger.warning("live epaper render failed %s: %s", page_url, exc)
-        return []
-    finally:
-        try:
-            bs.close()
-        except Exception:
-            pass
-    soup = BeautifulSoup(html, "lxml")
-    urls, seen = [], set()
-    for img in soup.select("img[src], img[data-src]"):
-        src = img.get("src") or img.get("data-src") or ""
-        if not src:
-            continue
-        full = urljoin(page_url, src)
-        base = full.split("?")[0].lower()
-        if not base.endswith((".jpg", ".jpeg", ".png", ".webp")):
-            continue
-        if full not in seen:
-            seen.add(full)
-            urls.append(full)
-    return urls
+        if hasattr(scraper, "fetch_article"):
+            return scraper.fetch_article(art)
+        return (scraper.fetch_body(art) if hasattr(scraper, "fetch_body")
+                else art.body), None
+    except Exception:
+        return "", None
 
 
-def _download_image(url: str) -> tuple[Path | None, str]:
-    """Download an image to an OS temp file (nothing persists).
-
-    Returns (path, "") on success, or (None, reason) so a failure is explainable
-    (HTTP 403, timeout, too-small response, TLS error, …). Browser-like headers +
-    a Referer help with image hosts that block plain clients / hotlinking."""
-    import httpx
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    origin = f"{p.scheme}://{p.netloc}"
-    verify = "e.dunya.com.pk" not in url
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": origin + "/",
-        "Accept-Language": "en-US,en;q=0.9,ur;q=0.8",
-    }
-    try:
-        with httpx.stream("GET", url, timeout=45, follow_redirects=True, verify=verify,
-                          headers=headers) as r:
-            if r.status_code >= 400:
-                return None, f"HTTP {r.status_code}"
-            fd = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            size = 0
-            for chunk in r.iter_bytes():
-                fd.write(chunk)
-                size += len(chunk)
-            fd.close()
-            if size < 15000:                 # too small to be a readable page scan
-                Path(fd.name).unlink(missing_ok=True)
-                return None, f"response too small ({size} bytes) — likely a block/error page"
-            return Path(fd.name), ""
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
-
-
+# ==========================================================================
+# E-paper — the priority path. Full current-date edition, per page, two tiers.
+# See app/epaper/livescan.py for why clickable papers never touch a vision model.
+# ==========================================================================
 def search_epaper(jid: str, keywords: list[tuple[str, str]],
                   sources: list[dict], date_iso: str | None) -> None:
-    """OCR the page images on each user-added e-paper URL and match. Best-effort:
-    JS-only viewers may expose no <img> tags, in which case nothing is found."""
-    from app.epaper import sources as ep_sources
-    from app.epaper.reader import has_key, provider, read_page
-    from app.epaper.pipeline import _snippet
+    """Read every page of each selected e-paper's edition for the chosen date and
+    emit a clipping per keyword match.
 
-    if not has_key() or provider() == "none":
-        jobs.set_progress(jid, phase="epaper",
-                          current="e-paper reading needs a vision API key (not set)")
-        logger.warning("epaper OCR skipped: no vision key")
-        return
+    Each source is scanned in turn (pages within a source run concurrently) so
+    progress reads sensibly paper by paper, and results stream as they are found.
+    """
+    from app.epaper import livescan
 
-    d = None
-    if date_iso:
-        try:
-            d = datetime.strptime(date_iso, "%Y-%m-%d").date()
-        except ValueError:
-            d = None
+    day = _target_day(date_iso)
+    jobs.set_progress(jid, phase="epaper", total=0, checked=0,
+                      current=f"reading editions for {day.isoformat()}")
 
-    # (source_name, link_url, image_url, page_label) — bounded per source.
-    candidates: list[tuple[str, str, str, str]] = []
-    for src in sources:
+    stats: dict = {}
+    resolved = [(s.get("name") or s["url"], _slug_for_epaper_url(s["url"]), s["url"])
+                for s in sources]
+
+    def emit(card):
+        jobs.add_result(jid, card)
+
+    def progress(**fields):
+        jobs.set_progress(jid, **fields)
+
+    for name, slug, url in resolved:
         if jobs.is_cancelled(jid):
             break
-        name = src.get("name") or src["url"]
-        slug = _slug_for_epaper_url(src["url"])
-        if slug:
-            # Known e-paper → full edition (every page), via the site's adapter.
-            try:
-                pages = ep_sources.list_pages(slug, d)[:EPAPER_PAGES_PER_PAPER]
-            except Exception as exc:
-                logger.warning("live epaper list_pages %s failed: %s", slug, exc)
-                pages = []
-            for pg in pages:
-                candidates.append((name, pg.viewer_url or pg.image_url,
-                                   pg.image_url, f"page {pg.page_no}"))
-        else:
-            # Unknown site → best-effort images on the landing page.
-            for img in _epaper_image_urls(src["url"])[:EPAPER_PAGES_PER_PAPER]:
-                candidates.append((name, img, img, "page"))
-    jobs.set_progress(jid, phase="epaper", total=len(candidates), checked=0)
-    if not candidates:
-        return
-
-    lock = threading.Lock()
-    state = {"done": 0, "downloaded": 0, "ocr_ok": 0, "ocr_chars": 0,
-             "ocr_err": 0, "first_err": ""}
-
-    def _one(item) -> None:
-        name, link_url, img_url, page_label = item
-        if jobs.is_cancelled(jid):
-            return
-        tmp, dl_reason = _download_image(img_url)
         try:
-            if tmp is None:
-                with lock:
-                    if not state["first_err"]:
-                        state["first_err"] = f"image download failed — {dl_reason}"
-            else:
-                with lock:
-                    state["downloaded"] += 1
-                try:
-                    text = read_page(tmp)
-                    with lock:
-                        state["ocr_ok"] += 1
-                        state["ocr_chars"] += len(text)
-                except Exception as exc:
-                    logger.warning("live epaper read failed %s: %s", img_url, exc)
-                    text = ""
-                    with lock:
-                        state["ocr_err"] += 1
-                        if not state["first_err"]:
-                            state["first_err"] = f"OCR error: {type(exc).__name__}: {str(exc)[:160]}"
-                labels = _match_labels(text, keywords)
-                if labels:
-                    jobs.add_result(jid, {
-                        "module": "epaper",
-                        "source": name,
-                        "title": f"{name} — {page_label}",
-                        # Open the exact page (the viewer at that page, or the scan
-                        # itself); the scan image is the click-to-zoom preview.
-                        "url": link_url,
-                        "image": img_url,
-                        "section": "E-paper",
-                        "snippet": _snippet(text, labels),
-                        "keywords": labels,
-                        "meta": "",
-                    })
-        finally:
-            if tmp is not None:
-                try:
-                    Path(tmp).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            with lock:
-                state["done"] += 1
-                jobs.set_progress(jid, current=f"e-paper page {state['done']}/{len(candidates)}",
-                                  checked=state["done"])
+            livescan.scan_source(
+                job_id=jid, name=name, slug=slug, url=url, keywords=keywords,
+                day=day, emit=emit, progress=progress,
+                cancelled=lambda: jobs.is_cancelled(jid), stats=stats,
+            )
+        except Exception as exc:
+            logger.exception("live epaper %s failed", name)
+            stats.setdefault("notes", []).append(f"{name}: {type(exc).__name__}: {exc}")
+        jobs.set_progress(jid, total=stats.get("pages_total", 0),
+                          checked=stats.get("pages_done", 0))
 
-    with ThreadPoolExecutor(max_workers=EPAPER_PARALLEL) as ex:
-        list(ex.map(_one, candidates))
+    _explain_epaper(jid, stats)
+    logger.info("epaper done: %s", stats)
 
-    # Surface WHY e-paper found nothing, so a silent 0 is never a mystery.
+
+def _explain_epaper(jid: str, stats: dict) -> None:
+    """Never let a silent zero be a mystery — say exactly what happened."""
+    notes = list(stats.get("notes") or [])
     job = jobs.get(jid)
-    epaper_hits = sum(1 for r in (job.results if job else []) if r.get("module") == "epaper")
-    if epaper_hits == 0:
-        if state["downloaded"] == 0:
-            jobs.set_note(jid, f"Couldn't download any of the {len(candidates)} e-paper page "
-                               f"images — {state['first_err']}")
-        elif state["ocr_err"] and state["ocr_ok"] == 0:
-            jobs.set_note(jid, f"Downloaded pages but OCR failed on all of them — "
-                               f"{state['first_err']}")
-        elif state["ocr_ok"] and state["ocr_chars"] < 50 * state["ocr_ok"]:
-            jobs.set_note(jid, "E-paper pages read but returned almost no text "
-                               "(the vision model may not be transcribing).")
-    logger.info("epaper done: pages=%d downloaded=%d ocr_ok=%d ocr_err=%d chars=%d",
-                len(candidates), state["downloaded"], state["ocr_ok"],
-                state["ocr_err"], state["ocr_chars"])
+    hits = sum(1 for r in (job.results if job else []) if r.get("module") == "epaper")
+    if hits == 0:
+        total = stats.get("pages_total", 0)
+        read = stats.get("pages_read", 0)
+        if total == 0 and not notes:
+            notes.append("No e-paper pages were published for that date yet.")
+        elif read == 0 and total:
+            notes.append(f"Found {total} page(s) but could not read any — "
+                         f"{stats.get('first_err') or 'unknown error'}")
+        elif read:
+            notes.append(f"Read {read} page(s) of {total} — your keyword does not "
+                         f"appear in this edition.")
+    elif stats.get("map_fail") or stats.get("ocr_fail"):
+        bad = stats.get("map_fail", 0) + stats.get("ocr_fail", 0)
+        notes.append(f"{bad} page(s) could not be read and were skipped.")
+    if notes:
+        jobs.set_note(jid, " · ".join(notes[:3]))
 
 
 # ==========================================================================

@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup
 
-from app.scrapers.base import Article, BaseScraper, extract_main_text
+from app.scrapers.base import (
+    Article, BaseScraper, extract_main_text, extract_published,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +88,17 @@ class ConfigurableScraper(BaseScraper):
         return found
 
     def fetch_body(self, article: Article) -> str:
+        return self.fetch_article(article)[0]
+
+    def fetch_article(self, article: Article):
+        """Return (body_text, published_date|None) from one render of the page.
+
+        Both come from the same HTML so date filtering costs no extra fetch.
+        """
         try:
             html = self.render(article.url, wait_ms=1500)
         except Exception as exc:
             logger.warning("%s: failed to fetch body for %s: %s", self.name, article.url, exc)
-            return ""
-        return extract_main_text(html, self.cfg.body_selector)
+            return "", None
+        return (extract_main_text(html, self.cfg.body_selector),
+                extract_published(html, article.url))

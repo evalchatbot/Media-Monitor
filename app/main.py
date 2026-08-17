@@ -33,12 +33,10 @@ from sqlalchemy.orm import Session
 from config import BASE_DIR, settings
 from app.db.base import SessionLocal, init_db
 from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, NewsSource, YouTubeChannel
-from app.core import keyword_scan_queue, result_policy
+from app.core import result_policy
 from app.live import jobs as live_jobs, search as live_search
 from app.core.keywords import script_language
-from app.epaper import scan_runner, sources
-from app.newspaper import scan_manager
-from app.newspaper.pipeline import run_newspaper_scan, run_quick_match
+from app.epaper import sources
 from app.youtube import scan_runner as yt_scan_runner
 from app.scrapers.sites import SITE_CONFIGS
 from app import sources_probe
@@ -85,6 +83,14 @@ async def lifespan(app: FastAPI):
     # nothing is persisted. init_db still runs so the keyword watchlist (the one
     # thing we keep) has its table.
     init_db()
+    # E-paper clippings are written per job and deleted when that job is
+    # evicted — but a restart strands whatever the previous process was holding,
+    # so clear those before serving.
+    try:
+        from app.epaper.livescan import sweep_orphans
+        sweep_orphans(max_age_seconds=0)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("live storage sweep at startup failed: %s", exc)
     yield
 
 
@@ -1120,73 +1126,9 @@ _JS = """
     setTimeout(function(){location.href=href;},500); // navigate once covered
   });
 
-  var wasScanning=__SCANNING__;
-  var wasQueue=__QUEUE__;
-  var lastResultsSig=(document.getElementById('results')||{}).getAttribute
-    ? (document.getElementById('results').getAttribute('data-sig')||'')
-    : '';
-  async function refreshResults(force){
-    var el=document.getElementById('results');
-    if(!el)return;
-    var params=new URLSearchParams(location.search);
-    if(!force && !params.has('go')&&!(params.get('q')||'').trim()&&!params.get('start'))return;
-    params.set('module', pageModule);
-    if(force)el.style.opacity='0.45';  // instant feedback on click
-    try{
-      var r=await fetch('/ui/results?'+params.toString(),{headers:{'Accept':'text/html'}});
-      if(!r.ok){el.style.opacity='';return;}
-      var sig=r.headers.get('X-Results-Sig')||'';
-      var html=await r.text();
-      if(!force && sig && sig===lastResultsSig){el.style.opacity='';return;}
-      lastResultsSig=sig||lastResultsSig;
-      var wrap=document.createElement('div');
-      wrap.innerHTML=html.trim();
-      var next=wrap.firstElementChild;
-      if(next)el.replaceWith(next);
-    }catch(err){}
-    var back=document.getElementById('results');
-    if(back)back.style.opacity='';
-  }
-  var IDLE_MS=6000, BUSY_MS=1500, pollTimer=null;
-  async function poll(){
-    var running=false, queueOn=false;
-    try{
-      // Only the status feeds this page cares about — the other module's poll
-      // was pure waste. These read a progress file, not the database.
-      var q=await fetch('/api/scan/queue').then(function(r){return r.json()});
-      var queueItems=[].concat(q.batch||[], q.pending||[]);
-      queueOn=queueItems.some(function(x){
-        var m=(x&&x.module)||'newspaper';
-        return pageModule==='youtube'?m==='youtube':m!=='youtube';
-      });
-      if(pageModule==='youtube'){
-        var y=await fetch('/api/scan/youtube/status').then(function(r){return r.json()}).catch(function(){return {}});
-        running=!!(y.running||queueOn);
-      }else{
-        var n=await fetch('/api/scan/status').then(function(r){return r.json()});
-        var e=await fetch('/api/scan/epaper/status').then(function(r){return r.json()});
-        running=!!(n.running||e.running||queueOn);
-      }
-      var b=document.getElementById('scanbtn');
-      if(running && b){b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…'}
-      if(running)showLoad();else hideLoad();
-      // Only re-query results while something is producing them; the idle case
-      // was re-running the full results query every tick for no change.
-      if(running) await refreshResults();
-      if(wasQueue && !queueOn){location.reload();return}
-      if(!running && wasScanning){location.reload();return}
-      wasScanning=running;
-      wasQueue=queueOn;
-    }catch(err){}
-    finally{
-      // Fast heartbeat while working, slow one when idle — cuts steady-state
-      // background requests roughly fourfold.
-      pollTimer=setTimeout(poll, running?BUSY_MS:IDLE_MS);
-    }
-  }
-  // Live-only model: no background poll, no DB auto-refresh. Results come ONLY
-  // from an on-demand live search (below). The old poll()/refreshResults() are
-  // left defined but never started.
+  /* The old DB poller (poll/refreshResults) is gone with the live-only
+     model: nothing scans in the background, so there is nothing to poll
+     for. Results arrive only from the live search below. */
 
   /* ---- Search live results — the ONLY thing that scrapes ---- */
   function escHtml(s){return (s||'').replace(/[<>&"]/g,function(c){
@@ -1532,7 +1474,7 @@ def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
   <span class="spacer"></span>
 </div></div>
 <main class="page" id="page"><div class="wrap">{body}</div></main>
-<script>{_JS.replace('__SCANNING__', 'false').replace('__QUEUE__', 'false')}</script>
+<script>{_JS}</script>
 </body></html>"""
 
 
@@ -1744,13 +1686,6 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
             f'<div class="meta">{meta}</div><div>{tags}</div></div></div>')
 
 
-def _known_keyword_fold(db: Session) -> set[str]:
-    """All keyword strings still in the watchlist table (active or paused)."""
-    return {
-        (k.text or "").casefold()
-        for k in db.execute(select(Keyword)).scalars().all()
-        if k.text
-    }
 
 
 def _active_keyword_fold(db: Session, module: str | None = "newspaper") -> dict[str, str]:
@@ -1776,184 +1711,12 @@ def _live_matched(m: Mention, active_fold: dict[str, str]) -> list[str]:
     return out
 
 
-def _refresh_mention_visuals(db: Session, m: Mention) -> bool:
-    """Rebuild cutout/screenshot so baked-in highlights match current keywords only."""
-    kws = [k for k in (m.matched_keywords or []) if k]
-    if not kws:
-        return False
-    old_shot, old_full = m.screenshot_path, m.full_screenshot_path
-    old_keyword_paths = set((m.keyword_media or {}).values())
-
-    if m.module == "epaper":
-        parts = (m.external_id or "").split(":")
-        if len(parts) < 4 or not parts[3].startswith("p"):
-            return False
-        try:
-            page_no = int(parts[3][1:])
-        except ValueError:
-            return False
-        row = db.execute(
-            select(EPaperPage).where(
-                EPaperPage.paper == parts[0],
-                EPaperPage.city == parts[1],
-                EPaperPage.date == parts[2],
-                EPaperPage.page_no == page_no,
-            )
-        ).scalar_one_or_none()
-        if not row or not row.image_path:
-            return False
-        from app.epaper.pipeline import _detection_shot, _make_clip, _snippet
-
-        langs = {
-            k.text: k.language
-            for k in db.execute(select(Keyword)).scalars().all()
-            if k.text
-        }
-        kw_lang = {k: langs.get(k, "en") for k in kws}
-        media = {}
-        for keyword in kws:
-            snippet = _snippet(row.ocr_text or "", [keyword])
-            clip = _make_clip(
-                row, [keyword], {keyword: kw_lang.get(keyword, "en")}, snippet
-            )
-            if clip:
-                media[keyword] = clip
-        shot = _detection_shot(row)
-        m.keyword_media = media
-        m.screenshot_path = next(iter(media.values()), None) or shot
-        m.full_screenshot_path = shot or m.full_screenshot_path
-        db.flush()
-        if old_shot and old_shot != m.screenshot_path:
-            _unlink_orphan_media(db, old_shot, m.id)
-        if old_full and old_full != m.full_screenshot_path:
-            _unlink_orphan_media(db, old_full, m.id)
-        current = set(media.values())
-        for old in old_keyword_paths - current:
-            _unlink_orphan_media(db, old, m.id)
-        return True
-
-    # Website: drop old baked highlights; backfill re-captures with current keywords.
-    m.screenshot_path = None
-    m.full_screenshot_path = None
-    m.keyword_media = {}
-    db.flush()
-    _unlink_orphan_media(db, old_shot, m.id)
-    _unlink_orphan_media(db, old_full, m.id)
-    for old in old_keyword_paths:
-        _unlink_orphan_media(db, old, m.id)
-    return True
 
 
-def _purge_keyword_results(db: Session, keyword_text: str) -> dict:
-    """Strict delete: remove EVERY mention that matched this keyword (even if
-    other keywords were also on the same card). Caller expects a fresh ▶ / scan
-    to rebuild hits for any remaining watchlist terms."""
-    needle = keyword_text.casefold()
-    deleted = files = 0
-    rows = db.execute(select(Mention)).scalars().all()
-    for m in rows:
-        kws = list(m.matched_keywords or [])
-        if not any((k or "").casefold() == needle for k in kws):
-            continue
-        paths = {
-            m.screenshot_path, m.full_screenshot_path,
-            *(m.keyword_media or {}).values(),
-        }
-        for path in paths:
-            if _unlink_orphan_media(db, path, m.id):
-                files += 1
-        db.delete(m)
-        deleted += 1
-    if deleted:
-        db.commit()
-    return {"mentions_deleted": deleted, "mentions_updated": 0,
-            "files_deleted": files, "visuals_refreshed": 0}
 
 
-def _purge_source_results(db: Session, source_name: str, modules: tuple[str, ...]) -> int:
-    """Delete every stored mention from one source (a newspaper/e-paper name, or
-    a YouTube channel name) plus its now-orphan media — so a removed source's
-    result cards vanish. Mentions link to a source only by its display name."""
-    needle = (source_name or "").strip().casefold()
-    if not needle:
-        return 0
-    deleted = 0
-    for m in db.execute(select(Mention)).scalars().all():
-        if (m.module or "") not in modules:
-            continue
-        if (m.source or "").strip().casefold() != needle:
-            continue
-        paths = {m.screenshot_path, m.full_screenshot_path, *(m.keyword_media or {}).values()}
-        for path in paths:
-            _unlink_orphan_media(db, path, m.id)
-        db.delete(m)
-        deleted += 1
-    if deleted:
-        db.commit()
-    return deleted
 
 
-def _scrub_deleted_keywords(db: Session) -> dict:
-    """Strip keyword labels that no longer exist in the watchlist; drop empty mentions.
-    Rebuild visuals on rows that keep other keywords so old highlights disappear.
-
-    This only has work to do when a keyword was DELETED, but it used to run a full
-    `SELECT * FROM mentions` on every home-page load — the main reason the page
-    crawled (and churned the table) as data grew. Skip the scan unless the active
-    keyword set actually changed since the last run."""
-    import hashlib
-
-    empty = {"mentions_deleted": 0, "mentions_updated": 0,
-             "files_deleted": 0, "visuals_refreshed": 0}
-    known = _known_keyword_fold(db)
-    fp = hashlib.sha1("|".join(sorted(known)).encode("utf-8")).hexdigest()
-    fp_path = settings.storage_dir.parent / ".kw_scrub_state"
-    try:
-        if fp_path.read_text(encoding="utf-8").strip() == fp:
-            return {**empty, "skipped": True}   # keyword set unchanged → nothing to scrub
-    except Exception:
-        pass
-
-    deleted = updated = files = refreshed = 0
-    need_web_backfill = False
-    rows = db.execute(select(Mention)).scalars().all()
-    for m in rows:
-        kws = list(m.matched_keywords or [])
-        remaining = [k for k in kws if (k or "").casefold() in known]
-        if len(remaining) == len(kws):
-            continue
-        if remaining:
-            m.matched_keywords = remaining
-            updated += 1
-            if _refresh_mention_visuals(db, m):
-                refreshed += 1
-                if m.module == "newspaper":
-                    need_web_backfill = True
-            continue
-        paths = {
-            m.screenshot_path, m.full_screenshot_path,
-            *(m.keyword_media or {}).values(),
-        }
-        for path in paths:
-            if _unlink_orphan_media(db, path, m.id):
-                files += 1
-        db.delete(m)
-        deleted += 1
-    if deleted or updated:
-        db.commit()
-    if need_web_backfill:
-        try:
-            from app.newspaper.screenshots import backfill_screenshots
-            backfill_screenshots(limit=40)
-        except Exception as exc:
-            logger.warning("post-scrub screenshot backfill failed: %s", exc)
-    try:                                    # remember this keyword set so we skip next time
-        fp_path.parent.mkdir(parents=True, exist_ok=True)
-        fp_path.write_text(fp, encoding="utf-8")
-    except Exception:
-        pass
-    return {"mentions_deleted": deleted, "mentions_updated": updated,
-            "files_deleted": files, "visuals_refreshed": refreshed}
 
 
 def _utc(dt):
@@ -1965,123 +1728,6 @@ def _home_redirect(extra: dict | None = None) -> RedirectResponse:
     return RedirectResponse("/" + (f"?{q}" if q else ""), status_code=303)
 
 
-def _results_section_html(
-    db: Session,
-    *,
-    show_date,
-    keyword: str,
-    selected_set: set[str],
-    results_scanning: bool,
-    max_results: int | None = None,
-) -> tuple[str, str]:
-    """Build the Results panel HTML and a cheap change-detection signature."""
-    active_fold = _active_keyword_fold(db, module="newspaper")
-    first_date = show_date - timedelta(
-        days=settings.keyword_search_days - 1
-    )
-    day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
-    day_end = datetime(
-        show_date.year, show_date.month, show_date.day, tzinfo=_PKT
-    ) + timedelta(days=1)
-    start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
-    end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
-
-    mentions = db.execute(
-        select(Mention).where(
-            Mention.module.in_(("newspaper", "epaper")),
-            or_(
-                and_(
-                    Mention.published_at.is_not(None),
-                    Mention.published_at >= start_utc,
-                    Mention.published_at < end_utc,
-                ),
-                and_(
-                    Mention.published_at.is_(None),
-                    Mention.detected_at >= start_utc,
-                    Mention.detected_at < end_utc,
-                ),
-            )
-        ).order_by(Mention.detected_at.desc())
-    ).scalars().all()
-
-    if selected_set:
-        mentions = [m for m in mentions if (m.source or "") in selected_set]
-    else:
-        mentions = []
-
-    if keyword:
-        kw_l = keyword.casefold()
-        if kw_l not in active_fold:
-            mentions = []
-        else:
-            mentions = [
-                m for m in mentions
-                if any((k or "").casefold() == kw_l for k in (m.matched_keywords or []))
-            ]
-    else:
-        mentions = [m for m in mentions if _live_matched(m, active_fold)]
-
-    page = max(1, settings.keyword_result_limit)
-    # max_results paginates: each "Show more" click asks for one more page.
-    show_limit = max_results if max_results and max_results > 0 else page
-
-    mentions.sort(key=result_policy.effective_time, reverse=True)
-    total = len(mentions)
-    shown = mentions[:show_limit]
-    spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
-    if shown:
-        cards = []
-        for m in shown:
-            live = _live_matched(m, active_fold)
-            if keyword:
-                hl = [active_fold[keyword.casefold()]]
-            else:
-                hl = live
-            cards.append(_detection_card(
-                m, highlight_keywords=hl, scanning=results_scanning))
-        grid = f'<div class="grid">{"".join(cards)}</div>'
-        if total > len(shown):
-            remaining = total - len(shown)
-            step = min(page, remaining)
-            more = (
-                '<div class="more-wrap">'
-                f'<button type="button" class="more-btn" id="news-more" '
-                f'data-next="{len(shown) + step}">Show next {step}</button>'
-                f'<span class="more-count">Showing {len(shown)} of {total}</span>'
-                "</div>"
-            )
-        else:
-            more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
-                    f"{total}.</p>" if total > page else "")
-    elif results_scanning:
-        grid = '<div class="empty loading"><span class="spin"></span></div>'
-        more = ""
-    elif not active_fold:
-        grid = ('<div class="empty">No active keywords on the watchlist yet.'
-                "<br>Add keywords above, then Confirm &amp; scan.</div>")
-        more = ""
-    else:
-        grid = (f'<div class="empty">No matches for the '
-                f'{settings.keyword_search_days} days through this date '
-                "and paper selection."
-                "<br>Try another date or run ▶ on a keyword.</div>")
-        more = ""
-
-    max_id = max((m.id for m in shown), default=0)
-    shots = sum(1 for m in shown if m.screenshot_path)
-    # len(shown) in the signature so paginating (more shown, same total) counts
-    # as a change and the fragment actually swaps in.
-    sig = f"{total}:{len(shown)}:{max_id}:{shots}:{int(results_scanning)}"
-    html_out = f"""
-        <section class="results" id="results" data-sig="{html.escape(sig)}">
-          <div class="results-head">
-            <h2>Results{spin}</h2>
-            <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
-          </div>
-          {grid}{more}
-        </section>
-        """
-    return html_out, sig
 
 
 def _storage_file(path: str | None) -> Path | None:
@@ -2129,16 +1775,6 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
         return False
 
 
-def _start_keyword_scan(kw: Keyword) -> dict:
-    """Queue this keyword for a FIFO one-at-a-time scan (safe with multiple adds)."""
-    st = keyword_scan_queue.enqueue(kw.id, kw.text, module=kw.module or "newspaper")
-    return {
-        "live_started": True,
-        "queued": st.get("queued", 1),
-        "articles_checked": 0,
-        "pages_checked": 0,
-        "mentions": 0,
-    }
 
 
 def _start_youtube_period_scan(
@@ -2475,20 +2111,6 @@ def home(request: Request, db: Session = Depends(get_db)):
                  "“+ Add more” to add one by its link.</span>")
 
     banner = ""
-    q_st = keyword_scan_queue.status()
-    queued_ids = {
-        int(x["id"])
-        for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
-        if x.get("id") is not None
-    }
-    queued_folds = {
-        (x.get("text") or "").casefold()
-        for x in list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
-        if x and x.get("text")
-    }
-    # Only the keyword queue drives chip/results spinners — scheduled crawls
-    # must not leave the UI spinning forever.
-    results_scanning = bool(q_st.get("running"))
     if qp.get("paper_removed"):
         banner = (
             f'<div class="banner ok">Removed <b>{html.escape(qp.get("paper_removed"))}</b> from the '
@@ -2507,28 +2129,13 @@ def home(request: Request, db: Session = Depends(get_db)):
             "(no scan yet).</div>"
         )
 
-    results_html = ""
-    # Drop labels for keywords that were deleted earlier (before purge existed).
-    _scrub_deleted_keywords(db)
-    active_fold = _active_keyword_fold(db, module="newspaper")
-
-    if searched:
-        results_html, _ = _results_section_html(
-            db,
-            show_date=show_date,
-            keyword=keyword,
-            selected_set=selected_set,
-            results_scanning=results_scanning,
-        )
-    else:
-        # Always ship a #results container, even empty, so clicking a keyword can
-        # swap results in place instead of finding nothing to update.
-        results_html = (
-            '<section class="results" id="results">'
-            '<div class="empty">Pick a date, type a keyword if you like, choose '
-            "newspapers, then show results — or click a keyword above to filter "
-            "what's already stored.</div></section>"
-        )
+    # Live-only: there are no stored newspaper results to render. Ship an empty
+    # #results container so the live search can swap its own section in place.
+    results_html = (
+        '<section class="results" id="results">'
+        '<div class="empty">Pick a date, type a word (or click a saved one), '
+        "choose your papers, then <b>Search live results</b>.</div></section>"
+    )
 
     active_kws = db.execute(
         select(Keyword).where(
@@ -2666,11 +2273,11 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         for r in status_rows
     ) + "</div>"
 
-    q_st = keyword_scan_queue.status()
+    # The per-keyword scan queue is gone with the live-only model; nothing
+    # enqueues, so no keyword is ever "busy".
     yt_st = yt_scan_runner.status()
-    queue_items = list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
-    yt_queue = [x for x in queue_items if (x.get("module") or "newspaper") == "youtube"]
-    results_scanning = bool(yt_st.get("running") or yt_queue) and not filter_only
+    yt_queue: list[dict] = []
+    results_scanning = bool(yt_st.get("running")) and not filter_only
     selected_kw_set = set(selected_kw_ids)
     selected_kw_labels = [k.text for k in active_kws if k.id in selected_kw_set]
     results_html, _ = _youtube_results_html(
@@ -3095,104 +2702,13 @@ def _youtube_results_html(
     return html_out, sig
 
 
-@app.get("/newspapers")
-@app.get("/epaper")
-@app.get("/mentions")
-def _gone_pages():
-    return RedirectResponse("/", status_code=303)
 
 
-@app.get("/ui/results", response_class=HTMLResponse)
-def ui_results_partial(request: Request, db: Session = Depends(get_db)):
-    """Live Results panel fragment — polled while a scan fills in matches.
-
-    Pass ``module=youtube`` (or be on the YouTube page) so newspaper cards never
-    replace the YouTube results grid.
-    """
-    today = datetime.now(_PKT).date()
-    qp = request.query_params
-    module = (qp.get("module") or "newspaper").strip().lower()
-    if module not in ("newspaper", "youtube"):
-        module = "newspaper"
-    date_s = (qp.get("date") or today.isoformat()).strip()
-    try:
-        show_date = datetime.strptime(date_s, "%Y-%m-%d").date()
-    except ValueError:
-        show_date = today
-    keyword = (qp.get("q") or qp.get("kw") or "").strip()
-
-    q_st = keyword_scan_queue.status()
-    queue_items = list(q_st.get("batch") or []) + list(q_st.get("pending") or [])
-
-    if module == "youtube":
-        yt_st = yt_scan_runner.status() if settings.youtube_enabled else {"running": False}
-        selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
-        period_start, period_end, period_label_s = _youtube_period_from_query(qp)
-        filter_only = bool(qp.get("filter"))
-        results_scanning = bool(
-            yt_st.get("running")
-            or any((x.get("module") or "newspaper") == "youtube" for x in queue_items)
-        ) and not filter_only
-        sel_labels = []
-        if selected_kw_ids:
-            sel_labels = list(db.execute(
-                select(Keyword.text).where(
-                    Keyword.id.in_(selected_kw_ids), Keyword.module == "youtube",
-                )
-            ).scalars().all())
-        html_out, sig = _youtube_results_html(
-            db,
-            keyword=keyword,
-            keyword_ids=selected_kw_ids or None,
-            period_start=period_start,
-            period_end=period_end,
-            period_label=period_label_s,
-            strict=bool(qp.get("go")),
-            filter_only=filter_only,
-            selected_kw_labels=sel_labels or None,
-            results_scanning=results_scanning,
-            max_results=int(qp.get("ymax")) if str(qp.get("ymax") or "").isdigit() else None,
-        )
-        return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
-
-    papers_all = _paper_names()
-    selected = qp.getlist("paper")
-    if not selected and "paper" not in qp:
-        selected = list(papers_all)
-    selected_set = set(selected)
-
-    results_scanning = bool(
-        any((x.get("module") or "newspaper") != "youtube" for x in queue_items)
-    )
-    html_out, sig = _results_section_html(
-        db,
-        show_date=show_date,
-        keyword=keyword,
-        selected_set=selected_set,
-        results_scanning=results_scanning,
-        max_results=int(qp.get("nmax")) if str(qp.get("nmax") or "").isdigit() else None,
-    )
-    return HTMLResponse(html_out, headers={"X-Results-Sig": sig, "Cache-Control": "no-store"})
 
 
 # ==========================================================================
 # UI actions (same behaviour; land back on the single page)
 # ==========================================================================
-@app.post("/ui/keywords")
-def ui_add_keyword(text: str = Form(...), language: str = Form("en"),
-                   db: Session = Depends(get_db)):
-    """Legacy single-add: create/reactivate and enqueue one keyword."""
-    kw = _upsert_watch_keyword(db, text, language)
-    if not kw:
-        return RedirectResponse("/", status_code=303)
-    today = datetime.now(_PKT).date().isoformat()
-    _start_keyword_scan(kw)
-    return _home_redirect({
-        "q": kw.text,
-        "go": "1",
-        "date": today,
-        "scanning": "1",
-    })
 
 
 def _wants_json(request) -> bool:
@@ -3640,50 +3156,12 @@ def api_live_job(job_id: str):
     return st
 
 
-@app.post("/api/keywords/{kid}/match")
-def api_match_keyword(kid: int, db: Session = Depends(get_db)):
-    """Match one keyword against already-stored article + e-paper text and return
-    at once. Fired when a newspaper keyword is clicked so results reflect the
-    stored data even for a keyword that was never scanned. No redirect — the
-    page refreshes the results fragment itself."""
-    kw = db.get(Keyword, kid)
-    if not kw or (kw.module or "newspaper") == "youtube":
-        raise HTTPException(404, "keyword not found")
-    _start_keyword_scan(kw)
-    return {"started": True, "keyword": kw.text}
 
 
-@app.post("/ui/keywords/{kid}/scan")
-def ui_scan_keyword(kid: int, date: str = Form(""), db: Session = Depends(get_db)):
-    kw = db.get(Keyword, kid)
-    if not kw:
-        raise HTTPException(404, "keyword not found")
-    home = "/youtube" if (kw.module or "newspaper") == "youtube" else "/"
-    slot_date = (date or datetime.now(_PKT).date().isoformat()).strip()
-    if (kw.module or "newspaper") == "youtube":
-        q = urlencode({"added": kw.text})
-        return RedirectResponse(f"{home}?{q}", status_code=303)
-    _start_keyword_scan(kw)
-    q = urlencode({
-        "q": kw.text,
-        "go": "1",
-        "date": slot_date,
-        "scanning": "1",
-    })
-    return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
-@app.post("/ui/scan")
-def ui_scan_all():
-    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
-    scan_runner.start_scan()
-    return RedirectResponse("/", status_code=303)
 
 
-@app.post("/ui/scan/newspaper")
-def ui_scan_newspapers():
-    scan_manager.start_scan(keyword_ids=None, keyword_label=None, capped=True)
-    return RedirectResponse("/", status_code=303)
 
 
 @app.post("/ui/scan/youtube/period")
@@ -3732,32 +3210,12 @@ def ui_scan_youtube_period(
     return RedirectResponse(f"/youtube?{urlencode(params)}", status_code=303)
 
 
-@app.post("/ui/scan/youtube")
-def ui_scan_youtube():
-    yt_scan_runner.start_scan(label="manual", force=True)
-    return RedirectResponse("/youtube", status_code=303)
 
 
-@app.post("/ui/epaper/fetch")
-def ui_epaper_fetch_all():
-    scan_runner.start_scan()
-    return RedirectResponse("/", status_code=303)
 
 
-@app.post("/ui/epaper/fetch/{slug}")
-def ui_epaper_fetch_one(slug: str):
-    if slug not in sources.SOURCES:
-        raise HTTPException(404, "unknown paper")
-    name = sources.SOURCES[slug][0]
-    scan_runner.start_scan(papers=[slug], label=name)
-    return RedirectResponse("/", status_code=303)
 
 
-@app.post("/ui/detections/clear")
-def ui_clear_detections(db: Session = Depends(get_db)):
-    db.execute(delete(Mention))
-    db.commit()
-    return RedirectResponse("/", status_code=303)
 
 
 # ==========================================================================
@@ -3825,75 +3283,8 @@ def list_keywords(module: str | None = None, db: Session = Depends(get_db)):
             for k in rows]
 
 
-@app.get("/api/mentions")
-def list_mentions(keyword: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
-    limit = max(1, min(limit, 500))
-    rows = db.execute(
-        select(Mention).where(
-            func.coalesce(Mention.published_at, Mention.detected_at)
-            >= result_policy.search_cutoff()
-        ).order_by(Mention.detected_at.desc())
-    ).scalars().all()
-    active = _active_keyword_fold(db)
-    yt_langs = _youtube_keyword_langs(db)
-    yt_active = _active_keyword_fold(db, module="youtube")
-    if keyword:
-        folded = keyword.casefold()
-        if folded not in active:
-            rows = []
-        else:
-            rows = [
-                m for m in rows
-                if (
-                    m.module == "youtube"
-                    and folded in {
-                        (k or "").casefold()
-                        for k in _youtube_verified_labels(m, yt_langs, yt_active)
-                    }
-                )
-                or (
-                    m.module != "youtube"
-                    and any((label or "").casefold() == folded for label in (m.matched_keywords or []))
-                )
-            ]
-    else:
-        rows = [
-            m for m in rows
-            if (
-                m.module == "youtube"
-                and _youtube_verified_labels(m, yt_langs, yt_active)
-            )
-            or (m.module != "youtube" and _live_matched(m, active))
-        ]
-    rows.sort(key=result_policy.effective_time, reverse=True)
-    rows = rows[:limit]
-    return [
-        {
-            "id": m.id, "module": m.module, "source": m.source, "title": m.title,
-            "url": m.url,
-            "matched_keywords": (
-                _youtube_verified_labels(m, yt_langs, yt_active)
-                if m.module == "youtube" else _live_matched(m, active)
-            ),
-            "sentiment": m.sentiment,
-            "detected_at": m.detected_at.isoformat() if m.detected_at else None,
-        }
-        for m in rows
-    ]
 
 
-@app.get("/api/epaper/pages")
-def list_epaper_pages(date: str | None = None, db: Session = Depends(get_db)):
-    ds = date or datetime.now(_PKT).date().isoformat()
-    rows = db.execute(
-        select(EPaperPage).where(EPaperPage.date == ds)
-        .order_by(EPaperPage.paper, EPaperPage.page_no)
-    ).scalars().all()
-    return [
-        {"paper": r.paper, "source": r.source, "city": r.city, "date": r.date,
-         "page": r.page_no, "ocr_status": r.ocr_status, "viewer_url": r.viewer_url}
-        for r in rows
-    ]
 
 
 @app.get("/api/version")
@@ -3902,29 +3293,14 @@ def app_version():
     return {"version": BUILD_VERSION}
 
 
-@app.get("/api/scan/status")
-def scan_status():
-    return scan_manager.status()
 
 
-@app.get("/api/scan/epaper/status")
-def epaper_scan_status():
-    return scan_runner.status()
 
 
-@app.get("/api/scan/queue")
-def keyword_queue_status():
-    return keyword_scan_queue.status()
 
 
-@app.get("/api/scan/youtube/status")
-def youtube_scan_status():
-    return yt_scan_runner.status()
 
 
-@app.post("/api/scan/youtube")
-def trigger_youtube_scan():
-    return {"started": yt_scan_runner.start_scan(label="api", force=True)}
 
 
 class _YoutubeProbeIn(BaseModel):
@@ -4002,11 +3378,5 @@ def list_youtube_channels(db: Session = Depends(get_db)):
     ]
 
 
-@app.post("/api/scan/epaper")
-def trigger_epaper_scan():
-    return {"started": scan_runner.start_scan()}
 
 
-@app.post("/api/scan/newspaper")
-def trigger_scan(keyword_ids: list[int] | None = None):
-    return run_newspaper_scan(keyword_ids=keyword_ids, uncapped=True)

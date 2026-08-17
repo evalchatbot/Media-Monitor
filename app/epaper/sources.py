@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date as _date
 
@@ -28,6 +29,9 @@ import httpx
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Page-existence probes issued concurrently (see _probe_all).
+_PROBE_WORKERS = 12
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -134,6 +138,20 @@ def _nawaiwaqt(d: _date, city: str) -> list[EPage]:
 
 
 # ------------------------------------------------------- jang / thenews -----
+def _probe_all(urls: list[str], min_bytes: int = 30_000) -> list[bool]:
+    """Probe many candidate page URLs at once.
+
+    Papers on constructable URLs (Jang, The News, Dawn, Jehan) are discovered by
+    testing page1..N. Done serially that is the slowest step in the entire live
+    scan — 24 round-trips took 36s for one paper, more than the OCR. These
+    probes are independent, so they all go out together.
+    """
+    if not urls:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(urls), _PROBE_WORKERS)) as ex:
+        return list(ex.map(lambda u: _probe_image(u, min_bytes), urls))
+
+
 def _probe_image(url: str, min_bytes: int = 30_000) -> bool:
     """True if `url` serves a real page scan (an image of meaningful size).
     Jang-family hosts answer 200 for MISSING pages too (a soft-404 HTML/tiny
@@ -175,16 +193,19 @@ def _jang_family(d: _date, city: str, *, host: str, paper: str, source: str,
 
     # Pages upload progressively through the morning and some numbers 404 while
     # neighbours exist — so probe EVERY number up to the cap and keep the hits.
-    pages = []
-    for n in range(1, settings.epaper_max_pages + 1):
-        url = f"{img_base}/page{n}.jpg"
-        if n > 1 and not _probe_image(url):
-            continue
-        pages.append(EPage(
-            paper=paper, source=source, city=c, date=d.isoformat(),
-            page_no=n, image_url=url,
-            viewer_url=f"https://{host}/{c}/{ddmmyyyy}/page{n}",
-        ))
+    nums = list(range(2, settings.epaper_max_pages + 1))
+    urls = [f"{img_base}/page{n}.jpg" for n in nums]
+    ok = _probe_all(urls)
+    pages = [EPage(
+        paper=paper, source=source, city=c, date=d.isoformat(), page_no=1,
+        image_url=f"{img_base}/page1.jpg",
+        viewer_url=f"https://{host}/{c}/{ddmmyyyy}/page1",
+    )]
+    pages += [EPage(
+        paper=paper, source=source, city=c, date=d.isoformat(),
+        page_no=n, image_url=url,
+        viewer_url=f"https://{host}/{c}/{ddmmyyyy}/page{n}",
+    ) for n, url, good in zip(nums, urls, ok) if good]
     return pages
 
 
@@ -207,17 +228,13 @@ def _dawn(d: _date, city: str) -> list[EPage]:
     — so probe page numbers just like the Jang family."""
     stamp = d.strftime("%d_%m_%Y")
     base = f"https://e.dawn.com/{d:%Y}/{d:%m}/{d:%d}/pages"
-    pages = []
-    for n in range(1, settings.epaper_max_pages + 1):
-        url = f"{base}/{stamp}_{n:03d}.jpg"
-        if not _probe_image(url):
-            continue
-        pages.append(EPage(
-            paper="dawn", source="Dawn", city="national", date=d.isoformat(),
-            page_no=n, image_url=url,
-            viewer_url=f"https://epaper.dawn.com/?page={stamp}_{n:03d}",
-        ))
-    return pages
+    nums = list(range(1, settings.epaper_max_pages + 1))
+    urls = [f"{base}/{stamp}_{n:03d}.jpg" for n in nums]
+    return [EPage(
+        paper="dawn", source="Dawn", city="national", date=d.isoformat(),
+        page_no=n, image_url=url,
+        viewer_url=f"https://epaper.dawn.com/?page={stamp}_{n:03d}",
+    ) for n, url, good in zip(nums, urls, _probe_all(urls)) if good]
 
 
 # -------------------------------------------------------------- jehan -------
@@ -239,15 +256,17 @@ def _jehan(d: _date, city: str) -> list[EPage]:
         if not _probe_image(f"{base}/p1.jpg"):
             continue
         index = f"https://jehanpakistan.com/epaper/epaper.php?edition={c}&date={ddmmyy}"
-        pages = []
-        for n in range(1, settings.epaper_max_pages + 1):
-            url = f"{base}/p{n}.jpg"
-            if n > 1 and not _probe_image(url):
-                continue
-            pages.append(EPage(
-                paper="jehanpakistan", source="Jehan Pakistan", city=c,
-                date=d.isoformat(), page_no=n, image_url=url, viewer_url=index,
-            ))
+        nums = list(range(2, settings.epaper_max_pages + 1))
+        urls = [f"{base}/p{n}.jpg" for n in nums]
+        pages = [EPage(
+            paper="jehanpakistan", source="Jehan Pakistan", city=c,
+            date=d.isoformat(), page_no=1, image_url=f"{base}/p1.jpg",
+            viewer_url=index,
+        )]
+        pages += [EPage(
+            paper="jehanpakistan", source="Jehan Pakistan", city=c,
+            date=d.isoformat(), page_no=n, image_url=url, viewer_url=index,
+        ) for n, url, good in zip(nums, urls, _probe_all(urls)) if good]
         if pages:
             return pages
     return []

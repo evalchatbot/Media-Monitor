@@ -14,6 +14,7 @@ Requires Chromium:  python -m playwright install chromium
 from __future__ import annotations
 
 import logging
+import re
 import urllib.robotparser
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -345,6 +346,84 @@ def _slugify(text: str) -> str:
 
     text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
     return re.sub(r"[\s]+", "-", text) or "article"
+
+
+_DATE_META = (
+    ("meta", {"property": "article:published_time"}, "content"),
+    ("meta", {"property": "article:modified_time"}, "content"),
+    ("meta", {"itemprop": "datePublished"}, "content"),
+    ("meta", {"name": "publish-date"}, "content"),
+    ("meta", {"name": "pubdate"}, "content"),
+    ("meta", {"name": "date"}, "content"),
+    ("meta", {"property": "og:updated_time"}, "content"),
+)
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def extract_published(html: str, url: str = "") -> "date | None":
+    """Best-effort publication date for an article page.
+
+    Publishers agree on very little, so this tries the things that are actually
+    common — Open Graph / schema.org meta tags, JSON-LD `datePublished`, a
+    `<time datetime=…>` element — and finally a YYYY/MM/DD or YYYY-MM-DD in the
+    URL. Returns None when nothing is found; callers must treat that as "don't
+    know" rather than "not today", or a site that publishes no dates would go
+    completely dark.
+    """
+    import json as _json
+    from datetime import date
+
+    from bs4 import BeautifulSoup
+
+    def _parse(raw: str) -> "date | None":
+        m = _ISO_DATE.search(raw or "")
+        if not m:
+            return None
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    soup = BeautifulSoup(html, "lxml")
+    for tag, attrs, key in _DATE_META:
+        el = soup.find(tag, attrs=attrs)
+        if el and el.get(key):
+            got = _parse(el.get(key))
+            if got:
+                return got
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            blob = _json.loads(script.string or "{}")
+        except Exception:
+            continue
+        stack = [blob]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                for field in ("datePublished", "dateCreated", "dateModified"):
+                    if isinstance(node.get(field), str):
+                        got = _parse(node[field])
+                        if got:
+                            return got
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+
+    el = soup.find("time")
+    if el:
+        got = _parse(el.get("datetime") or el.get_text(" ", strip=True))
+        if got:
+            return got
+
+    # …/2026/08/17/slug or …/2026-08-17/…
+    m = re.search(r"/(\d{4})[/-](\d{2})[/-](\d{2})(?:[/-]|$)", url or "")
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
 
 
 def extract_main_text(html: str, body_selector: str | None = None) -> str:

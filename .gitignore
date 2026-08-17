@@ -18,3 +18,10 @@ data/*
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code local state. .claude/worktrees/ holds full checkouts of the repo,
+# so committing this would balloon history.
+.claude/
+
+# Local scratch files
+scratch_*.py

@@ -49,13 +49,23 @@ class Job:
         }
 
 
+def _forget(jid: str) -> None:
+    """Drop a job and the clipping images it wrote."""
+    _JOBS.pop(jid, None)
+    try:
+        from app.epaper.livescan import cleanup_job
+        cleanup_job(jid)
+    except Exception:  # pragma: no cover - cleanup must never break eviction
+        pass
+
+
 def _evict_locked() -> None:
     now = time.time()
     for jid in [j for j, job in _JOBS.items() if now - job.updated > _TTL_SECONDS]:
-        _JOBS.pop(jid, None)
+        _forget(jid)
     if len(_JOBS) > _MAX_JOBS:
         for jid in sorted(_JOBS, key=lambda k: _JOBS[k].updated)[: len(_JOBS) - _MAX_JOBS]:
-            _JOBS.pop(jid, None)
+            _forget(jid)
 
 
 def create(module: str) -> str:

@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     # Device pixel ratio for screenshots (2 = retina-crisp text; 1 = lighter).
     screenshot_scale: int = 2
 
+    # --- E-paper live scan ---
+    # Concurrent Chromium instances used to screenshot matched articles. Each is
+    # a real browser, so this is the main memory lever on a small host: drop to
+    # 1-2 if the container is memory-constrained (it only costs wall-clock).
+    epaper_shot_workers: int = 4
+    # Most article screenshots taken per paper per search. Beyond this a match
+    # still gets its exact cutout, just no live shot.
+    epaper_max_shots: int = 12
+
     # --- Notifications ---
     notifier: str = "console"
     whatsapp_phone_number_id: str = ""
@@ -90,13 +99,18 @@ class Settings(BaseSettings):
     # Groq (default provider when set): powers e-paper page reading (vision)
     # and relevance/sentiment scoring. Llama-4 multimodal models.
     groq_api_key: str = ""
-    # Scout is the Llama-4 vision model generally available on Groq accounts.
-    groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    # Vision model for e-paper OCR (Groq's current multimodal model). Llama-4
-    # vision was retired; Qwen replaces it.
+    # NB: the Llama-4 models this project originally used (llama-4-scout,
+    # llama-4-maverick) and llama-3.1-8b-instant have all been RETIRED from
+    # Groq — requests to them 404. Verify against GET /openai/v1/models before
+    # changing any of these.
+    #
+    # General/JSON model (press-clipping locate + verify calls).
+    groq_model: str = "qwen/qwen3.6-27b"
+    # Vision model for e-paper OCR. Reads English fine; see app/epaper/reader.py
+    # — it CANNOT read Urdu Nastaliq, which is why GEMINI_API_KEY matters.
     groq_vision_model: str = "qwen/qwen3.6-27b"
-    # Fast text model for batch sentiment on live results (free tier).
-    groq_text_model: str = "llama-3.1-8b-instant"
+    # Fast text model for batch sentiment on live results.
+    groq_text_model: str = "openai/gpt-oss-20b"
     # Optional: Google Gemini for PRECISE press-clipping boxes (grounding is
     # its strength). Free key at https://aistudio.google.com/apikey — when set,
     # the clipper uses Gemini for locate/verify; reading stays on Groq.
