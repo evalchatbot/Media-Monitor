@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # up immediately, so these keep a search responsive and its cost predictable.
 NEWS_BODIES_PER_SITE = 60     # article bodies fetched per publication
 NEWS_PARALLEL = 4             # newspapers scraped at once (their own browsers)
+NEWS_SHOTS_PER_SITE = 12      # article-page screenshots per publication per search
 EPAPER_PAGES_PER_PAPER = 24   # e-paper pages OCR'd per paper (a full edition)
 EPAPER_PARALLEL = 5           # e-paper pages OCR'd at once
 
@@ -147,18 +148,65 @@ def search_press(jid: str, keywords: list[tuple[str, str]],
 
 
 # ==========================================================================
-# Newspaper — scrape the URL the user added: find article links, read text,
-# match. Generic (no per-site selectors). No screenshots, no DB.
+# Newspaper — scrape the URL the user added: find ARTICLE links (not the
+# homepage), read each story, match, screenshot the story page. Generic unless
+# the host is a known paper, in which case we reuse its article-URL pattern so
+# the result link is the story itself.
 # ==========================================================================
+def _origin(url: str) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    if not p.scheme or not p.netloc:
+        return url
+    return f"{p.scheme}://{p.netloc}"
+
+
+def _host_hints(url: str) -> dict:
+    """Article-link pattern / crop selector when the user added a known host.
+
+    This does not add papers to the search — it only helps parse a URL the user
+    already saved. Unknown hosts fall back to generic article-URL heuristics.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host == "dawn.com" or host.endswith(".dawn.com"):
+        return {
+            "article_url_pattern": r"dawn\.com/news/\d+",
+            "link_selector": "h2.story__title a, h2.story__link a, article a.story__link",
+            "crop_selector": "div.story__content, div.story, article",
+        }
+    try:
+        from app.scrapers.sites import SITE_CONFIGS
+    except Exception:
+        return {}
+    for cfg in SITE_CONFIGS:
+        cfg_host = (urlparse(cfg.base_url).hostname or "").lower().removeprefix("www.")
+        if host == cfg_host or (cfg_host and host.endswith("." + cfg_host)):
+            return {
+                "article_url_pattern": cfg.article_url_pattern,
+                "link_selector": cfg.link_selector,
+                "crop_selector": cfg.crop_selector,
+            }
+    return {}
+
+
 def _generic_scraper(src: dict):
     from app.scrapers.configurable import ConfigurableScraper, SiteConfig
     name = src.get("name") or src.get("url") or "source"
+    url = src["url"]
+    hints = _host_hints(url)
     return ConfigurableScraper(SiteConfig(
         name=name,
         source=name,
-        base_url=src["url"],
-        sections={"Home": src["url"]},
+        base_url=_origin(url),
+        sections={"Home": url},
         language=src.get("language", "en"),
+        link_selector=hints.get("link_selector"),
+        article_url_pattern=hints.get("article_url_pattern"),
+        crop_selector=hints.get("crop_selector") or (
+            "article, main, .story, .story-content, .detail-content, "
+            ".post-content, .entry-content"
+        ),
         min_title_len=12,
     ))
 
@@ -181,7 +229,7 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
         scraper = None
         try:
             scraper = _generic_scraper(src)
-            _scrape_one_newspaper(jid, scraper, keywords, lock, state, day)
+            _scrape_one_newspaper(jid, scraper, keywords, lock, state, day, src.get("url") or "")
         except Exception as exc:
             logger.warning("live news %s failed: %s", src.get("name"), exc)
         finally:
@@ -202,8 +250,10 @@ def search_newspaper(jid: str, keywords: list[tuple[str, str]],
                     state["stale"], day)
 
 
-def _scrape_one_newspaper(jid, scraper, keywords, lock, state, day) -> None:
-    from app.epaper.livescan import snippet as _make_snippet
+def _scrape_one_newspaper(jid, scraper, keywords, lock, state, day,
+                          listing_url: str = "") -> None:
+    from app.epaper.livescan import job_dir, media_url, snippet as _make_snippet
+    from app.scrapers.configurable import looks_like_article_url
 
     try:
         articles = scraper.list_articles()
@@ -212,20 +262,18 @@ def _scrape_one_newspaper(jid, scraper, keywords, lock, state, day) -> None:
         return
 
     fetched = 0
+    shots = 0
+    workdir = job_dir(jid)
     for art in articles:
         if jobs.is_cancelled(jid) or fetched >= NEWS_BODIES_PER_SITE:
             break
+        if listing_url and not getattr(getattr(scraper, "cfg", None), "article_url_pattern", None):
+            if not looks_like_article_url(art.url, listing_url):
+                continue
         # One render yields both the body and the publication date, so filtering
         # to the requested day costs nothing extra.
-        published = None
-        if _match_labels(art.title, keywords):
-            # Title already matches — still fetch, so we can date-check it and
-            # show a real excerpt rather than just the headline.
-            body, published = _fetch(scraper, art)
-            fetched += 1
-        else:
-            body, published = _fetch(scraper, art)
-            fetched += 1
+        body, published = _fetch(scraper, art)
+        fetched += 1
         # Unknown date is kept: many sites publish none, and dropping those
         # would silently blind the search rather than narrow it.
         if published is not None and published != day:
@@ -242,15 +290,30 @@ def _scrape_one_newspaper(jid, scraper, keywords, lock, state, day) -> None:
                 jid, current=f"{state['read']} read · {state['found']} found")
         if not labels:
             continue
+        image = ""
+        if shots < NEWS_SHOTS_PER_SITE:
+            try:
+                _full, crop = scraper.capture_screenshots(
+                    art, workdir,
+                    crop_selector=getattr(scraper, "ARTICLE_CROP_SELECTOR", None),
+                    highlight=labels,
+                )
+                image = media_url(crop) or media_url(_full)
+                if image:
+                    shots += 1
+            except Exception as exc:
+                logger.info("live news shot skipped %s: %s", art.url, type(exc).__name__)
+        preview = (body or "").strip() or art.title
         jobs.add_result(jid, {
             "module": "newspaper",
             "source": art.source,
             "title": art.title,
             "url": art.url,
             "section": art.section,
-            "snippet": _make_snippet(haystack, labels),
+            "snippet": _make_snippet(preview, labels) or preview[:280],
             "keywords": labels,
             "meta": published.strftime("%d %b") if published else "",
+            "image": image,
         })
 
 

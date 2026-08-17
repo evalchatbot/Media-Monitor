@@ -2883,16 +2883,22 @@ def _render_live_results(job) -> str:
         href = html.escape(r.get("url") or "#")
         img = (r.get("image") or "").strip()
         if img:
-            # Remote page scan (e-paper): show it as a click-to-zoom preview.
+            # Remote page scan (e-paper) or article screenshot (website).
             e = html.escape(img, quote=True)
             shot = (f'<div class="shot"><img loading="lazy" class="zoom" src="{e}" '
-                    f'data-full="{e}" alt="page scan"></div>')
+                    f'data-full="{e}" alt="preview"></div>')
         else:
             shot = ('<div class="shot missing"><span class="noprev">No preview · live</span></div>')
+        open_link = ""
+        if r.get("module") == "newspaper" and href and href != "#":
+            open_link = (
+                f'<a class="jump" href="{href}" target="_blank" rel="noopener">'
+                f'Open article</a>'
+            )
         cards.append(
             f'<div class="det">{shot}<div class="body">'
             f'<a class="ttl" href="{href}" target="_blank" rel="noopener">{title}</a>'
-            f'{excerpt_html}<div class="meta">{html.escape(meta)}</div>'
+            f'{excerpt_html}{open_link}<div class="meta">{html.escape(meta)}</div>'
             f'<div>{sent_html}{tags}</div></div></div>'
         )
     prog = job.progress or {}

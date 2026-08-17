@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -64,9 +65,13 @@ class ConfigurableScraper(BaseScraper):
         return list(articles.values())
 
     def _abs(self, href: str) -> str:
-        if href.startswith("http"):
+        href = (href or "").strip()
+        if href.startswith("http://") or href.startswith("https://"):
             return href
-        return self.base_url.rstrip("/") + "/" + href.lstrip("/")
+        return urljoin(self.base_url.rstrip("/") + "/", href)
+
+    def _listing_url(self, section: str) -> str:
+        return self.sections.get(section) or self.base_url
 
     def _parse_listing(self, html: str, section: str) -> list[Article]:
         soup = BeautifulSoup(html, "lxml")
@@ -75,14 +80,20 @@ class ConfigurableScraper(BaseScraper):
             if self.cfg.link_selector
             else soup.find_all("a", href=True)
         )
+        listing = self._listing_url(section)
         found: list[Article] = []
         for a in anchors:
             title = a.get_text(strip=True)
             href = a.get("href", "")
             if not title or not href or len(title) < self.cfg.min_title_len:
                 continue
+            if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
             full = self._abs(href)
-            if self._pattern and not self._pattern.search(full):
+            if self._pattern:
+                if not self._pattern.search(full):
+                    continue
+            elif not looks_like_article_url(full, listing):
                 continue
             found.append(Article(source=self.cfg.source, title=title, url=full, section=section))
         return found
@@ -102,3 +113,49 @@ class ConfigurableScraper(BaseScraper):
             return "", None
         return (extract_main_text(html, self.cfg.body_selector),
                 extract_published(html, article.url))
+
+
+# Listing / chrome paths that are not a single story. Used when the user added
+# a paper by URL and we have no per-site article pattern.
+_SKIP_PATH = re.compile(
+    r"(?i)/(category|categories|tag|tags|author|authors|page|search|login|"
+    r"signup|register|contact|about|privacy|terms|video|live/?$|"
+    r"latest-news/?$|latest/?$|world/?$|opinion/?$|columns/?$|"
+    r"national/?$|international/?$|pakistan/?$|home/?$)(/|$)"
+)
+
+
+def looks_like_article_url(url: str, listing_url: str = "") -> bool:
+    """True if `url` looks like a single article, not the paper's homepage."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    path = (u.path or "/").rstrip("/") or "/"
+    if path == "/":
+        return False
+    if listing_url:
+        try:
+            listing = urlparse(listing_url)
+        except Exception:
+            listing = None
+        if listing:
+            uh = (u.hostname or "").lower().removeprefix("www.")
+            lh = (listing.hostname or "").lower().removeprefix("www.")
+            if lh and uh != lh:
+                return False
+            list_path = (listing.path or "/").rstrip("/") or "/"
+            if path == list_path:
+                return False
+    if _SKIP_PATH.search(path):
+        return False
+    if re.search(r"\.(css|js|jpg|jpeg|png|gif|svg|pdf|zip|mp4)(\?|$)", path, re.I):
+        return False
+    if re.search(r"/\d{3,}", path):
+        return True
+    if re.search(r"(?i)/(news|story|article|post|detail|stories)/", path):
+        return True
+    parts = [p for p in path.split("/") if p]
+    return len(parts) >= 2 and len(parts[-1]) >= 16
