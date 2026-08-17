@@ -36,9 +36,7 @@ from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, NewsSource
 from app.core import result_policy
 from app.live import jobs as live_jobs, search as live_search
 from app.core.keywords import script_language
-from app.epaper import sources
 from app.youtube import scan_runner as yt_scan_runner
-from app.scrapers.sites import SITE_CONFIGS
 from app import sources_probe
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1438,22 +1436,6 @@ _JS = """
   })();
 })();
 """
-
-
-def _paper_names() -> list[str]:
-    """Unique publication names shown in the filter (websites + e-papers).
-    Papers the user removed are hidden here so they drop out of the picker."""
-    names: list[str] = ["Dawn"]
-    names.extend(c.source for c in SITE_CONFIGS)
-    names.extend(meta[0] for meta in sources.SOURCES.values())
-    names.extend(r["name"] for r in sources_probe.custom_sources() if r.get("name"))
-    hidden = sources_probe.hidden_papers()
-    out, seen = [], set()
-    for n in names:
-        if n not in seen and n.strip().casefold() not in hidden:
-            seen.add(n)
-            out.append(n)
-    return out
 
 
 def _shell(title: str, body: str, *, module: str = "newspaper") -> str:
