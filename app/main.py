@@ -17,7 +17,6 @@ from __future__ import annotations
 import html
 import logging
 import re
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,16 +26,14 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from config import BASE_DIR, settings
 from app.db.base import SessionLocal, init_db
-from app.db.models import BulletinSlot, EPaperPage, Keyword, Mention, NewsSource, YouTubeChannel
-from app.core import result_policy
+from app.db.models import EPaperPage, Keyword, Mention, NewsSource, YouTubeChannel
 from app.live import jobs as live_jobs, search as live_search
 from app.core.keywords import script_language
-from app.youtube import scan_runner as yt_scan_runner
 from app import sources_probe
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -160,7 +157,6 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
   text-decoration:none;color:var(--muted);border:1px solid transparent}
 .mod-nav a:hover{color:var(--blue-deep);background:var(--blue-soft)}
 .mod-nav a.on{color:#fff;background:var(--blue-deep);border-color:var(--blue-deep)}
-.yt-status{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.5rem;margin:0 0 1rem}
 .yt-tabs{display:flex;gap:.35rem;margin:1rem 0 0;flex-wrap:wrap}
 .yt-tab{padding:.5rem 1rem;border-radius:999px 999px 0 0;border:1px solid var(--line);border-bottom:none;
   background:var(--surface);color:var(--muted);font-weight:700;font-size:.85rem;cursor:pointer}
@@ -168,12 +164,6 @@ h1,h2{font-family:"Fraunces","Manrope",serif;font-weight:600;letter-spacing:-.02
 .yt-tab.on{background:linear-gradient(180deg,#fffdf9,#faf4ea);color:var(--blue-deep);border-color:var(--line)}
 .yt-panel{margin-top:0}
 .yt-panel .panel{border-top-left-radius:0}
-.yt-status .cell{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);
-  padding:.65rem .75rem;font-size:.8rem}
-.yt-status .cell b{display:block;font-size:.88rem;color:var(--ink);margin-bottom:.2rem}
-.yt-status .st{font-weight:700;color:var(--blue-deep);text-transform:capitalize}
-.yt-status .st.missing,.yt-status .st.failed{color:var(--warn)}
-.yt-status .st.ready{color:var(--ok)}
 .jump{display:inline-flex;margin-top:.25rem;padding:.2rem .55rem;border-radius:999px;
   background:var(--blue-soft);color:var(--blue-deep);font-size:.72rem;font-weight:700;
   text-decoration:none;border:1px solid var(--blue-mist);margin-right:.35rem}
@@ -401,28 +391,7 @@ mark{background:#ffe9a8;color:var(--ink);border-radius:3px;padding:0 .1em;font-w
 #yt-ch-modal #yt-ch-result.show{display:block}
 #yt-ch-modal #yt-ch-result.ok{background:var(--blue-soft);border:1px solid var(--blue-mist);color:var(--blue-deep)}
 #yt-ch-modal #yt-ch-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
-#yt-ch-slots{margin:.65rem 0 0;padding:0;list-style:none;max-height:11rem;overflow:auto}
-#yt-ch-slots li{display:flex;gap:.5rem;align-items:flex-start;padding:.45rem 0;border-bottom:1px solid var(--line);
-  font-size:.82rem;font-weight:500}
-#yt-ch-slots li:last-child{border-bottom:0}
-#yt-ch-slots .slot-meta{color:var(--faint);font-size:.76rem;font-weight:500;margin-top:.15rem;line-height:1.35}
 
-#yt-period-modal,#yt-live-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;
-  padding:1rem;background:rgba(44,58,72,.45);backdrop-filter:blur(6px)}
-#yt-period-modal.open,#yt-live-modal.open{display:flex}
-#yt-period-modal .box,#yt-live-modal .box{width:min(520px,100%);background:linear-gradient(180deg,#fffdf9,#faf4ea);
-  border:1px solid var(--line);border-radius:var(--r);padding:1.35rem 1.4rem;box-shadow:var(--shadow)}
-#yt-period-modal h3,#yt-live-modal h3{margin:0 0 .35rem;font-size:1.15rem;color:var(--blue-deep)}
-#yt-period-modal .sub,#yt-live-modal .sub{margin:0 0 1rem;color:var(--muted);font-size:.88rem;line-height:1.45}
-#yt-period-modal .period-grid,#yt-live-modal .period-grid{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .75rem;margin-bottom:.75rem}
-#yt-period-modal label,#yt-live-modal label{font-size:.78rem;font-weight:600;color:var(--muted);display:block;margin-bottom:.25rem}
-#yt-period-modal input[type=date],#yt-period-modal input[type=time],#yt-live-modal input[type=text]{width:100%;padding:.55rem .75rem;
-  border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9}
-#yt-period-modal .row-btns,#yt-live-modal .row-btns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
-#yt-period-modal #yt-period-result{margin-top:.75rem;padding:.75rem .9rem;border-radius:var(--r-sm);font-size:.88rem;
-  font-weight:600;line-height:1.45;display:none}
-#yt-period-modal #yt-period-result.show{display:block}
-#yt-period-modal #yt-period-result.bad{background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn)}
 #yt-live-list .live-pick{display:block;padding:.5rem .6rem;margin:.3rem 0;border:1px solid var(--line);
   border-radius:var(--r-sm);background:#fffdf9;font-size:.85rem;line-height:1.4;cursor:pointer}
 #yt-live-list .live-pick:hover{border-color:var(--blue-mist);background:var(--blue-soft)}
@@ -553,8 +522,6 @@ main.page{animation:pageIn .4s ease}
   .hero{margin:.3rem 0 1rem}
   .grid{grid-template-columns:1fr;gap:.85rem}
   .papers{grid-template-columns:1fr 1fr}
-  .yt-status{grid-template-columns:1fr 1fr}
-  #yt-period-modal .period-grid,#yt-live-modal .period-grid{grid-template-columns:1fr}
   .field input[type=date],.field input[type=text]{max-width:100%}
   .live-detail{display:none}
   /* wide content must scroll inside itself, never the page body */
@@ -702,77 +669,6 @@ _JS = """
       document.querySelectorAll('.kw-chip[data-kw-id]').forEach(function(c){c.classList.remove('sel')});
       if(pageModule==='youtube')autoShowYoutube();
     });
-    var ytForm=document.getElementById('yt-search');
-    function syncPeriodHidden(){
-      var sd=document.getElementById('yt-p-start-date');
-      var ed=document.getElementById('yt-p-end-date');
-      var st=document.getElementById('yt-p-start-time');
-      var et=document.getElementById('yt-p-end-time');
-      var hs=document.getElementById('yt-period-start');
-      var he=document.getElementById('yt-period-end');
-      if(!sd||!ed||!st||!et||!hs||!he)return;
-      hs.value=sd.value+'T'+st.value+':00+05:00';
-      he.value=ed.value+'T'+et.value+':59+05:00';
-    }
-    if(ytForm)ytForm.addEventListener('submit',function(){
-      syncPeriodHidden();
-      var box=document.getElementById('yt-kw-hidden');
-      if(!box)return;
-      box.innerHTML='';
-      document.querySelectorAll('.kw-chip.sel[data-kw-id]').forEach(function(chip){
-        var id=chip.getAttribute('data-kw-id');
-        if(!id)return;
-        var inp=document.createElement('input');
-        inp.type='hidden';inp.name='kw_id';inp.value=id;
-        box.appendChild(inp);
-      });
-      var filterInp=document.getElementById('yt-filter');
-      var showBtn=document.getElementById('yt-show-results');
-      if(filterInp&&showBtn&&document.activeElement===showBtn){
-        filterInp.value='1';
-      }else if(filterInp){
-        filterInp.value='';
-      }
-    });
-    var periodOpen=document.getElementById('yt-period-open');
-    var periodModal=document.getElementById('yt-period-modal');
-    var periodClose=document.getElementById('yt-period-close');
-    var periodRun=document.getElementById('yt-period-run');
-    var periodForm=document.getElementById('yt-period-form');
-    var periodResult=document.getElementById('yt-period-result');
-    function openPeriodModal(){
-      if(!periodModal)return;
-      periodModal.classList.add('open');
-      if(periodResult){periodResult.className='';periodResult.textContent='';periodResult.classList.remove('show')}
-    }
-    function closePeriodModal(){if(periodModal)periodModal.classList.remove('open')}
-    if(periodOpen)periodOpen.addEventListener('click',openPeriodModal);
-    if(periodClose)periodClose.addEventListener('click',closePeriodModal);
-    if(periodModal)periodModal.addEventListener('click',function(e){if(e.target===periodModal)closePeriodModal()});
-    document.addEventListener('keydown',function(e){
-      if(e.key==='Escape'&&periodModal&&periodModal.classList.contains('open'))closePeriodModal();
-    });
-    if(periodRun)periodRun.addEventListener('click',function(){
-      if(!periodForm)return;
-      var sel=document.querySelectorAll('.kw-chip.sel[data-kw-id]');
-      if(!sel.length){
-        if(periodResult){periodResult.textContent='Select at least one keyword on the watchlist.';periodResult.className='show bad'}
-        return;
-      }
-      syncPeriodHidden();
-      var box=document.getElementById('yt-period-kw-hidden');
-      if(box){
-        box.innerHTML='';
-        sel.forEach(function(chip){
-          var id=chip.getAttribute('data-kw-id');
-          if(!id)return;
-          var inp=document.createElement('input');
-          inp.type='hidden';inp.name='kw_id';inp.value=id;
-          box.appendChild(inp);
-        });
-      }
-      periodForm.requestSubmit?periodForm.requestSubmit():periodForm.submit();
-    });
   }
 
   /* Live streams — its own flow: list what's live, pick a window, transcribe
@@ -810,8 +706,8 @@ _JS = """
     function syncLabels(){
       var a=parseInt(fromI.value,10),b=parseInt(toI.value,10);
       var rec=picked&&picked.kind==='recorded';
-      if(fromLbl)fromLbl.textContent=rec?(fmt(a)+' into the bulletin'):(wallFmt(a)+'  ('+fmt(a)+' into stream)');
-      if(toLbl)toLbl.textContent=rec?(fmt(b)+' into the bulletin'):(wallFmt(b)+'  ('+fmt(b)+' into stream)');
+      if(fromLbl)fromLbl.textContent=rec?(fmt(a)+' into the recording'):(wallFmt(a)+'  ('+fmt(a)+' into stream)');
+      if(toLbl)toLbl.textContent=rec?(fmt(b)+' into the recording'):(wallFmt(b)+'  ('+fmt(b)+' into stream)');
       if(winInfo){
         var w=b-a,maxW=mode.maxMin*60;
         winInfo.textContent=w>0
@@ -827,7 +723,7 @@ _JS = """
     function setMode(kind){
       if(kind==='ticker'){
         mode={kind:'ticker',endpoint:'/api/youtube/live/ticker',maxMin:15};
-        if(heading)heading.textContent='Live ticker — read the on-screen Urdu ticker (live streams or a bulletin)';
+        if(heading)heading.textContent='Live ticker — read the on-screen Urdu ticker';
         runBtn.textContent='Read Urdu ticker & match';
       }else{
         mode={kind:'audio',endpoint:'/api/youtube/live/run',maxMin:30};
@@ -846,12 +742,12 @@ _JS = """
     function renderList(items){
       if(!items.length){
         list.innerHTML='<div class="empty" style="padding:.8rem">'
-          +(mode.kind==='ticker'?'No live streams and no bulletins for that date.':'No live streams on your channels right now.')+'</div>';
+          +(mode.kind==='ticker'?'No live streams (and no recorded videos) for that date.':'No live streams on your channels right now.')+'</div>';
         return;
       }
       list.innerHTML=items.map(function(s,i){
         var meta = s.kind==='recorded'
-          ? '<span class="hint">bulletin · '+esc(s.slot||'')+(s.duration_seconds?(' · '+fmt(s.duration_seconds)+' long'):'')+'</span>'
+          ? '<span class="hint">recorded · '+esc(s.slot||'')+(s.duration_seconds?(' · '+fmt(s.duration_seconds)+' long'):'')+'</span>'
           : '<span class="hint">🔴 LIVE · '+fmt(s.elapsed_seconds)+(s.viewers?(' · '+esc(String(s.viewers))+' watching'):'')+'</span>';
         return '<label class="live-pick"><input type="radio" name="yt-live-pick" value="'+i+'">'
           +'<b>'+esc(s.channel)+'</b> — '+esc((s.title||'').slice(0,72))+' '+meta+'</label>';
@@ -864,9 +760,9 @@ _JS = """
       picked=item;resultsEl.innerHTML='';winBox.style.display='none';runBtn.style.display='none';
       if(item.kind==='recorded'){
         var dur=item.duration_seconds||0;
-        if(!dur){statusEl.textContent='This bulletin has no known length yet — pick another.';return;}
+        if(!dur){statusEl.textContent='This recording has no known length yet — pick another.';return;}
         headSecs=dur;probeAt=0;statusEl.textContent='';
-        if(spanEl)spanEl.innerHTML='Bulletin length: <b>'+fmt(dur)+'</b> · slide to choose the part to read.';
+        if(spanEl)spanEl.innerHTML='Recording length: <b>'+fmt(dur)+'</b> · slide to choose the part to read.';
         fromI.min=0;fromI.max=dur;fromI.step=5;fromI.value=0;
         toI.min=0;toI.max=dur;toI.step=5;toI.value=Math.min(dur,600);
         syncLabels();winBox.style.display='block';runBtn.style.display='inline-flex';
@@ -964,20 +860,20 @@ _JS = """
     }
   })();
 
-  /* YouTube tabs: Daily bulletins | Live stream | Live ticker. Keywords sit
+  /* YouTube tabs: Uploads | Live stream | Live ticker. Keywords sit
      above the tabs and are shared across all three (same watchlist). */
   (function(){
     var tabs=document.querySelectorAll('.yt-tab');
     if(!tabs.length)return;
     var panels={
-      bulletins:document.getElementById('yt-tab-bulletins'),
+      search:document.getElementById('yt-tab-search'),
       live:document.getElementById('yt-tab-live'),
       ticker:document.getElementById('yt-tab-live')  // shares the live panel
     };
     function show(name){
       tabs.forEach(function(t){t.classList.toggle('on',t.getAttribute('data-tab')===name);});
-      document.getElementById('yt-tab-bulletins').style.display=(name==='bulletins')?'':'none';
-      document.getElementById('yt-tab-live').style.display=(name==='bulletins')?'none':'';
+      document.getElementById('yt-tab-search').style.display=(name==='search')?'':'none';
+      document.getElementById('yt-tab-live').style.display=(name==='search')?'none':'';
       if(name==='live'&&window.__ytLiveActivate)window.__ytLiveActivate('audio');
       if(name==='ticker'&&window.__ytLiveActivate)window.__ytLiveActivate('ticker');
     }
@@ -1349,26 +1245,15 @@ _JS = """
     var checkBtn=document.getElementById('yt-ch-check');
     var saveBtn=document.getElementById('yt-ch-save');
     var result=document.getElementById('yt-ch-result');
-    var slotsBox=document.getElementById('yt-ch-slots');
     var lastProbe=null;
     function openModal(){
       if(!modal)return;
       modal.classList.add('open');
       lastProbe=null;
       if(result){result.className='';result.textContent='';result.classList.remove('show')}
-      if(slotsBox)slotsBox.innerHTML='';
       if(saveBtn)saveBtn.style.display='none';
     }
     function closeModal(){if(modal)modal.classList.remove('open')}
-    function renderSlots(slots){
-      if(!slotsBox||!slots||!slots.length){if(slotsBox)slotsBox.innerHTML='';return}
-      slotsBox.innerHTML=slots.map(function(s,i){
-        var ex=(s.example_title||'').replace(/</g,'&lt;');
-        return '<li><label><input type="checkbox" class="yt-slot-pick" data-i="'+i+'" checked> '
-          +'<span><b>'+s.label+'</b> · '+s.samples+' recent upload'+(s.samples===1?'':'s')
-          +(ex?'<div class="slot-meta">e.g. '+ex+'</div>':'')+'</span></label></li>';
-      }).join('');
-    }
     if(openBtn)openBtn.addEventListener('click',openModal);
     if(closeBtn)closeBtn.addEventListener('click',closeModal);
     if(modal)modal.addEventListener('click',function(e){if(e.target===modal)closeModal()});
@@ -1387,28 +1272,18 @@ _JS = """
           result.textContent=r.summary||'No result';
           result.className='show '+(r.ok?'ok':'bad');
         }
-        renderSlots(r.detail&&r.detail.slots);
         if(saveBtn)saveBtn.style.display=r.ok?'inline-flex':'none';
       }catch(err){
         if(result){result.textContent='Check failed — try again.';result.className='show bad'}
         if(saveBtn)saveBtn.style.display='none';
-        if(slotsBox)slotsBox.innerHTML='';
       }
-      checkBtn.disabled=false;checkBtn.textContent='Find bulletins';
+      checkBtn.disabled=false;checkBtn.textContent='Check channel';
     });
     if(saveBtn)saveBtn.addEventListener('click',async function(){
       if(!lastProbe||!lastProbe.ok||!lastProbe.detail)return;
-      var picks=[].slice.call(document.querySelectorAll('.yt-slot-pick:checked'))
-        .map(function(el){return parseInt(el.getAttribute('data-i'),10)})
-        .filter(function(n){return !isNaN(n)});
-      var slots=(lastProbe.detail.slots||[]).filter(function(_,i){return picks.indexOf(i)>=0});
-      if(!slots.length){
-        if(result){result.textContent='Select at least one bulletin slot.';result.className='show bad'}
-        return;
-      }
       saveBtn.disabled=true;
       try{
-        var body=Object.assign({},lastProbe.detail,{slots:slots});
+        var body=Object.assign({},lastProbe.detail,{slots:[]});
         var r=await fetch('/api/youtube/channels',{method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify(body)}).then(function(x){return x.json()});
@@ -1670,37 +1545,6 @@ def _detection_card(m: Mention, highlight_keywords: list[str] | None = None,
 
 
 
-def _active_keyword_fold(db: Session, module: str | None = "newspaper") -> dict[str, str]:
-    """casefold -> canonical text for active watchlist keywords."""
-    out: dict[str, str] = {}
-    q = select(Keyword).where(Keyword.active.is_(True))
-    if module:
-        q = q.where(Keyword.module == module)
-    for k in db.execute(q).scalars().all():
-        if k.text:
-            out[(k.text or "").casefold()] = k.text
-    return out
-
-
-def _live_matched(m: Mention, active_fold: dict[str, str]) -> list[str]:
-    """matched_keywords that are still on the active watchlist (canonical text)."""
-    seen, out = set(), []
-    for k in (m.matched_keywords or []):
-        fold = (k or "").casefold()
-        if fold in active_fold and fold not in seen:
-            seen.add(fold)
-            out.append(active_fold[fold])
-    return out
-
-
-
-
-
-
-
-
-
-
 def _utc(dt):
     return dt.replace(tzinfo=timezone.utc) if (dt and dt.tzinfo is None) else dt
 
@@ -1759,113 +1603,6 @@ def _unlink_orphan_media(db: Session, path: str | None, except_id: int) -> bool:
 
 
 
-def _start_youtube_period_scan(
-    start_date: str,
-    end_date: str,
-    keyword_ids: list[int],
-    *,
-    start_time: str = "00:00",
-    end_time: str = "23:59",
-    label: str | None = None,
-) -> bool:
-    """User-triggered scan: all non-live uploads in a date/time window."""
-    from app.youtube.pipeline import period_bounds_from_parts, period_label
-
-    try:
-        p_start, p_end = period_bounds_from_parts(
-            start_date, end_date, start_time, end_time,
-        )
-    except ValueError:
-        return False
-    return yt_scan_runner.start_scan(
-        keyword_ids=keyword_ids or None,
-        period_start=p_start.isoformat(),
-        period_end=p_end.isoformat(),
-        label=label or f"period:{period_label(p_start, p_end)}",
-    )
-
-
-def _youtube_period_from_query(qp) -> tuple[datetime | None, datetime | None, str]:
-    """Parse ?start=&end= ISO bounds from the URL (UTC-aware)."""
-    from app.youtube.pipeline import parse_period_iso, period_label
-
-    start_s = (qp.get("start") or "").strip()
-    end_s = (qp.get("end") or "").strip()
-    if not start_s or not end_s:
-        return None, None, ""
-    try:
-        p_start, p_end = parse_period_iso(start_s, end_s)
-        return p_start, p_end, period_label(p_start, p_end)
-    except ValueError:
-        return None, None, ""
-
-
-def _youtube_period_form_defaults(
-    qp,
-    *,
-    today=None,
-) -> dict[str, str]:
-    """Default date/time fields for the custom scan modal."""
-    today = today or datetime.now(_PKT).date()
-    p_start, p_end, _ = _youtube_period_from_query(qp)
-    if p_start and p_end:
-        s = p_start.astimezone(_PKT)
-        e = p_end.astimezone(_PKT)
-        return {
-            "start_date": s.date().isoformat(),
-            "end_date": e.date().isoformat(),
-            "start_time": s.strftime("%H:%M"),
-            "end_time": e.strftime("%H:%M"),
-        }
-    week_ago = today - timedelta(days=6)
-    return {
-        "start_date": week_ago.isoformat(),
-        "end_date": today.isoformat(),
-        "start_time": "00:00",
-        "end_time": "23:59",
-    }
-
-
-def _youtube_keyword_langs(
-    db: Session,
-    keyword_ids: list[int] | None = None,
-) -> dict[str, str]:
-    q = select(Keyword.text, Keyword.language).where(Keyword.module == "youtube")
-    if keyword_ids:
-        q = q.where(Keyword.id.in_(keyword_ids))
-    return {t: lang or "ur" for t, lang in db.execute(q).all() if t}
-
-
-def _youtube_verified_labels(
-    m: Mention,
-    keyword_langs: dict[str, str],
-    active_fold: dict[str, str],
-    allowed_fold: set[str] | None = None,
-) -> list[str]:
-    from app.youtube.matcher import mention_verified_keywords
-
-    labels = mention_verified_keywords(
-        m.matched_keywords,
-        m.keyword_hits,
-        keyword_langs,
-        active_fold=active_fold,
-    )
-    if allowed_fold is None:
-        return labels
-    return [k for k in labels if (k or "").casefold() in allowed_fold]
-
-
-def _filter_youtube_mentions(
-    mentions: list[Mention],
-    keyword_langs: dict[str, str],
-    active_fold: dict[str, str],
-    allowed_fold: set[str] | None = None,
-) -> list[Mention]:
-    return [
-        m for m in mentions
-        if _youtube_verified_labels(m, keyword_langs, active_fold, allowed_fold)
-    ]
-
 
 def _youtube_snippet_for(
     m: Mention,
@@ -1885,44 +1622,6 @@ def _youtube_snippet_for(
     return m.snippet or ""
 
 
-def _dedupe_youtube_mentions(mentions: list[Mention]) -> list[Mention]:
-    """One card per video — keep the newest row."""
-    best: dict[str, Mention] = {}
-    for m in mentions:
-        key = (m.external_id or "").strip() or f"id:{m.id}"
-        prev = best.get(key)
-        if prev is None or result_policy.effective_time(m) > result_policy.effective_time(prev):
-            best[key] = m
-    out = list(best.values())
-    out.sort(key=result_policy.effective_time, reverse=True)
-    return out
-
-
-def _youtube_keyword_ids_from_query(
-    db: Session,
-    *,
-    kw_id_params: list[str],
-    keyword: str,
-    module: str = "youtube",
-) -> list[int]:
-    ids = [int(x) for x in kw_id_params if str(x).isdigit()]
-    if ids:
-        return ids
-    if keyword:
-        row = db.execute(
-            select(Keyword.id).where(
-                Keyword.active.is_(True),
-                Keyword.module == module,
-                func.lower(Keyword.text) == keyword.casefold(),
-            )
-        ).scalar_one_or_none()
-        if row:
-            return [int(row)]
-    return []
-
-
-_instant_match_lock = threading.Lock()
-
 def detect_keyword_language(text: str, requested: str = "en") -> str:
     """Language to match a keyword under, from its own script.
 
@@ -1937,35 +1636,6 @@ def detect_keyword_language(text: str, requested: str = "en") -> str:
         # Latin text explicitly marked Urdu — folding would do nothing useful.
         return "en"
     return requested if requested in ("en", "ur") else "en"
-
-
-def start_instant_youtube_match(keyword_ids: list[int]) -> None:
-    """Match new keywords against stored transcripts without waiting for a scan.
-
-    The scan runner allows one subprocess at a time, so while a bulletin scan is
-    working through its backlog — which is most of the time — a request to match
-    is refused and dropped. A newly added keyword would then find nothing until
-    some later scan happened to re-match it.
-
-    Matching cached transcripts needs no download, so it runs in-process on a
-    worker thread instead and cannot be blocked by that lock.
-    """
-    if not keyword_ids:
-        return
-
-    def _run() -> None:
-        # One at a time: several adds in quick succession should queue, not
-        # pile up concurrent passes over the same transcripts.
-        with _instant_match_lock:
-            try:
-                from app.youtube.pipeline import run_quick_youtube_match
-
-                summary = run_quick_youtube_match(keyword_ids)
-                logger.info("instant youtube match done: %s", summary)
-            except Exception:
-                logger.exception("instant youtube match failed")
-
-    threading.Thread(target=_run, name="yt-instant-match", daemon=True).start()
 
 
 def _upsert_watch_keywords(db: Session, texts: list[str], language: str,
@@ -2221,23 +1891,13 @@ def home(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/youtube", response_class=HTMLResponse)
 def youtube_home(request: Request, db: Session = Depends(get_db)):
-    """YouTube bulletin monitoring workspace (separate keyword watchlist)."""
+    """YouTube live search workspace (separate keyword watchlist)."""
     if not settings.youtube_enabled:
         return RedirectResponse("/", status_code=303)
-    from app.youtube.pipeline import bulletin_status_for_date, ensure_due_bulletins, repair_youtube_mentions
 
     today = datetime.now(_PKT).date()
     qp = request.query_params
     date_s = (qp.get("date") or today.isoformat()).strip()
-    keyword = (qp.get("q") or "").strip()
-    search_requested = bool(qp.get("go"))
-    filter_only = bool(qp.get("filter"))
-    selected_kw_ids = [int(x) for x in qp.getlist("kw_id") if str(x).isdigit()]
-    period_start, period_end, period_label_s = _youtube_period_from_query(qp)
-    period_defaults = _youtube_period_form_defaults(qp, today=today)
-    ensure_due_bulletins(db, for_date=today.isoformat())
-    if search_requested:
-        repair_youtube_mentions(db)
 
     active_kws = db.execute(
         select(Keyword).where(
@@ -2245,53 +1905,9 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         ).order_by(Keyword.text)
     ).scalars().all()
 
-    status_rows = bulletin_status_for_date(db, today)
-    status_html = '<div class="yt-status">' + "".join(
-        f'<div class="cell"><b>{html.escape(r["channel"])}</b>'
-        f'<span class="st {html.escape((r["status"] or "").split("/")[0].split()[0])}">{html.escape(r["status"] or "waiting")}</span>'
-        f'<div class="hint" style="margin:0">{html.escape(r.get("slot") or "—")}'
-        + (f' · {html.escape((r.get("title") or "")[:48])}' if r.get("title") else "")
-        + "</div></div>"
-        for r in status_rows
-    ) + "</div>"
-
-    # The per-keyword scan queue is gone with the live-only model; nothing
-    # enqueues, so no keyword is ever "busy".
-    yt_st = yt_scan_runner.status()
-    yt_queue: list[dict] = []
-    results_scanning = bool(yt_st.get("running")) and not filter_only
-    selected_kw_set = set(selected_kw_ids)
-    selected_kw_labels = [k.text for k in active_kws if k.id in selected_kw_set]
-    results_html, _ = _youtube_results_html(
-        db,
-        keyword=keyword,
-        keyword_ids=selected_kw_ids or None,
-        period_start=period_start,
-        period_end=period_end,
-        period_label=period_label_s,
-        strict=search_requested,
-        filter_only=filter_only,
-        selected_kw_labels=selected_kw_labels,
-        results_scanning=results_scanning,
-    )
-
-    queued_ids = {
-        int(x["id"])
-        for x in yt_queue
-        if x.get("id") is not None
-    }
-    queued_folds = {
-        (x.get("text") or "").casefold()
-        for x in yt_queue
-        if x and x.get("text")
-    }
-
     def _kw_chip(k: Keyword) -> str:
-        sel = " sel" if k.id in selected_kw_set else ""
-        this_busy = k.id in queued_ids or k.text.casefold() in queued_folds
-        busy = " busy" if this_busy else ""
         return (
-            f'<span class="kw-chip{sel}{busy}" data-kw-id="{k.id}">'
+            f'<span class="kw-chip" data-kw-id="{k.id}">'
             f'<button type="button" class="kw-toggle" '
             f'data-kw="{html.escape(k.text, quote=True)}">{html.escape(k.text)}</button>'
             f'<button type="button" class="kw-x" data-del-id="{k.id}" '
@@ -2305,27 +1921,22 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     if qp.get("removed"):
         banner = (
             f'<div class="banner ok">Hidden <b>{html.escape(qp.get("removed"))}</b> from the '
-            "YouTube watchlist. Results remain retained for 90 days.</div>"
+            "YouTube watchlist.</div>"
         )
     elif qp.get("added"):
         banner = (
             f'<div class="banner ok">Added <b>{html.escape(qp.get("added"))}</b> to the YouTube '
-            "watchlist — use Custom scan to search a time period.</div>"
+            "watchlist. Select it, pick a day, then Search live results.</div>"
         )
     elif qp.get("channel_added"):
         banner = (
-            f'<div class="banner ok">Added channel <b>{html.escape(qp.get("channel_added"))}</b> '
-            "with auto-detected bulletin slots. Daily bulletin scans run on schedule.</div>"
+            f'<div class="banner ok">Added channel <b>{html.escape(qp.get("channel_added"))}</b>. '
+            "It is included in the next live search.</div>"
         )
     elif qp.get("channel_removed"):
         banner = (
             f'<div class="banner ok">Removed channel <b>{html.escape(qp.get("channel_removed"))}</b> '
-            "and its stored results. Re-add it any time to resume scanning.</div>"
-        )
-    elif qp.get("scan_started"):
-        banner = (
-            f'<div class="banner ok">Scanning <b>{html.escape(qp.get("scan_started"))}</b> — '
-            "all non-live uploads in that window will be transcribed and matched.</div>"
+            "from live search. Re-add it any time.</div>"
         )
 
     channels = db.execute(
@@ -2339,8 +1950,7 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         for c in channels
     ) or '<span class="hint">No channels yet.</span>'
 
-    p_start_iso = period_start.isoformat() if period_start else ""
-    p_end_iso = period_end.isoformat() if period_end else ""
+    results_html = _youtube_live_placeholder()
 
     body = f"""
     {banner}
@@ -2371,8 +1981,8 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
           <input type="hidden" name="module" value="youtube">
           <input type="hidden" name="scan" value="1">
         </form>
-        <p class="hint" style="margin-top:.45rem">Adding searches transcripts already stored — no rescan needed.
-        Click keywords to select (✓), then open <b>Custom scan</b> or <b>Show results</b>.</p>
+        <p class="hint" style="margin-top:.45rem">Adding only saves the keyword. Click chips to select (✓),
+        pick a day, then <b>Search live results</b>.</p>
         <div class="kw-bar">
           <div class="cap">Watchlist · click to select · × hide
             <button type="button" class="ghost" id="kw-sel-all" style="margin-left:.5rem;font-size:.72rem">Select all</button>
@@ -2382,25 +1992,14 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         </div>
       </div>
       <div class="yt-tabs" role="tablist">
-        <button type="button" class="yt-tab on" data-tab="bulletins">Daily bulletins</button>
+        <button type="button" class="yt-tab on" data-tab="search">Uploads</button>
         <button type="button" class="yt-tab" data-tab="live">Live stream</button>
         <button type="button" class="yt-tab" data-tab="ticker">Live ticker</button>
       </div>
     </div>
-    <div id="yt-tab-bulletins" class="yt-panel">
+    <div id="yt-tab-search" class="yt-panel">
       <div class="panel">
-        <div class="field">
-          <label>Today's bulletin auto-scan</label>
-          <p class="hint" style="margin:.25rem 0 .5rem">Scheduled scans pick up each channel's daily bulletin slots automatically.</p>
-          {status_html}
-        </div>
-        <form method="get" action="/youtube" id="yt-search">
-          <div id="yt-kw-hidden"></div>
-          <input type="hidden" name="q" id="q" value="">
-          <input type="hidden" name="go" value="1">
-          <input type="hidden" name="filter" id="yt-filter" value="{html.escape(qp.get("filter") or "")}">
-          <input type="hidden" name="start" id="yt-period-start" value="{html.escape(p_start_iso)}">
-          <input type="hidden" name="end" id="yt-period-end" value="{html.escape(p_end_iso)}">
+        <form id="yt-search" onsubmit="return false">
           <div class="field">
             <label for="date">Day to search</label>
             <input type="date" id="date" name="date" value="{html.escape(date_s)}">
@@ -2418,11 +2017,11 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
       <div class="panel">
         <h2 style="margin-top:0" id="yt-live-heading">Live stream — read audio</h2>
         <p class="sub" id="yt-live-sub" style="color:var(--muted);font-size:.9rem;margin:.1rem 0 .9rem">Streams live right now on your channels. Pick one, choose a window of its timeline,
-        and that portion is transcribed and matched against the same watchlist. Separate from bulletins — results appear only here.</p>
+        and that portion is transcribed and matched against the same watchlist. Results appear only here and are not saved.</p>
         <div id="yt-live-datebar" style="display:none;margin:.1rem 0 .7rem">
-          <label style="font-size:.8rem;font-weight:600;color:var(--muted);margin-right:.45rem">Bulletin date</label>
+          <label style="font-size:.8rem;font-weight:600;color:var(--muted);margin-right:.45rem">Date</label>
           <input type="date" id="yt-live-date" style="padding:.45rem .7rem;border:1px solid var(--line-strong);border-radius:999px;font:inherit;background:#fffdf9">
-          <span class="hint" style="margin-left:.5rem">today's live streams + this day's bulletins</span>
+          <span class="hint" style="margin-left:.5rem">live streams now, plus recorded videos already known for that day</span>
         </div>
         <div id="yt-live-list"><span class="hint">Open this tab to check what's available…</span></div>
         <div id="yt-live-window" style="display:none">
@@ -2444,46 +2043,16 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
         <div id="yt-live-results" style="margin-top:.55rem"></div>
       </div>
     </div>
-    <div id="yt-period-modal" role="dialog" aria-modal="true" aria-labelledby="yt-period-title">
-      <div class="box">
-        <h3 id="yt-period-title">Custom scan period</h3>
-        <p class="sub">Pick a date and time range (Pakistan time). Every non-live upload published in that window
-        on all channels will be transcribed and matched to the keywords you selected on the watchlist.</p>
-        <form method="post" action="/ui/scan/youtube/period" id="yt-period-form">
-          <div id="yt-period-kw-hidden"></div>
-          <div class="period-grid">
-            <div><label for="yt-p-start-date">From date</label>
-              <input type="date" id="yt-p-start-date" name="start_date"
-                value="{html.escape(period_defaults["start_date"])}" required></div>
-            <div><label for="yt-p-end-date">To date</label>
-              <input type="date" id="yt-p-end-date" name="end_date"
-                value="{html.escape(period_defaults["end_date"])}" required></div>
-            <div><label for="yt-p-start-time">From time</label>
-              <input type="time" id="yt-p-start-time" name="start_time"
-                value="{html.escape(period_defaults["start_time"])}" required></div>
-            <div><label for="yt-p-end-time">To time</label>
-              <input type="time" id="yt-p-end-time" name="end_time"
-                value="{html.escape(period_defaults["end_time"])}" required></div>
-          </div>
-          <div class="row-btns">
-            <button type="button" id="yt-period-run">Scan period</button>
-            <button type="button" class="ghost" id="yt-period-close">Close</button>
-          </div>
-          <div id="yt-period-result"></div>
-        </form>
-      </div>
-    </div>
     <div id="yt-ch-modal" role="dialog" aria-modal="true" aria-labelledby="yt-ch-title">
       <div class="box">
         <h3 id="yt-ch-title">Add YouTube channel</h3>
-        <p class="sub">Paste a channel URL or @handle. We scan recent uploads and suggest up to five daily bulletin times.</p>
+        <p class="sub">Paste a channel URL or @handle. We'll confirm it and add it to live search.</p>
         <input type="url" id="yt-ch-url" placeholder="https://www.youtube.com/@ChannelName" autocomplete="off">
         <div class="row-btns">
-          <button type="button" id="yt-ch-check">Find bulletins</button>
+          <button type="button" id="yt-ch-check">Check channel</button>
           <button type="button" id="yt-ch-save" style="display:none">Add channel</button>
           <button type="button" class="ghost" id="yt-ch-close">Close</button>
         </div>
-        <ul id="yt-ch-slots"></ul>
         <div id="yt-ch-result"></div>
       </div>
     </div>
@@ -2491,200 +2060,17 @@ def youtube_home(request: Request, db: Session = Depends(get_db)):
     return _shell("YouTube · Media Monitor", body, module="youtube")
 
 
-def _youtube_results_html(
-    db: Session,
-    *,
-    keyword: str,
-    keyword_ids: list[int] | None = None,
-    period_start: datetime | None = None,
-    period_end: datetime | None = None,
-    period_label: str = "",
-    strict: bool = False,
-    filter_only: bool = False,
-    selected_kw_labels: list[str] | None = None,
-    results_scanning: bool,
-    max_results: int | None = None,
-) -> tuple[str, str]:
-    active_fold = _active_keyword_fold(db, module="youtube")
-    today = datetime.now(_PKT).date()
-    if period_start and period_end:
-        start_utc = period_start.replace(tzinfo=None) if period_start.tzinfo else period_start
-        end_utc = period_end.replace(tzinfo=None) if period_end.tzinfo else period_end
-    else:
-        first_date = today - timedelta(days=settings.keyword_search_days - 1)
-        day_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=_PKT)
-        day_end = datetime(today.year, today.month, today.day, tzinfo=_PKT) + timedelta(days=1)
-        start_utc = day_start.astimezone(timezone.utc).replace(tzinfo=None)
-        end_utc = day_end.astimezone(timezone.utc).replace(tzinfo=None)
-
-    mentions = db.execute(
-        select(Mention).where(
-            Mention.module == "youtube",
-            or_(
-                and_(
-                    Mention.published_at.is_not(None),
-                    Mention.published_at >= start_utc,
-                    Mention.published_at <= end_utc,
-                ),
-                and_(
-                    Mention.published_at.is_(None),
-                    Mention.detected_at >= start_utc,
-                    Mention.detected_at <= end_utc,
-                ),
-            ),
-        ).order_by(Mention.detected_at.desc())
-    ).scalars().all()
-
-    allowed_labels: set[str] | None = None
-    keyword_langs: dict[str, str] = {}
-    allowed_fold: set[str] | None = None
-    paused_labels: list[str] = []
-    if strict and not keyword_ids:
-        mentions = []
-        allowed_labels = set()
-    elif keyword_ids:
-        rows = db.execute(
-            select(Keyword.text, Keyword.language, Keyword.active).where(
-                Keyword.id.in_(keyword_ids),
-                Keyword.module == "youtube",
-            )
-        ).all()
-        allowed_labels = {t for t, _, _ in rows if t}
-        keyword_langs = {t: lang or "ur" for t, lang, _ in rows if t}
-        allowed_fold = {t.casefold() for t in allowed_labels}
-        # A paused keyword is never matched, so it can only ever come back
-        # empty. Saying "run a Custom scan" here sends the user to rescan
-        # bulletins that would still be searched without it.
-        paused_labels = [t for t, _, act in rows if t and not act]
-    elif keyword:
-        kw_l = keyword.casefold()
-        if kw_l not in active_fold:
-            mentions = []
-        else:
-            allowed_fold = {kw_l}
-
-    if not keyword_langs:
-        keyword_langs = _youtube_keyword_langs(db)
-
-    if mentions:
-        mentions = _filter_youtube_mentions(
-            mentions, keyword_langs, active_fold, allowed_fold,
-        )
-
-    page = max(1, settings.keyword_result_limit)
-    # max_results paginates: each "Show more" click asks for one more page.
-    show_limit = max_results if max_results and max_results > 0 else page
-
-    mentions.sort(key=result_policy.effective_time, reverse=True)
-    mentions = _dedupe_youtube_mentions(mentions)
-    total = len(mentions)
-    shown = mentions[:show_limit]
-    spin = ' <span class="spin" title="Scanning"></span>' if results_scanning else ""
-
-    period_hint = ""
-    if period_label:
-        period_hint = f'<p class="hint results-filter-hint">Period: <b>{html.escape(period_label)}</b></p>'
-
-    filter_hint = ""
-    if selected_kw_labels:
-        kw_line = html.escape(", ".join(selected_kw_labels[:6]))
-        if len(selected_kw_labels) > 6:
-            kw_line += html.escape(f" +{len(selected_kw_labels) - 6}")
-        filter_hint = (
-            f'<p class="hint results-filter-hint">Exact transcript match only for: '
-            f"<b>{kw_line}</b> · one result per video</p>"
-        )
-    elif strict:
-        filter_hint = (
-            '<p class="hint results-filter-hint">Select keyword(s) on the watchlist, '
-            "then click <b>Show results</b> or run <b>Custom scan</b>.</p>"
-        )
-
-    show_results_btn = (
-        '<button type="submit" form="yt-search" id="yt-show-results" '
-        'title="Show exact matches for selected keywords (no rescan)">Show results</button>'
-    )
-    if shown:
-        cards = []
-        for m in shown:
-            if allowed_labels:
-                fold_filter = {(t or "").casefold() for t in allowed_labels}
-                hl = _youtube_verified_labels(m, keyword_langs, active_fold, fold_filter)
-            elif keyword:
-                hl = _youtube_verified_labels(
-                    m, keyword_langs, active_fold, {keyword.casefold()},
-                )
-            else:
-                hl = _youtube_verified_labels(m, keyword_langs, active_fold)
-            cards.append(_detection_card(
-                m, highlight_keywords=hl, scanning=results_scanning,
-                keyword_langs=keyword_langs,
-            ))
-        grid = f'<div class="grid">{"".join(cards)}</div>'
-        if total > len(shown):
-            remaining = total - len(shown)
-            step = min(page, remaining)
-            more = (
-                '<div class="more-wrap">'
-                f'<button type="button" class="more-btn" id="yt-more" '
-                f'data-next="{len(shown) + step}">Show next {step}</button>'
-                f'<span class="more-count">Showing {len(shown)} of {total}</span>'
-                "</div>"
-            )
-        else:
-            more = (f'<p class="hint" style="margin-top:.9rem">Showing {len(shown)} of '
-                    f"{total}.</p>" if total > page else "")
-    elif results_scanning:
-        grid = '<div class="empty loading"><span class="spin"></span></div>'
-        more = ""
-    elif not active_fold:
-        grid = ('<div class="empty">No YouTube keywords yet.'
-                "<br>Add keywords above, then run Custom scan.</div>")
-        more = ""
-    elif strict and not keyword_ids:
-        grid = ('<div class="empty">Select one or more keywords from the watchlist '
-                '(click to mark ✓), then <b>Show results</b> or <b>Custom scan</b>.</div>')
-        more = ""
-    elif keyword_ids and paused_labels and not shown:
-        names = ", ".join(html.escape(t) for t in sorted(paused_labels))
-        grid = (f'<div class="empty">Paused: <b>{names}</b>.'
-                "<br>Paused keywords are never matched. Resume on the watchlist "
-                "above, and past bulletins are searched straight away.</div>")
-        more = ""
-    elif filter_only and keyword_ids and not shown:
-        grid = ('<div class="empty">No exact matches for the selected keyword(s) in this period.'
-                "<br>Run <b>Custom scan</b> to transcribe uploads in the window.</div>")
-        more = ""
-    elif strict and period_label:
-        grid = (f'<div class="empty">No matches in <b>{html.escape(period_label)}</b> yet.'
-                "<br>Scanning non-live uploads in that window — results appear as they are found.</div>")
-        more = ""
-    else:
-        grid = ('<div class="empty">Select keywords and run <b>Custom scan</b> to search a time period, '
-                "or click <b>Show results</b> to filter existing matches.</div>")
-        more = ""
-
-    max_id = max((m.id for m in shown), default=0)
-    shots = sum(1 for m in shown if m.screenshot_path)
-    # len(shown) is in the signature so paginating (same total, more shown)
-    # counts as a change and the fragment actually swaps in.
-    sig = f"yt:{len(mentions)}:{len(shown)}:{max_id}:{shots}:{int(results_scanning)}"
-    html_out = f"""
-        <section class="results" id="results" data-sig="{html.escape(sig)}">
+def _youtube_live_placeholder() -> str:
+    """Empty #results shell. Live search JS replaces this section in place."""
+    return """
+        <section class="results" id="results">
           <div class="results-head">
-            <h2>Results{spin}</h2>
-            <span class="count">{len(mentions)} match{'es' if len(mentions) != 1 else ''}</span>
-            <div class="results-actions">{show_results_btn}</div>
+            <h2>Live results</h2>
           </div>
-          {period_hint}
-          {filter_hint}
-          {grid}{more}
+          <div class="empty">Select keywords, pick a day, then click <b>Search live results</b>.
+          Hits appear here and are not saved.</div>
         </section>
         """
-    return html_out, sig
-
-
-
 
 
 
@@ -2797,11 +2183,14 @@ def ui_delete_keyword(kid: int, db: Session = Depends(get_db), request: Request 
         # AJAX: the page drops the chip from the DOM instantly — no reload.
         return JSONResponse({"ok": True, "id": kid, "text": text, "module": module})
     home = "/youtube" if module == "youtube" else "/"
-    q = urlencode({
-        "removed": text,
-        "go": "1",
-        "date": datetime.now(_PKT).date().isoformat(),
-    })
+    if module == "youtube":
+        q = urlencode({"removed": text})
+    else:
+        q = urlencode({
+            "removed": text,
+            "go": "1",
+            "date": datetime.now(_PKT).date().isoformat(),
+        })
     return RedirectResponse(f"{home}?{q}", status_code=303)
 
 
@@ -3152,60 +2541,6 @@ def api_live_job(job_id: str):
 
 
 
-@app.post("/ui/scan/youtube/period")
-def ui_scan_youtube_period(
-    start_date: str = Form(...),
-    end_date: str = Form(...),
-    start_time: str = Form("00:00"),
-    end_time: str = Form("23:59"),
-    kw_id: list[str] = Form(default=[]),
-):
-    """User-triggered scan of all non-live uploads in a custom date/time window."""
-    if not settings.youtube_enabled:
-        return RedirectResponse("/", status_code=303)
-    from app.youtube.pipeline import period_bounds_from_parts, period_label
-
-    kw_ids = [int(x) for x in kw_id if str(x).isdigit()]
-    if not kw_ids:
-        return RedirectResponse("/youtube?period_error=keywords", status_code=303)
-    try:
-        p_start, p_end = period_bounds_from_parts(
-            start_date, end_date, start_time, end_time,
-        )
-    except ValueError:
-        return RedirectResponse("/youtube?period_error=range", status_code=303)
-
-    label = period_label(p_start, p_end)
-    if yt_scan_runner.is_running():
-        q = urlencode({"period_busy": label})
-        return RedirectResponse(f"/youtube?{q}", status_code=303)
-
-    _start_youtube_period_scan(
-        start_date,
-        end_date,
-        kw_ids,
-        start_time=start_time,
-        end_time=end_time,
-        label=label,
-    )
-    params: list[tuple[str, str]] = [
-        ("go", "1"),
-        ("start", p_start.isoformat()),
-        ("end", p_end.isoformat()),
-        ("scan_started", label),
-    ]
-    params += [("kw_id", str(i)) for i in kw_ids]
-    return RedirectResponse(f"/youtube?{urlencode(params)}", status_code=303)
-
-
-
-
-
-
-
-
-
-
 # ==========================================================================
 # JSON API (unchanged — for scripts / poller)
 # ==========================================================================
@@ -3321,12 +2656,9 @@ def api_probe_youtube_channel(body: _YoutubeProbeIn):
 @app.post("/api/youtube/channels")
 def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_db)):
     from app.youtube import channel_probe
-    from app.youtube.pipeline import ensure_due_bulletins
 
     if not body.channel_id.strip():
         return {"ok": False, "summary": "Missing channel id."}
-    if not body.slots:
-        return {"ok": False, "summary": "Select at least one bulletin slot."}
     existing = db.execute(
         select(YouTubeChannel).where(YouTubeChannel.channel_id == body.channel_id.strip())
     ).scalar_one_or_none()
@@ -3335,7 +2667,6 @@ def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_d
     if existing and not existing.active:
         existing.active = True          # re-adding a removed channel reactivates it
         db.commit()
-        ensure_due_bulletins(db)
         return {"ok": True, "summary": f"Re-added “{existing.name}”.",
                 "name": existing.name, "id": existing.id}
     row = channel_probe.save_channel(
@@ -3345,9 +2676,8 @@ def api_add_youtube_channel(body: _YoutubeChannelIn, db: Session = Depends(get_d
         url=body.url.strip(),
         handle=body.handle.strip(),
         uploads_playlist_id=body.uploads_playlist_id.strip(),
-        slots=[s.model_dump() for s in body.slots],
+        slots=[],
     )
-    ensure_due_bulletins(db)
     return {"ok": True, "name": row.name, "id": row.id, "summary": f"Added {row.name}."}
 
 
